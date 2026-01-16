@@ -1,8 +1,34 @@
-# FusedEquiTensorPot
+# FusedSCEquiTensorPot
 
-An E(3)-equivariant neural potential for molecular energies and forces, built with PyTorch + e3nn.
+[![Python](https://img.shields.io/badge/Python-3.8%2B-blue)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-1.12%2B-orange)](https://pytorch.org/)
+[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-**Key idea**: fuse multi-branch message passing features via equivariant tensor products and a fixed basis, then linearly combine to predict energies (forces via autograd).
+**FusedEquiSCTensorPot** is an E(3)-equivariant neural potential for predicting molecular energies and forces. Built with PyTorch and e3nn, it supports multiple tensor product modes including spherical harmonics and Cartesian implementations.
+
+## ✨ Features
+
+- **Multiple Tensor Product Modes**: 
+  - `spherical`: e3nn-based spherical harmonics (strictly equivariant)
+  - `cartesian`: Cartesian tensor products with CG coefficients (strictly equivariant)
+  - `cartesian-loose`: Optimized Cartesian tensor products (approximate equivariance)
+  
+- **E(3)-Equivariant**: All modes maintain rotational equivariance and parity conservation
+  
+- **Complete Workflow**:
+  - Data preprocessing from Extended XYZ format with PBC support
+  - Training with dynamic loss weight adjustment, SWA, EMA support
+  - Evaluation with detailed metrics
+  - Molecular dynamics (MD) simulation via ASE
+  - Nudged Elastic Band (NEB) calculations
+  
+- **Easy to Use**:
+  - Simple command-line interface
+  - Python API for custom workflows
+  - Automatic data preprocessing
+  - Checkpoint management with mode detection
+  
+- **GPU Support**: Full CUDA acceleration for training and inference
 
 ## Installation
 
@@ -15,16 +41,6 @@ Or install dependencies from requirements.txt:
 ```bash
 pip install -r requirements.txt
 ```
-
-## Features
-
-- E3NN-based E(3)-equivariant neural potential (energies + forces)
-- Efficient data preprocessing and dataset handling
-- Training and evaluation utilities
-- ASE Calculator integration for molecular dynamics
-- Command-line interface for common tasks
-- Robust Extended XYZ parsing: `energy=...`, `pbc="T T F"`, `Lattice="..."` (PBC)
-- Optional CLI overrides for baseline atomic energies (E0) and dynamic loss weights (a/b)
 
 ## Quick Start
 
@@ -43,7 +59,7 @@ This will:
 - Save preprocessed data to HDF5 and CSV formats
 - Precompute neighbor lists and write `processed_{train,val}.h5` by default
 
-To skip neighbor list preprocessing (fast sanity-check):
+To skip neighbor list preprocessing (for quick sanity-check):
 
 ```bash
 mff-preprocess --input-file data.xyz --output-dir data --max-atom 40 --skip-h5
@@ -51,16 +67,28 @@ mff-preprocess --input-file data.xyz --output-dir data --max-atom 40 --skip-h5
 
 ### 2. Training
 
-Train a model:
+Train a model (default: spherical mode):
 
 ```bash
 mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda
 ```
 
+Train with Cartesian mode (strictly equivariant):
+
+```bash
+mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode cartesian
+```
+
+Train with Cartesian-Loose mode:
+
+```bash
+mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode cartesian-loose
+```
+
 Optional: clamp dynamic loss weights `a/b` (they change during training):
 
 ```bash
-mff-train --data-dir data --a-min 0.5 --a-max 10 --b-min 0.001 --b-max 100
+mff-train --data-dir data --a 10.0 --b 100.0 --update-param 750 --weight-a-growth 1.05 --weight-b-decay 0.98 --a-max 1000 --b-min 1 --b-max 1000 
 ```
 
 Optional: override baseline atomic energies (E0):
@@ -75,10 +103,17 @@ mff-train --data-dir data --atomic-energy-keys 1 6 7 8 --atomic-energy-values -4
 
 ### 3. Evaluation
 
-Evaluate a trained model:
+Evaluate a trained model (use the same tensor-product-mode as training):
 
 ```bash
-mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test
+# For spherical mode
+mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode spherical --use-h5
+
+# For cartesian mode
+mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode cartesian --use-h5
+
+# For cartesian-loose mode
+mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode cartesian-loose --use-h5
 ```
 
 Outputs include:
@@ -196,22 +231,44 @@ molecular_force_field/
 - ASE >= 3.22.0
 - See `requirements.txt` for full list
 
-## Documentation
+## 🎯 Choosing Tensor Product Mode
 
-For full CLI and hyperparameter documentation, see `USAGE.md`.
+The library supports three tensor product modes, each with different characteristics:
 
-## License
+| Mode | Equivariance | Implementation | Use Case |
+|------|--------------|----------------|----------|
+| `spherical` | Strict | e3nn spherical harmonics | Standard e3nn implementation, most compatible |
+| `cartesian` | Strict | Cartesian with CG coefficients | Cartesian implementation with strict equivariance |
+| `cartesian-loose` | Approximate* | Optimized Cartesian | Alternative implementation with norm product approximation |
+
+*Note: `cartesian-loose` maintains equivariance within numerical precision (tested to machine precision).
+
+**Recommendation**: Choose based on your requirements - `spherical` for maximum compatibility, `cartesian` for strict equivariance with Cartesian implementation, or `cartesian-loose` for an alternative approach.
+
+## 📚 Documentation
+
+For full CLI and hyperparameter documentation, see [USAGE.md](USAGE.md).
+
+
+## 📄 License
 
 MIT License
+
+## 🙏 Acknowledgments
+
+- Built on [e3nn](https://github.com/e3nn/e3nn) for equivariant neural networks
+- Uses [ASE](https://wiki.fysik.dtu.dk/ase/) for molecular simulations
+- Inspired by NequIP, MACE, and other equivariant neural potentials
 
 ## Citation
 
 If you use this library in your research, please cite:
 
 ```bibtex
-@software{fused_equitensorpot,
-  title = {FusedEquiTensorPot},
+@software{fused_sc_equitensorpot,
+  title = {FusedEquiSCTensorPot},
   version = {0.1.0},
-  url = {https://github.com/Parity-LRX/FusedEquiTensorPot}
+  url = {https://github.com/Parity-LRX/FusedSCEquiTensorPot}
 }
 ```
+
