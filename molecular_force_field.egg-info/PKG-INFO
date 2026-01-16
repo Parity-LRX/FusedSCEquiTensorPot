@@ -1,0 +1,253 @@
+Metadata-Version: 2.4
+Name: molecular_force_field
+Version: 0.1.0
+Summary: A Python library for molecular modeling with E3NN-based neural networks
+Home-page: https://github.com/yourusername/molecular_force_field
+Author: Your Name
+Author-email: your.email@example.com
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Science/Research
+Classifier: Topic :: Scientific/Engineering :: Chemistry
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=1.12.0
+Requires-Dist: numpy>=1.21.0
+Requires-Dist: pandas>=1.3.0
+Requires-Dist: e3nn>=0.5.0
+Requires-Dist: torch-scatter>=2.0.9
+Requires-Dist: torch-cluster>=1.6.0
+Requires-Dist: ase>=3.22.0
+Requires-Dist: tqdm>=4.62.0
+Requires-Dist: h5py>=3.6.0
+Requires-Dist: matplotlib>=3.5.0
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+# FusedEquiTensorPot
+
+An E(3)-equivariant neural potential for molecular energies and forces, built with PyTorch + e3nn.
+
+**Key idea**: fuse multi-branch message passing features via equivariant tensor products and a fixed basis, then linearly combine to predict energies (forces via autograd).
+
+## Installation
+
+```bash
+pip install -e .
+```
+
+Or install dependencies from requirements.txt:
+
+```bash
+pip install -r requirements.txt
+```
+
+## Features
+
+- E3NN-based E(3)-equivariant neural potential (energies + forces)
+- Efficient data preprocessing and dataset handling
+- Training and evaluation utilities
+- ASE Calculator integration for molecular dynamics
+- Command-line interface for common tasks
+- Robust Extended XYZ parsing: `energy=...`, `pbc="T T F"`, `Lattice="..."` (PBC)
+- Optional CLI overrides for baseline atomic energies (E0) and dynamic loss weights (a/b)
+
+## Quick Start
+
+### 1. Data Preprocessing
+
+Preprocess your Extended XYZ file:
+
+```bash
+mff-preprocess --input-file data.xyz --output-dir data --max-atom 40
+```
+
+This will:
+- Extract data blocks from XYZ file
+- Split into training and validation sets
+- Fit baseline atomic energies
+- Save preprocessed data to HDF5 and CSV formats
+- Precompute neighbor lists and write `processed_{train,val}.h5` by default
+
+To skip neighbor list preprocessing (fast sanity-check):
+
+```bash
+mff-preprocess --input-file data.xyz --output-dir data --max-atom 40 --skip-h5
+```
+
+### 2. Training
+
+Train a model:
+
+```bash
+mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda
+```
+
+Optional: clamp dynamic loss weights `a/b` (they change during training):
+
+```bash
+mff-train --data-dir data --a-min 0.5 --a-max 10 --b-min 0.001 --b-max 100
+```
+
+Optional: override baseline atomic energies (E0):
+
+```bash
+# from CSV (Atom,E0)
+mff-train --data-dir data --atomic-energy-file data/fitted_E0.csv
+
+# or directly from CLI
+mff-train --data-dir data --atomic-energy-keys 1 6 7 8 --atomic-energy-values -430.53 -821.03 -1488.19 -2044.35
+```
+
+### 3. Evaluation
+
+Evaluate a trained model:
+
+```bash
+mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test
+```
+
+Outputs include:
+- `test_loss.csv`
+- `test_energy.csv`
+- `test_force.csv`
+
+For molecular dynamics simulation:
+
+```bash
+mff-evaluate --checkpoint combined_model.pth --md-sim
+```
+
+For NEB (Nudged Elastic Band) calculations:
+
+```bash
+mff-evaluate --checkpoint combined_model.pth --neb
+```
+
+## Python API
+
+```python
+from molecular_force_field.models import E3_TransformerLayer_multi, MainNet
+from molecular_force_field.data import H5Dataset
+from molecular_force_field.data.collate import collate_fn_h5
+from molecular_force_field.training.trainer import Trainer
+from molecular_force_field.utils.config import ModelConfig
+from torch.utils.data import DataLoader
+import torch
+
+# Load dataset
+train_dataset = H5Dataset('train')
+val_dataset = H5Dataset('val')
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=8,
+    shuffle=True,
+    collate_fn=collate_fn_h5
+)
+
+# Initialize model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+config = ModelConfig()
+
+model = MainNet(
+    input_size=config.input_dim_weight,
+    hidden_sizes=config.main_hidden_sizes4,
+    output_size=1
+).to(device)
+
+e3trans = E3_TransformerLayer_multi(
+    max_embed_radius=config.max_radius,
+    main_max_radius=config.max_radius_main,
+    main_number_of_basis=config.number_of_basis_main,
+    irreps_input=config.get_irreps_input_conv_main(),
+    irreps_query=config.get_irreps_query_main(),
+    irreps_key=config.get_irreps_key_main(),
+    irreps_value=config.get_irreps_value_main(),
+    irreps_output=config.get_irreps_output_conv_2(),
+    irreps_sh=config.get_irreps_sh_transformer(),
+    hidden_dim_sh=config.get_hidden_dim_sh(),
+    hidden_dim=config.emb_number_main_2,
+    device=device
+).to(device)
+
+# Train
+trainer = Trainer(
+    model=model,
+    e3trans=e3trans,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    train_dataset=train_dataset,
+    val_dataset=val_dataset,
+    device=device,
+    config=config,
+)
+
+trainer.run_training()
+```
+
+## Project Structure
+
+```
+molecular_force_field/
+├── models/              # Model definitions
+│   ├── e3nn_layers.py  # E3NN-based layers
+│   ├── mlp.py          # MLP networks
+│   └── losses.py       # Loss functions
+├── data/               # Dataset and preprocessing
+│   ├── datasets.py     # Dataset classes
+│   ├── collate.py      # Collate functions
+│   └── preprocessing.py # Data preprocessing
+├── utils/              # Utility functions
+│   ├── graph_utils.py  # Graph operations
+│   ├── tensor_utils.py # Tensor utilities
+│   └── config.py       # Configuration management
+├── training/           # Training utilities
+│   ├── trainer.py      # Trainer class
+│   └── schedulers.py   # Learning rate schedulers
+├── evaluation/         # Evaluation utilities
+│   ├── evaluator.py    # Static evaluation
+│   └── calculator.py   # ASE Calculator wrapper
+└── cli/                # Command-line interfaces
+    ├── train.py        # Training CLI
+    ├── evaluate.py     # Evaluation CLI
+    └── preprocess.py   # Preprocessing CLI
+```
+
+## Requirements
+
+- Python >= 3.8
+- PyTorch >= 1.12.0
+- e3nn >= 0.5.0
+- ASE >= 3.22.0
+- See `requirements.txt` for full list
+
+## Documentation
+
+For full CLI and hyperparameter documentation, see `USAGE.md`.
+
+## License
+
+MIT License
+
+## Citation
+
+If you use this library in your research, please cite:
+
+```bibtex
+@software{fused_equitensorpot,
+  title = {FusedEquiTensorPot},
+  version = {0.1.0},
+  url = {https://github.com/Parity-LRX/FusedEquiTensorPot}
+}
+```

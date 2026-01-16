@@ -1,0 +1,479 @@
+"""Command-line interface for evaluation."""
+
+import argparse
+import torch
+import logging
+from torch.utils.data import DataLoader
+
+from molecular_force_field.models import E3_TransformerLayer_multi, CartesianTransformerLayer, CartesianTransformerLayerStrict, CartesianTransformerLayerLoose
+from molecular_force_field.data import OnTheFlyDataset, H5Dataset
+from molecular_force_field.data.collate import on_the_fly_collate, collate_fn_h5
+from molecular_force_field.evaluation.evaluator import Evaluator
+from molecular_force_field.evaluation.calculator import MyE3NNCalculator
+from molecular_force_field.utils.config import ModelConfig
+
+
+def main():
+    """Main evaluation function."""
+    parser = argparse.ArgumentParser(description='Evaluate molecular force field model')
+    parser.add_argument('--checkpoint', type=str, required=True,
+                        help='Path to model checkpoint')
+    parser.add_argument('--test-prefix', type=str, default='test',
+                        help='Prefix for test data files')
+    parser.add_argument('--data-dir', type=str, default='.',
+                        help='Directory containing data files (default: current directory)')
+    parser.add_argument('--read-file', type=str, default=None,
+                        help='Path to read HDF5 file (for on-the-fly dataset)')
+    parser.add_argument('--energy-file', type=str, default=None,
+                        help='Path to energy HDF5 file (for on-the-fly dataset)')
+    parser.add_argument('--cell-file', type=str, default=None,
+                        help='Path to cell HDF5 file (for on-the-fly dataset)')
+    parser.add_argument('--max-radius', type=float, default=5.0,
+                        help='Maximum radius for neighbor search')
+    parser.add_argument('--batch-size', type=int, default=1,
+                        help='Batch size')
+    parser.add_argument('--device', type=str, default=None,
+                        help='Device to use (cuda/cpu)')
+    parser.add_argument('--output-prefix', type=str, default='test',
+                        help='Prefix for output files')
+    parser.add_argument('--use-h5', action='store_true',
+                        help='Use H5Dataset instead of OnTheFlyDataset')
+    parser.add_argument('--md-sim', action='store_true',
+                        help='Run MD simulation')
+    parser.add_argument('--neb', action='store_true',
+                        help='Run NEB calculation')
+    parser.add_argument('--dtype', type=str, default='float64',
+                        choices=['float32', 'float64', 'float', 'double'],
+                        help='Default dtype for tensors (float32 or float64, default: float64)')
+    
+    # MD simulation parameters
+    parser.add_argument('--md-input', type=str, default='start_structure.xyz',
+                        help='Input structure file for MD simulation (default: start_structure.xyz)')
+    parser.add_argument('--md-temperature', type=float, default=300.0,
+                        help='MD simulation temperature in Kelvin (default: 300.0)')
+    parser.add_argument('--md-timestep', type=float, default=1.0,
+                        help='MD timestep in femtoseconds (default: 1.0)')
+    parser.add_argument('--md-friction', type=float, default=0.01,
+                        help='Langevin friction coefficient (default: 0.01)')
+    parser.add_argument('--md-steps', type=int, default=10000,
+                        help='Number of MD steps (default: 10000)')
+    parser.add_argument('--md-relax-fmax', type=float, default=0.05,
+                        help='Force convergence for initial relaxation in eV/Å (default: 0.05)')
+    parser.add_argument('--md-log-interval', type=int, default=10,
+                        help='Interval for logging MD status (default: 10)')
+    parser.add_argument('--md-output', type=str, default='md_traj.xyz',
+                        help='Output trajectory file for MD (default: md_traj.xyz)')
+    parser.add_argument('--md-no-relax', action='store_true',
+                        help='Skip initial relaxation before MD')
+    
+    # NEB parameters
+    parser.add_argument('--neb-initial', type=str, default='initial.xyz',
+                        help='Initial structure for NEB (default: initial.xyz)')
+    parser.add_argument('--neb-final', type=str, default='final.xyz',
+                        help='Final structure for NEB (default: final.xyz)')
+    parser.add_argument('--neb-images', type=int, default=10,
+                        help='Number of intermediate NEB images (default: 10)')
+    parser.add_argument('--neb-fmax', type=float, default=0.05,
+                        help='Force convergence for NEB in eV/Å (default: 0.05)')
+    parser.add_argument('--neb-output', type=str, default='neb.traj',
+                        help='Output trajectory file for NEB (default: neb.traj)')
+    
+    # Model architecture hyperparameters
+    parser.add_argument('--max-atomvalue', type=int, default=10,
+                        help='Maximum atomic number in atom embedding (default: 10)')
+    parser.add_argument('--embedding-dim', type=int, default=16,
+                        help='Atom embedding dimension (default: 16)')
+    parser.add_argument('--lmax', type=int, default=2,
+                        help='Maximum L value for spherical harmonics in irreps (default: 2). Controls the highest order of irreducible representations.')
+    parser.add_argument('--irreps-output-conv-channels', type=int, default=None,
+                        help='Number of channels for irreps_output_conv (e.g., 64 for lmax=2 gives "64x0e + 64x1o + 64x2e"). If not set, uses channel_in from config (default: 64)')
+    parser.add_argument('--function-type', type=str, default='gaussian',
+                        choices=['gaussian', 'bessel', 'fourier', 'cosine', 'smooth_finite'],
+                        help='Basis function type for radial basis (default: gaussian). Options: gaussian, bessel, fourier, cosine, smooth_finite')
+    parser.add_argument('--tensor-product-mode', type=str, default='spherical',
+                        choices=['spherical', 'cartesian', 'cartesian-strict', 'cartesian-loose'],
+                        help='Tensor product mode: "spherical" uses e3nn spherical harmonics (default), '
+                             '"cartesian" uses Cartesian tensor products (faster, fewer parameters), '
+                             '"cartesian-strict" uses strict parity Cartesian products (physically rigorous), '
+                             '"cartesian-loose" uses optimized Cartesian tensor products (fastest, not strictly equivariant)')
+
+    # Atomic reference energies (E0)
+    parser.add_argument('--atomic-energy-file', type=str, default=None,
+                        help='CSV file with columns Atom,E0 to load atomic reference energies. '
+                             'If not set, defaults to fitted_E0.csv in the current directory.')
+    parser.add_argument('--atomic-energy-keys', type=int, nargs='+', default=None,
+                        help='Atomic numbers for custom atomic reference energies (must match --atomic-energy-values length).')
+    parser.add_argument('--atomic-energy-values', type=float, nargs='+', default=None,
+                        help='Atomic reference energies (E0) in eV corresponding to --atomic-energy-keys.')
+    
+    args = parser.parse_args()
+    
+    # Setup logging
+    logging.basicConfig(level=logging.INFO)
+    
+    # Set default dtype before creating any tensors
+    if args.dtype == 'float64' or args.dtype == 'double':
+        torch.set_default_dtype(torch.float64)
+        logging.info("Using dtype: float64")
+    elif args.dtype == 'float32' or args.dtype == 'float':
+        torch.set_default_dtype(torch.float32)
+        logging.info("Using dtype: float32")
+    
+    # Device setup
+    if args.device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+    
+    logging.info(f"Using device: {device}")
+    
+    # Load checkpoint
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    
+    # Model configuration
+    # Convert dtype string to torch.dtype
+    config_dtype = torch.float64 if args.dtype in ['float64', 'double'] else torch.float32
+    config = ModelConfig(
+        dtype=config_dtype,
+        max_atomvalue=args.max_atomvalue,
+        embedding_dim=args.embedding_dim,
+        lmax=args.lmax,
+        irreps_output_conv_channels=args.irreps_output_conv_channels,
+        function_type=args.function_type
+    )
+    
+    # Atomic reference energies (E0)
+    if args.atomic_energy_keys is not None or args.atomic_energy_values is not None:
+        if args.atomic_energy_keys is None or args.atomic_energy_values is None:
+            raise ValueError("Both --atomic-energy-keys and --atomic-energy-values must be provided together.")
+        if len(args.atomic_energy_keys) != len(args.atomic_energy_values):
+            raise ValueError("--atomic-energy-keys and --atomic-energy-values must have the same length.")
+        config.atomic_energy_keys = torch.tensor(args.atomic_energy_keys, dtype=torch.long)
+        config.atomic_energy_values = torch.tensor(args.atomic_energy_values, dtype=config.dtype)
+        logging.info("Using custom atomic reference energies from CLI.")
+    else:
+        e0_path = args.atomic_energy_file or 'fitted_E0.csv'
+        config.load_atomic_energies_from_file(e0_path)
+    
+    # Log model hyperparameters
+    logging.info("=" * 80)
+    logging.info("Model Hyperparameters:")
+    logging.info(f"  max_atomvalue: {config.max_atomvalue}")
+    logging.info(f"  embedding_dim: {config.embedding_dim}")
+    logging.info(f"  lmax: {config.lmax}")
+    logging.info(f"  irreps_output_conv: {config.get_irreps_output_conv()}")
+    logging.info(f"  function_type: {config.function_type}")
+    logging.info(f"  max_radius: {config.max_radius}")
+    logging.info(f"  dtype: {config.dtype}")
+    logging.info("=" * 80)
+    
+    # Initialize model based on tensor product mode
+    if args.tensor_product_mode == 'cartesian':
+        logging.info("Using Cartesian tensor product mode")
+        e3trans = CartesianTransformerLayer(
+            max_embed_radius=config.max_radius,
+            main_max_radius=config.max_radius_main,
+            main_number_of_basis=config.number_of_basis_main,
+            hidden_dim_conv=config.channel_in,
+            hidden_dim_sh=config.get_hidden_dim_sh(),
+            hidden_dim=config.emb_number_main_2,
+            channel_in2=config.channel_in2,
+            embedding_dim=config.embedding_dim,
+            max_atomvalue=config.max_atomvalue,
+            output_size=config.output_size,
+            embed_size=config.embed_size,
+            main_hidden_sizes3=config.main_hidden_sizes3,
+            num_layers=config.num_layers,
+            function_type_main=config.function_type,
+            lmax=config.lmax,
+            device=device
+        ).to(device)
+    elif args.tensor_product_mode == 'cartesian-strict':
+        logging.info("Using Cartesian tensor product mode with STRICT parity")
+        e3trans = CartesianTransformerLayerStrict(
+            max_embed_radius=config.max_radius,
+            main_max_radius=config.max_radius_main,
+            main_number_of_basis=config.number_of_basis_main,
+            hidden_dim_conv=config.channel_in,
+            hidden_dim_sh=config.get_hidden_dim_sh(),
+            hidden_dim=config.emb_number_main_2,
+            channel_in2=config.channel_in2,
+            embedding_dim=config.embedding_dim,
+            max_atomvalue=config.max_atomvalue,
+            output_size=config.output_size,
+            embed_size=config.embed_size,
+            main_hidden_sizes3=config.main_hidden_sizes3,
+            num_layers=config.num_layers,
+            function_type_main=config.function_type,
+            lmax=config.lmax,
+            device=device
+        ).to(device)
+    elif args.tensor_product_mode == 'cartesian-loose':
+        logging.info("Using Cartesian LOOSE mode (optimized CartesianFullyConnectedTP, fastest, not strictly equivariant)")
+        e3trans = CartesianTransformerLayerLoose(
+            max_embed_radius=config.max_radius,
+            main_max_radius=config.max_radius_main,
+            main_number_of_basis=config.number_of_basis_main,
+            hidden_dim_conv=config.channel_in,
+            hidden_dim_sh=config.get_hidden_dim_sh(),
+            hidden_dim=config.emb_number_main_2,
+            channel_in2=config.channel_in2,
+            embedding_dim=config.embedding_dim,
+            max_atomvalue=config.max_atomvalue,
+            output_size=config.output_size,
+            embed_size=config.embed_size,
+            main_hidden_sizes3=config.main_hidden_sizes3,
+            num_layers=config.num_layers,
+            function_type_main=config.function_type,
+            lmax=config.lmax,
+            device=device
+        ).to(device)
+    else:  # spherical (default)
+        logging.info("Using Spherical harmonics tensor product mode (e3nn)")
+        e3trans = E3_TransformerLayer_multi(
+            max_embed_radius=config.max_radius,
+            main_max_radius=config.max_radius_main,
+            main_number_of_basis=config.number_of_basis_main,
+            irreps_input=config.get_irreps_output_conv(),  # Fixed: should match train.py
+            irreps_query=config.get_irreps_query_main(),
+            irreps_key=config.get_irreps_key_main(),
+            irreps_value=config.get_irreps_value_main(),
+            irreps_output=config.get_irreps_output_conv_2(),
+            irreps_sh=config.get_irreps_sh_transformer(),
+            hidden_dim_sh=config.get_hidden_dim_sh(),
+            hidden_dim=config.emb_number_main_2,
+            channel_in2=config.channel_in2,
+            embedding_dim=config.embedding_dim,
+            max_atomvalue=config.max_atomvalue,
+            output_size=config.output_size,
+            embed_size=config.embed_size,
+            main_hidden_sizes3=config.main_hidden_sizes3,
+            num_layers=config.num_layers,
+            function_type_main=config.function_type,
+            device=device
+        ).to(device)
+    
+    e3trans.load_state_dict(checkpoint['e3trans_state_dict'])
+    e3trans.eval()
+    
+    logging.info("Loaded model from checkpoint.")
+    
+    # Skip static evaluation if only running NEB or MD
+    skip_static_eval = args.neb or args.md_sim
+    
+    if not skip_static_eval:
+        # Static evaluation
+        if args.use_h5:
+            dataset = H5Dataset(args.test_prefix, data_dir=args.data_dir)
+            collate_fn = collate_fn_h5
+        else:
+            if args.read_file is None:
+                args.read_file = f'read_{args.test_prefix}.h5'
+            if args.energy_file is None:
+                args.energy_file = f'raw_energy_{args.test_prefix}.h5'
+            if args.cell_file is None:
+                args.cell_file = f'cell_{args.test_prefix}.h5'
+            
+            dataset = OnTheFlyDataset(
+                args.read_file,
+                args.energy_file,
+                args.cell_file,
+                max_radius=args.max_radius
+            )
+            collate_fn = on_the_fly_collate
+        
+        data_loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=10,
+            pin_memory=True
+        )
+        
+        evaluator = Evaluator(
+            model=e3trans,
+            dataset=dataset,
+            device=device,
+            atomic_energy_keys=config.atomic_energy_keys,
+            atomic_energy_values=config.atomic_energy_values,
+        )
+        
+        logging.info("Starting static evaluation...")
+        metrics = evaluator.evaluate(data_loader, output_prefix=args.output_prefix)
+        logging.info(f"Evaluation completed! Energy RMSE: {metrics['energy_rmse']:.6f}")
+    
+    # MD simulation or NEB calculation
+    if args.md_sim or args.neb:
+        from ase import Atoms
+        from ase.io import read, write
+        from ase.optimize import BFGS
+        from ase.md.langevin import Langevin
+        from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
+        from ase import units
+        from ase.md import MDLogger
+        
+        ref_energies_dict = {
+            k.item(): v.item()
+            for k, v in zip(config.atomic_energy_keys, config.atomic_energy_values)
+        }
+        calc = MyE3NNCalculator(e3trans, ref_energies_dict, device, args.max_radius)
+        
+        if args.neb:
+            logging.info("=" * 60)
+            logging.info("NEB Calculation")
+            logging.info("=" * 60)
+            logging.info(f"  Initial structure: {args.neb_initial}")
+            logging.info(f"  Final structure:   {args.neb_final}")
+            logging.info(f"  Number of images:  {args.neb_images}")
+            logging.info(f"  Force threshold:   {args.neb_fmax} eV/Å")
+            logging.info(f"  Output trajectory: {args.neb_output}")
+            logging.info("=" * 60)
+            
+            from ase.mep import NEB
+            from ase.optimize import FIRE
+            
+            try:
+                initial_structure = read(args.neb_initial)
+                final_structure = read(args.neb_final)
+            except Exception as e:
+                logging.error(f"Error reading structure files: {e}")
+                return
+            
+            images = [initial_structure]
+            images += [initial_structure.copy() for _ in range(args.neb_images)]
+            images += [final_structure]
+            
+            neb = NEB(images, climb=True, method='improvedtangent', allow_shared_calculator=True)
+            neb.interpolate()
+            
+            for image in images:
+                # Use cell from initial structure if available, otherwise use large box
+                if initial_structure.cell.any():
+                    image.set_cell(initial_structure.cell)
+                    image.set_pbc(initial_structure.pbc)
+                else:
+                    image.set_cell([100, 100, 100])
+                    image.set_pbc(False)
+                image.set_calculator(calc)
+            
+            optimizer = FIRE(neb, trajectory=args.neb_output)
+            
+            def log_neb_status():
+                energies = [img.get_potential_energy() for img in images]
+                # Use NEB's projected forces (same as optimizer uses)
+                neb_forces = neb.get_forces()
+                n_images = len(images)
+                n_atoms = len(images[0])
+                forces_reshaped = neb_forces.reshape(n_images, n_atoms, 3)
+                intermediate_forces = forces_reshaped[1:-1]
+                max_force = (intermediate_forces**2).sum(axis=2).max()**0.5
+                logging.info(
+                    f"NEB step {optimizer.nsteps:4d} | E_min = {min(energies):.6f} eV | "
+                    f"E_max = {max(energies):.6f} eV | "
+                    f"Barrier = {max(energies) - energies[0]:.4f} eV | "
+                    f"F_max = {max_force:.4f} eV/Å"
+                )
+            
+            optimizer.attach(log_neb_status, interval=1)
+            
+            try:
+                optimizer.run(fmax=args.neb_fmax)
+                logging.info("NEB optimization completed successfully!")
+                
+                # Print final results
+                energies = [img.get_potential_energy() for img in images]
+                barrier = max(energies) - energies[0]
+                reverse_barrier = max(energies) - energies[-1]
+                logging.info("=" * 60)
+                logging.info("NEB Results:")
+                logging.info(f"  Forward barrier:  {barrier:.4f} eV")
+                logging.info(f"  Reverse barrier:  {reverse_barrier:.4f} eV")
+                logging.info(f"  Reaction energy:  {energies[-1] - energies[0]:.4f} eV")
+                logging.info("=" * 60)
+            except Exception as e:
+                logging.critical(f"Error during NEB optimization: {e}")
+        
+        if args.md_sim:
+            logging.info("=" * 60)
+            logging.info("MD Simulation")
+            logging.info("=" * 60)
+            logging.info(f"  Input structure:  {args.md_input}")
+            logging.info(f"  Temperature:      {args.md_temperature} K")
+            logging.info(f"  Timestep:         {args.md_timestep} fs")
+            logging.info(f"  Friction:         {args.md_friction}")
+            logging.info(f"  Total steps:      {args.md_steps}")
+            logging.info(f"  Log interval:     {args.md_log_interval}")
+            logging.info(f"  Output file:      {args.md_output}")
+            logging.info(f"  Skip relaxation:  {args.md_no_relax}")
+            logging.info("=" * 60)
+            
+            try:
+                atoms = read(args.md_input)
+                logging.info(f"Loaded {len(atoms)} atoms from {args.md_input}")
+            except Exception as e:
+                logging.error(f"Error reading {args.md_input}: {e}")
+                return
+            
+            atoms.set_calculator(calc)
+            
+            # Initial relaxation (optional)
+            if not args.md_no_relax:
+                logging.info(f"Relaxing structure (fmax={args.md_relax_fmax} eV/Å)...")
+                opt = BFGS(atoms, logfile='md_relax.log')
+                opt.run(fmax=args.md_relax_fmax)
+                logging.info("Relaxation completed.")
+                write('relaxed_structure.xyz', atoms)
+                logging.info("Saved relaxed structure to relaxed_structure.xyz")
+            
+            # Initialize velocities
+            logging.info(f"Initializing velocities at {args.md_temperature} K...")
+            MaxwellBoltzmannDistribution(atoms, temperature_K=args.md_temperature)
+            
+            # Setup Langevin dynamics
+            dyn = Langevin(
+                atoms, 
+                args.md_timestep * units.fs, 
+                temperature_K=args.md_temperature, 
+                friction=args.md_friction
+            )
+            
+            # Calculate total simulation time
+            total_time_fs = args.md_steps * args.md_timestep
+            total_time_ps = total_time_fs / 1000
+            logging.info(f"Starting MD: {args.md_steps} steps = {total_time_ps:.2f} ps")
+            
+            # Log file
+            md_log_file = args.md_output.replace('.xyz', '_log.txt').replace('.traj', '_log.txt')
+            if md_log_file == args.md_output:
+                md_log_file = 'md_log.txt'
+            
+            def print_status():
+                time_fs = dyn.nsteps * args.md_timestep
+                time_ps = time_fs / 1000
+                logging.info(
+                    f"Step {dyn.nsteps:6d} | t = {time_ps:8.3f} ps | "
+                    f"T = {atoms.get_temperature():6.1f} K | "
+                    f"E_pot = {atoms.get_potential_energy():10.4f} eV | "
+                    f"E_tot = {atoms.get_total_energy():10.4f} eV"
+                )
+            
+            dyn.attach(MDLogger(dyn, atoms, md_log_file, header=True, mode="w"), interval=args.md_log_interval)
+            dyn.attach(print_status, interval=args.md_log_interval)
+            dyn.attach(lambda: write(args.md_output, atoms, append=True), interval=args.md_log_interval)
+            
+            try:
+                dyn.run(args.md_steps)
+                logging.info("=" * 60)
+                logging.info("MD simulation completed successfully!")
+                logging.info(f"  Final temperature: {atoms.get_temperature():.1f} K")
+                logging.info(f"  Final energy:      {atoms.get_potential_energy():.4f} eV")
+                logging.info(f"  Trajectory saved:  {args.md_output}")
+                logging.info(f"  Log saved:         {md_log_file}")
+                logging.info("=" * 60)
+            except Exception as e:
+                logging.critical(f"Error during MD simulation: {e}")
+
+
+if __name__ == '__main__':
+    main()

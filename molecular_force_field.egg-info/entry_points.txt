@@ -1,0 +1,5 @@
+[console_scripts]
+mff-evaluate = molecular_force_field.cli.evaluate:main
+mff-lammps = molecular_force_field.cli.lammps_interface:main
+mff-preprocess = molecular_force_field.cli.preprocess:main
+mff-train = molecular_force_field.cli.train:main
