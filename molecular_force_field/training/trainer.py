@@ -98,6 +98,7 @@ class Trainer:
         world_size=1,
         train_sampler=None,
         save_val_csv=False,
+        use_checkpoint_loss_weights=True,
     ):
         """
         Initialize trainer.
@@ -145,6 +146,8 @@ class Trainer:
             train_sampler: Distributed sampler for training data
             save_val_csv: Whether to save validation energy and force predictions to CSV files
                 (default: True). If False, only metrics are logged but CSV files are not saved.
+            use_checkpoint_loss_weights: Whether to use loss weights (a, b) from checkpoint when loading.
+                If True (default), use checkpoint values. If False, use the values passed to __init__.
         """
         self.distributed = distributed
         self.rank = rank
@@ -196,6 +199,7 @@ class Trainer:
         self.e3trans_ema = None  # will be initialized when EMA starts
         self.checkpoint_path = checkpoint_path
         self.save_val_csv = save_val_csv  # Control whether to save val_energy.csv and val_force.csv
+        self.use_checkpoint_loss_weights = use_checkpoint_loss_weights  # Whether to use checkpoint a/b
         
         # Initialize loss tracking for CSV
         self.loss_csv_path = 'loss.csv'
@@ -313,11 +317,17 @@ class Trainer:
         else:
             self.e3trans.load_state_dict(checkpoint['e3trans_state_dict'])
         
-        # Load loss weights
-        if 'a' in checkpoint:
-            self.a = checkpoint['a']
-        if 'b' in checkpoint:
-            self.b = checkpoint['b']
+        # Load loss weights (only if use_checkpoint_loss_weights is True)
+        if self.use_checkpoint_loss_weights:
+            if 'a' in checkpoint:
+                self.a = checkpoint['a']
+            if 'b' in checkpoint:
+                self.b = checkpoint['b']
+            if self.is_main_process:
+                logging.info(f"  Using loss weights from checkpoint: a={self.a:.4f}, b={self.b:.4f}")
+        else:
+            if self.is_main_process:
+                logging.info(f"  Using new loss weights (ignoring checkpoint): a={self.a:.4f}, b={self.b:.4f}")
         if 'swa_applied' in checkpoint:
             self.swa_applied = checkpoint['swa_applied']
         if 'ema_enabled' in checkpoint:
@@ -347,7 +357,10 @@ class Trainer:
             logging.info("Checkpoint Loaded Successfully!")
             logging.info(f"  Resuming from epoch: {self.start_epoch}")
             logging.info(f"  Batch count: {self.batch_count}")
-            logging.info(f"  Loss weights: a={self.a:.4f}, b={self.b:.4f}")
+            if self.use_checkpoint_loss_weights:
+                logging.info(f"  Loss weights (from checkpoint): a={self.a:.4f}, b={self.b:.4f}")
+            else:
+                logging.info(f"  Loss weights (new, ignoring checkpoint): a={self.a:.4f}, b={self.b:.4f}")
             logging.info(f"  Best validation loss: {self.best_val_loss:.6f}")
             logging.info(f"  Early stopping patience counter: {self.patience_counter}/{self.patience}")
             logging.info("=" * 80)

@@ -654,6 +654,11 @@ def save_to_h5_parallel(prefix, max_radius, num_workers, data_dir='.'):
         pbc = pbcs_all[idx].tolist() if idx < len(pbcs_all) else None
         tasks.append((idx, pos, atom_types, cell, pbc, max_radius))
 
+    # CLI/tests may pass num_workers=0 to mean "no parallelism".
+    # ProcessPoolExecutor requires max_workers >= 1 and we also avoid division by zero.
+    if num_workers is None or num_workers <= 0:
+        num_workers = 1
+
     # chunksize determines how many tasks to distribute to each process at once
     chunk_size = max(1, total_frames // (num_workers * 4))
     

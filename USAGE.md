@@ -210,7 +210,11 @@ mff-train \
   - `smooth_finite`: 平滑有限支撑基函数
 - `--tensor-product-mode`: 张量积实现模式（默认'spherical'）。选项：
   - `spherical`: 使用 e3nn 球谐函数张量积（默认，精度高）
-  - `cartesian`: 使用笛卡尔张量积（**速度快 2x+，参数少 45%**）
+  - `partial-cartesian`: 使用笛卡尔张量积（严格等变，参数量减少 17.3%）
+  - `partial-cartesian-loose`: 非严格等变张量积（使用 norm product 近似，速度接近 Spherical，参数量减少 17.3%）
+  - `pure-cartesian`: 纯笛卡尔张量积（3^L 表示，δ/ε 收缩，速度较慢，参数量大）
+  - `pure-cartesian-sparse`: 稀疏纯笛卡尔张量积（参数量减少 30.1%，速度接近 Spherical）
+  - `pure-cartesian-ictd`: 纯笛卡尔消息传递 + ICTD trace 链不变量读出（严格等变；通常比 pure-cartesian-sparse 慢很多）
 
 **SWA 和 EMA 参数：**
 - `--swa-start-epoch`: 开始 SWA（Stochastic Weight Averaging）的 epoch。启用后，`a` 和 `b` 会在该 epoch 直接切换为 `--swa-a` 和 `--swa-b` 的值，并重置早停计数器
@@ -1378,10 +1382,16 @@ torchrun --nproc_per_node=4 \
 
 ### Q: 如何加速训练？
 
-**1. 使用笛卡尔张量积模式（推荐，2.2x 加速）：**
+**1. 使用优化的张量积模式：**
 ```bash
-# 笛卡尔模式比球谐模式快 2 倍以上，参数量减少 45%
-mff-train --input-file data.xyz --tensor-product-mode cartesian
+# Pure-Cartesian-Sparse: 参数量减少最多（30.1%），速度接近 Spherical（0.86x）
+mff-train --input-file data.xyz --tensor-product-mode pure-cartesian-sparse
+
+# Partial-Cartesian-Loose: 非严格等变（norm product 近似），速度接近 Spherical（0.90x），参数量减少 17.3%
+mff-train --input-file data.xyz --tensor-product-mode partial-cartesian-loose
+
+# Partial-Cartesian: 严格等变，参数量减少 17.3%
+mff-train --input-file data.xyz --tensor-product-mode partial-cartesian
 ```
 
 **2. 使用预处理数据：**
@@ -1434,24 +1444,29 @@ torchrun --nproc_per_node=4 \
     --batch-size 8
 ```
 
-### Q: 应该选择 Spherical 还是 Cartesian 模式？
+### Q: 应该选择哪种张量积模式？
 
 | 场景 | 推荐模式 | 原因 |
 |------|----------|------|
-| 发表论文/高精度需求 | `spherical` | 使用 e3nn 严格球谐，精度最高 |
-| 大规模 MD 模拟 | `cartesian` | 推理速度快 2x+，适合长时间模拟 |
-| GPU 内存受限 | `cartesian` | 参数量减少 45%，显存占用更低 |
-| 生产环境部署 | `cartesian` | 速度优先 |
-| 快速实验迭代 | `cartesian` | 训练更快 |
-| 首次尝试/对比基准 | `spherical` | 验证模型正确性 |
+| 发表论文/高精度需求 | `spherical` | 使用 e3nn 严格球谐，精度最高，标准实现 |
+| 参数量优化（最多） | `pure-cartesian-ictd` | 参数量减少 73.5%，速度较快（0.72x），严格等变 |
+| 参数量优化（平衡） | `pure-cartesian-sparse` | 参数量减少 30.1%，速度接近 Spherical（0.93x），严格等变 |
+| GPU 内存受限 | `pure-cartesian-ictd` 或 `pure-cartesian-sparse` | 参数量减少 73.5% 或 30.1%，显存占用更低 |
+| 严格等变性要求 | `spherical`、`partial-cartesian`、`pure-cartesian-sparse` 或 `pure-cartesian-ictd` | 这些模式都严格等变 |
+| 快速实验迭代 | `partial-cartesian-loose` | 速度最快（0.62x），但非严格等变（norm product 近似） |
+| 首次尝试/对比基准 | `spherical` | 验证模型正确性，性能基准 |
+| 大规模模型部署 | `pure-cartesian-ictd` | 参数量最少（减少 73.5%），速度较快（0.72x） |
 
 **切换模式：**
 ```bash
 # 球谐模式（默认）
 mff-train --input-file data.xyz
 
-# 笛卡尔模式
-mff-train --input-file data.xyz --tensor-product-mode cartesian
+# 其他模式
+mff-train --input-file data.xyz --tensor-product-mode partial-cartesian
+mff-train --input-file data.xyz --tensor-product-mode partial-cartesian-loose
+mff-train --input-file data.xyz --tensor-product-mode pure-cartesian-sparse
+mff-train --input-file data.xyz --tensor-product-mode pure-cartesian-ictd
 ```
 
 **注意：** 训练和评估必须使用相同的模式！
@@ -1661,21 +1676,20 @@ mff-train \
    - **稳定阶段**：保持`learning_rate`
    - **衰减阶段**：如果验证指标不改善，每`--lr-decay-patience`个batch后乘以`--lr-decay-factor`
 
-## 笛卡尔张量积模式
+## 张量积模式对比
 
-FusedEquiTensorPot 支持两种张量积实现模式：
+FusedEquiTensorPot 支持六种张量积实现模式，每种模式在速度、参数量和等变性方面有不同的特点：
 
-### 模式对比
+### 模式对比总览
 
-| 特性 | Spherical (e3nn) | Cartesian |
-|------|------------------|-----------|
-| 实现 | e3nn 球谐函数 | 笛卡尔坐标直接计算 |
-| 速度 | 基准 | **2.2x 加速** |
-| 参数量 | 基准 | **减少 45%** |
-| 精度 | 最高 | 接近 |
-| 等变性 | ✅ 严格等变 | ✅ 等变 |
-| DDP 支持 | ✅ | ✅ |
-| SWA/EMA 支持 | ✅ | ✅ |
+| 特性 | Spherical | Partial-Cartesian | Partial-Cartesian-Loose | Pure-Cartesian | Pure-Cartesian-Sparse | Pure-Cartesian-ICTD |
+|------|-----------|-------------------|------------------------|----------------|----------------------|---------------------|
+| 实现 | e3nn 球谐函数 | 笛卡尔坐标 + CG 系数 | 非严格等变（norm product 近似） | 纯笛卡尔（3^L，δ/ε） | 稀疏纯笛卡尔（δ/ε） | ICTD irreps 内部表示 |
+| 等变性 | ✅ 严格等变 | ✅ 严格等变 | ⚠️ 近似等变 | ✅ 严格等变 | ✅ 严格等变 | ✅ 严格等变 |
+| 速度 (GPU, 64 atoms) | 50.79 ms (基准 1.00x) | 57.52 ms (1.13x) | 31.66 ms (0.62x) | 470.30 ms (9.26x) | 47.09 ms (0.93x) | 36.68 ms (0.72x) |
+| 参数量 | 6,540,634 (100%) | 5,404,938 (82.6%) | 5,406,026 (82.7%) | 33,591,562 (514.0%) | 4,571,402 (69.9%) | 1,734,304 (26.5%) |
+| 参数量变化 | - | **减少 17.4%** | **减少 17.3%** | +414% | **减少 30.1%** | **减少 73.5%** |
+| 推荐场景 | 默认，最高精度 | 严格等变，平衡性能 | 快速迭代，非严格等变可接受 | 不推荐（速度慢） | 参数量优化，严格等变 | 参数量最少，严格等变 |
 
 ### 使用方法
 
@@ -1685,37 +1699,79 @@ FusedEquiTensorPot 支持两种张量积实现模式：
 mff-train --input-file data.xyz --data-dir output
 
 # 笛卡尔模式（速度快，参数少）
-mff-train --input-file data.xyz --data-dir output --tensor-product-mode cartesian
+mff-train --input-file data.xyz --data-dir output --tensor-product-mode partial-cartesian
 ```
 
 **评估时必须使用相同模式：**
 ```bash
 # 如果训练时用的是 cartesian
-mff-evaluate --checkpoint model.pth --tensor-product-mode cartesian
+mff-evaluate --checkpoint model.pth --tensor-product-mode partial-cartesian
 ```
 
-### 性能对比（channels=64, lmax=2）
+### 详细性能对比（channels=64, lmax=2, GPU，64 atoms，512 edges）
 
-| 系统规模 | Spherical (ms) | Cartesian (ms) | 加速比 |
-|----------|----------------|----------------|--------|
-| 20 atoms | 35.2 | 15.5 | 2.28x |
-| 50 atoms | 141.8 | 64.4 | 2.20x |
-| 100 atoms | 404.3 | 182.9 | 2.21x |
+**前向传播速度（单次前向，30次平均，以 Spherical 为基准）：**
+| 模式 | 时间 (ms) | 相对速度 | 等变性误差 |
+|------|-----------|----------|------------|
+| Spherical | 50.79 | 1.00x (基准) | 0.00e+00 ✅ |
+| Partial-Cartesian | 57.52 | 1.13x | 0.00e+00 ✅ |
+| Partial-Cartesian-Loose | 31.66 | **0.62x (最快)** | 0.00e+00 ✅ |
+| Pure-Cartesian | 470.30 | 9.26x (最慢) | 0.00e+00 ✅ |
+| Pure-Cartesian-Sparse | 47.09 | 0.93x | 0.00e+00 ✅ |
+| Pure-Cartesian-ICTD | 36.68 | 0.72x | 0.00e+00 ✅ |
 
-**参数量：** Spherical=6,534,394 | Cartesian=3,609,780 (55.2%)
+**参数量对比（以 Spherical 为基准）：**
+| 模式 | 参数量 | 相对参数量 | 参数量变化 |
+|------|--------|------------|------------|
+| Spherical | 6,540,634 | 100% (基准) | - |
+| Partial-Cartesian | 5,404,938 | 82.6% | **减少 17.4%** |
+| Partial-Cartesian-Loose | 5,406,026 | 82.7% | **减少 17.3%** |
+| Pure-Cartesian | 33,591,562 | 514.0% | +414% |
+| Pure-Cartesian-Sparse | 4,571,402 | 69.9% | **减少 30.1%** |
+| Pure-Cartesian-ICTD | 1,734,304 | 26.5% | **减少 73.5%** |
+
+**关键发现：**
+- ✅ 所有模式均通过 O(3) 等变性测试（包括宇称/反射），等变性误差 < 1e-6
+- 🚀 **Partial-Cartesian-Loose** 速度最快（0.62x），但非严格等变（使用 norm product 近似）
+- 🚀 **Pure-Cartesian-ICTD** 速度第二快（0.72x），且严格等变
+- 💾 **Pure-Cartesian-ICTD** 参数量最少（减少 73.5%），且严格等变，是参数量优化的最佳选择
+- 💾 **Pure-Cartesian-Sparse** 参数量减少 30.1%，速度接近 Spherical（0.93x），是平衡性能和参数量的好选择
+- ⚠️ **Pure-Cartesian**（非稀疏）速度最慢（9.26x），参数量最大（+414%），不推荐使用
+- 📊 测试环境：GPU (CUDA)，channels=64, lmax=2, 64 atoms, 512 edges
+- ⚠️ 在 CPU 上性能可能不同，建议根据实际硬件测试
 
 ### 推荐使用场景
 
 **使用 Spherical（默认）：**
-- 需要最高精度
-- 研究/发表论文场景
-- 小规模数据集
+- ✅ 需要最高精度和兼容性
+- ✅ 研究/发表论文场景（标准 e3nn 实现）
+- ✅ 首次尝试/对比基准
+- ✅ 小规模数据集
 
-**使用 Cartesian：**
-- 需要更快的推理速度
-- 大规模 MD 模拟
-- GPU 内存受限
-- 生产环境部署
+**使用 Partial-Cartesian：**
+- ✅ 需要严格等变性但参数量更少（减少 17.4%）
+- ✅ GPU 内存受限场景
+- ✅ 需要平衡性能和等变性
+
+**使用 Partial-Cartesian-Loose：**
+- ✅ 快速实验迭代（速度最快，0.62x）
+- ⚠️ 对严格等变性要求不高的场景（使用 norm product 近似，非严格等变）
+- ⚠️ 注意：虽然等变性误差 < 1e-6，但理论上非严格等变
+
+**使用 Pure-Cartesian-Sparse：**
+- ✅ 参数量优化优先（减少 30.1%）
+- ✅ 速度接近 Spherical（0.93x），严格等变
+- ✅ 平衡参数量和性能的最佳选择
+
+**使用 Pure-Cartesian-ICTD：**
+- ✅ 参数量最少（减少 73.5%），严格等变
+- ✅ 速度较快（0.72x）
+- ✅ 内存极度受限场景
+- ✅ 大规模模型部署
+
+**不推荐使用 Pure-Cartesian：**
+- ❌ 速度最慢（9.26x），参数量最大（+414%）
+- ❌ 仅用于研究目的，不推荐实际使用
 
 ### 完整示例：笛卡尔模式 + 多卡 + SWA + EMA
 
@@ -1723,7 +1779,7 @@ mff-evaluate --checkpoint model.pth --tensor-product-mode cartesian
 torchrun --nproc_per_node=4 -m molecular_force_field.cli.train \
     --input-file large_dataset.xyz \
     --data-dir data \
-    --tensor-product-mode cartesian \
+    --tensor-product-mode partial-cartesian \
     --distributed \
     --epochs 2000 \
     --batch-size 8 \

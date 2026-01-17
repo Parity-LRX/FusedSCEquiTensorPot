@@ -9,9 +9,11 @@
 ## ✨ Features
 
 - **Multiple Tensor Product Modes**: 
-  - `spherical`: e3nn-based spherical harmonics (strictly equivariant)
-  - `cartesian`: Cartesian tensor products with CG coefficients (strictly equivariant)
-  - `cartesian-loose`: Optimized Cartesian tensor products (approximate equivariance)
+  - `spherical`: e3nn-based spherical harmonics (strictly equivariant, default)
+  - `partial-cartesian`: Cartesian tensor products with CG coefficients (strictly equivariant, -17.4% params)
+  - `partial-cartesian-loose`: Optimized Cartesian tensor products (approximate equivariance, fastest)
+  - `pure-cartesian-sparse`: Sparse pure Cartesian with δ/ε contractions (strictly equivariant, -30.1% params)
+  - `pure-cartesian-ictd`: ICTD trace-chain invariants (strictly equivariant, -73.5% params, best for memory)
   
 - **E(3)-Equivariant**: All modes maintain rotational equivariance and parity conservation
   
@@ -76,13 +78,23 @@ mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda
 Train with Cartesian mode (strictly equivariant):
 
 ```bash
-mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode cartesian
+mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode partial-cartesian
 ```
 
-Train with Cartesian-Loose mode:
+Train with different tensor product modes:
 
 ```bash
-mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode cartesian-loose
+# Partial-Cartesian (strictly equivariant, -17.4% params)
+mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode partial-cartesian
+
+# Partial-Cartesian-Loose (fastest, approximate equivariance)
+mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode partial-cartesian-loose
+
+# Pure-Cartesian-Sparse (strictly equivariant, -30.1% params)
+mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode pure-cartesian-sparse
+
+# Pure-Cartesian-ICTD (strictly equivariant, -73.5% params, best for memory)
+mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode pure-cartesian-ictd
 ```
 
 Optional: clamp dynamic loss weights `a/b` (they change during training):
@@ -106,14 +118,20 @@ mff-train --data-dir data --atomic-energy-keys 1 6 7 8 --atomic-energy-values -4
 Evaluate a trained model (use the same tensor-product-mode as training):
 
 ```bash
-# For spherical mode
+# For spherical mode (default)
 mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode spherical --use-h5
 
-# For cartesian mode
-mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode cartesian --use-h5
+# For partial-cartesian mode
+mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode partial-cartesian --use-h5
 
-# For cartesian-loose mode
-mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode cartesian-loose --use-h5
+# For partial-cartesian-loose mode
+mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode partial-cartesian-loose --use-h5
+
+# For pure-cartesian-sparse mode
+mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode pure-cartesian-sparse --use-h5
+
+# For pure-cartesian-ictd mode
+mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode pure-cartesian-ictd --use-h5
 ```
 
 Outputs include:
@@ -233,17 +251,28 @@ molecular_force_field/
 
 ## 🎯 Choosing Tensor Product Mode
 
-The library supports three tensor product modes, each with different characteristics:
+The library supports **six tensor product modes**, each optimized for different use cases:
 
-| Mode | Equivariance | Implementation | Use Case |
-|------|--------------|----------------|----------|
-| `spherical` | Strict | e3nn spherical harmonics | Standard e3nn implementation, most compatible |
-| `cartesian` | Strict | Cartesian with CG coefficients | Cartesian implementation with strict equivariance |
-| `cartesian-loose` | Approximate* | Optimized Cartesian | Alternative implementation with norm product approximation |
+| Mode | Equivariance | Speed* | Parameters* | Use Case |
+|------|--------------|--------|-------------|----------|
+| `spherical` | ✅ Strict | 1.00x (baseline) | 100% (baseline) | Default, maximum compatibility, research/publication |
+| `partial-cartesian` | ✅ Strict | 1.13x | 82.6% (-17.4%) | Strict equivariance with fewer parameters |
+| `partial-cartesian-loose` | ⚠️ Approximate | **0.62x (fastest)** | 82.7% (-17.3%) | Fast iteration, approximate equivariance acceptable |
+| `pure-cartesian-sparse` | ✅ Strict | 0.93x | 69.9% (-30.1%) | Best balance: fewer params, near-baseline speed |
+| `pure-cartesian-ictd` | ✅ Strict | 0.72x | **26.5% (-73.5%)** | **Best for memory**: fewest params, fast, strictly equivariant |
+| `pure-cartesian` | ✅ Strict | 9.26x (slowest) | 514.0% (+414%) | ❌ Not recommended (too slow, too many params) |
 
-*Note: `cartesian-loose` maintains equivariance within numerical precision (tested to machine precision).
+*Benchmark results on GPU (CUDA), channels=64, lmax=2, 64 atoms, 512 edges. All modes pass O(3) equivariance tests (error < 1e-6).
 
-**Recommendation**: Choose based on your requirements - `spherical` for maximum compatibility, `cartesian` for strict equivariance with Cartesian implementation, or `cartesian-loose` for an alternative approach.
+### Quick Recommendations
+
+- **First time / Research**: Use `spherical` (default)
+- **Memory constrained**: Use `pure-cartesian-ictd` (73.5% fewer parameters)
+- **Speed priority**: Use `partial-cartesian-loose` (fastest, but approximate equivariance)
+- **Best balance**: Use `pure-cartesian-sparse` (30.1% fewer params, 0.93x speed)
+- **Strict equivariance + fewer params**: Use `partial-cartesian` or `pure-cartesian-sparse`
+
+For detailed performance comparison and recommendations, see [USAGE.md](USAGE.md#张量积模式对比).
 
 ## 📚 Documentation
 

@@ -5,7 +5,14 @@ import torch
 import logging
 from torch.utils.data import DataLoader
 
-from molecular_force_field.models import E3_TransformerLayer_multi, CartesianTransformerLayer, CartesianTransformerLayerStrict, CartesianTransformerLayerLoose
+from molecular_force_field.models import (
+    E3_TransformerLayer_multi,
+    CartesianTransformerLayer,
+    CartesianTransformerLayerLoose,
+    PureCartesianTransformerLayer,
+    PureCartesianSparseTransformerLayer,
+    PureCartesianICTDTransformerLayer,
+)
 from molecular_force_field.data import OnTheFlyDataset, H5Dataset
 from molecular_force_field.data.collate import on_the_fly_collate, collate_fn_h5
 from molecular_force_field.evaluation.evaluator import Evaluator
@@ -91,11 +98,13 @@ def main():
                         choices=['gaussian', 'bessel', 'fourier', 'cosine', 'smooth_finite'],
                         help='Basis function type for radial basis (default: gaussian). Options: gaussian, bessel, fourier, cosine, smooth_finite')
     parser.add_argument('--tensor-product-mode', type=str, default='spherical',
-                        choices=['spherical', 'cartesian', 'cartesian-strict', 'cartesian-loose'],
+                        choices=['spherical', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-ictd'],
                         help='Tensor product mode: "spherical" uses e3nn spherical harmonics (default), '
-                             '"cartesian" uses Cartesian tensor products (faster, fewer parameters), '
-                             '"cartesian-strict" uses strict parity Cartesian products (physically rigorous), '
-                             '"cartesian-loose" uses optimized Cartesian tensor products (fastest, not strictly equivariant)')
+                             '"partial-cartesian" uses Cartesian tensor products (strictly equivariant), '
+                             '"partial-cartesian-loose" uses non-strictly-equivariant Cartesian tensor products (norm product approximation, not strictly equivariant), '
+                             '"pure-cartesian" uses full rank Cartesian tensors (3^L) with delta/epsilon contractions (most pure), '
+                             '"pure-cartesian-sparse" uses a sparse pure-cartesian delta/epsilon tensor product (O(3) strict) by restricting rank-rank paths, '
+                             '"pure-cartesian-ictd" uses pure-cartesian message passing but ICTD trace-chain invariants for readout')
 
     # Atomic reference energies (E0)
     parser.add_argument('--atomic-energy-file', type=str, default=None,
@@ -168,8 +177,68 @@ def main():
     logging.info("=" * 80)
     
     # Initialize model based on tensor product mode
-    if args.tensor_product_mode == 'cartesian':
-        logging.info("Using Cartesian tensor product mode")
+    if args.tensor_product_mode == 'pure-cartesian':
+        logging.info("Using PURE Cartesian mode (rank tensors 3^L with delta/epsilon contractions)")
+        e3trans = PureCartesianTransformerLayer(
+            max_embed_radius=config.max_radius,
+            main_max_radius=config.max_radius_main,
+            main_number_of_basis=config.number_of_basis_main,
+            hidden_dim_conv=config.channel_in,
+            hidden_dim_sh=config.get_hidden_dim_sh(),
+            hidden_dim=config.emb_number_main_2,
+            channel_in2=config.channel_in2,
+            embedding_dim=config.embedding_dim,
+            max_atomvalue=config.max_atomvalue,
+            output_size=config.output_size,
+            embed_size=config.embed_size,
+            main_hidden_sizes3=config.main_hidden_sizes3,
+            num_layers=config.num_layers,
+            function_type_main=config.function_type,
+            lmax=config.lmax,
+            device=device
+        ).to(device)
+    elif args.tensor_product_mode == 'pure-cartesian-ictd':
+        logging.info("Using PURE Cartesian ICTD mode (trace-chain invariants for readout)")
+        e3trans = PureCartesianICTDTransformerLayer(
+            max_embed_radius=config.max_radius,
+            main_max_radius=config.max_radius_main,
+            main_number_of_basis=config.number_of_basis_main,
+            hidden_dim_conv=config.channel_in,
+            hidden_dim_sh=config.get_hidden_dim_sh(),
+            hidden_dim=config.emb_number_main_2,
+            channel_in2=config.channel_in2,
+            embedding_dim=config.embedding_dim,
+            max_atomvalue=config.max_atomvalue,
+            output_size=config.output_size,
+            embed_size=config.embed_size,
+            main_hidden_sizes3=config.main_hidden_sizes3,
+            num_layers=config.num_layers,
+            function_type_main=config.function_type,
+            lmax=config.lmax,
+            device=device,
+        ).to(device)
+    elif args.tensor_product_mode == 'pure-cartesian-sparse':
+        logging.info("Using PURE Cartesian SPARSE mode (δ/ε path-sparse within 3^L, O(3) strict)")
+        e3trans = PureCartesianSparseTransformerLayer(
+            max_embed_radius=config.max_radius,
+            main_max_radius=config.max_radius_main,
+            main_number_of_basis=config.number_of_basis_main,
+            hidden_dim_conv=config.channel_in,
+            hidden_dim_sh=config.get_hidden_dim_sh(),
+            hidden_dim=config.emb_number_main_2,
+            channel_in2=config.channel_in2,
+            embedding_dim=config.embedding_dim,
+            max_atomvalue=config.max_atomvalue,
+            output_size=config.output_size,
+            embed_size=config.embed_size,
+            main_hidden_sizes3=config.main_hidden_sizes3,
+            num_layers=config.num_layers,
+            function_type_main=config.function_type,
+            lmax=config.lmax,
+            device=device
+        ).to(device)
+    elif args.tensor_product_mode == 'partial-cartesian':
+        logging.info("Using Partial-Cartesian tensor product mode (strict)")
         e3trans = CartesianTransformerLayer(
             max_embed_radius=config.max_radius,
             main_max_radius=config.max_radius_main,
@@ -188,28 +257,8 @@ def main():
             lmax=config.lmax,
             device=device
         ).to(device)
-    elif args.tensor_product_mode == 'cartesian-strict':
-        logging.info("Using Cartesian tensor product mode with STRICT parity")
-        e3trans = CartesianTransformerLayerStrict(
-            max_embed_radius=config.max_radius,
-            main_max_radius=config.max_radius_main,
-            main_number_of_basis=config.number_of_basis_main,
-            hidden_dim_conv=config.channel_in,
-            hidden_dim_sh=config.get_hidden_dim_sh(),
-            hidden_dim=config.emb_number_main_2,
-            channel_in2=config.channel_in2,
-            embedding_dim=config.embedding_dim,
-            max_atomvalue=config.max_atomvalue,
-            output_size=config.output_size,
-            embed_size=config.embed_size,
-            main_hidden_sizes3=config.main_hidden_sizes3,
-            num_layers=config.num_layers,
-            function_type_main=config.function_type,
-            lmax=config.lmax,
-            device=device
-        ).to(device)
-    elif args.tensor_product_mode == 'cartesian-loose':
-        logging.info("Using Cartesian LOOSE mode (optimized CartesianFullyConnectedTP, fastest, not strictly equivariant)")
+    elif args.tensor_product_mode == 'partial-cartesian-loose':
+        logging.info("Using Partial-Cartesian LOOSE mode (non-strictly-equivariant, norm product approximation)")
         e3trans = CartesianTransformerLayerLoose(
             max_embed_radius=config.max_radius,
             main_max_radius=config.max_radius_main,

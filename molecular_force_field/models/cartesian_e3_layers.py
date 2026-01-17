@@ -2010,6 +2010,12 @@ class CartesianE3ConvSparse(nn.Module):
         )
     
     def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell):
+        # Keep geometry dtype consistent with module parameters (datasets may provide float64)
+        dtype = next(self.parameters()).dtype
+        pos = pos.to(dtype=dtype)
+        cell = cell.to(dtype=dtype)
+        edge_shifts = edge_shifts.to(dtype=dtype)
+
         edge_batch_idx = batch[edge_src]
         edge_cells = cell[edge_batch_idx]
         shift_vecs = torch.einsum('ni,nij->nj', edge_shifts, edge_cells)
@@ -2163,6 +2169,12 @@ class CartesianE3Conv2Sparse(nn.Module):
               f"tp_weight_numel={self.tp.weight_numel}")
     
     def forward(self, f_in, pos, A, batch, edge_src, edge_dst, edge_shifts, cell):
+        # Keep geometry dtype consistent with feature dtype to avoid float/double mismatches
+        dtype = f_in.dtype
+        pos = pos.to(dtype=dtype)
+        cell = cell.to(dtype=dtype)
+        edge_shifts = edge_shifts.to(dtype=dtype)
+
         edge_batch_idx = batch[edge_src]
         edge_cells = cell[edge_batch_idx]
         shift_vecs = torch.einsum('ni,nij->nj', edge_shifts, edge_cells)

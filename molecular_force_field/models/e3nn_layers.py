@@ -319,6 +319,10 @@ class E3_TransformerLayer_multi(nn.Module):
         else:
             self.device = device
         
+        # emb_number should be a list, not an integer
+        # Use default [64, 64, 64] if hidden_dim is not a list
+        emb_number = [64, 64, 64] if not isinstance(hidden_dim, list) else hidden_dim
+        
         # Input irreps (scalar part)
         irreps_scalars = o3.Irreps(f"{32}x0e + {32}x0e")
         # Gate signal irreps
@@ -353,7 +357,7 @@ class E3_TransformerLayer_multi(nn.Module):
             output_size=output_size,
             main_hidden_sizes3=main_hidden_sizes3,
             embed_size=embed_size,
-            emb_number=hidden_dim,
+            emb_number=emb_number,
             atomic_energy_keys=torch.tensor([1, 6, 7, 8], device=self.device),
         )
         # Original code: E3Conv2(number_of_basis, max_embed_radius, irreps_output_conv, irreps_output_conv)
@@ -367,7 +371,7 @@ class E3_TransformerLayer_multi(nn.Module):
             output_size=output_size,
             main_hidden_sizes3=main_hidden_sizes3,
             embed_size=embed_size,
-            emb_number=hidden_dim,
+            emb_number=emb_number,
             atomic_energy_keys=torch.tensor([1, 6, 7, 8], device=self.device),
         )
         self.f2_proj = o3.Linear(self.irreps_output_conv, self.irreps_output_conv)
