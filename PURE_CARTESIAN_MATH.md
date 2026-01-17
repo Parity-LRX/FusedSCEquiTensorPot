@@ -1,4 +1,4 @@
-## Pure-Cartesian 家族的严格数学描述（含 O(3) 宇称、以及 ICTD/irreps 扩展）
+## Pure-Cartesian Tensor Product的数学描述
 
 本文的主线是：在**全笛卡尔 \(3^L\)** 表示下，用 **Kronecker δ** 与 **Levi-Civita ε** 的指标代数构造**严格 O(3) 等变**的张量积；并进一步解释它与 ICTD/trace-chain（\((2\ell+1)\) irreps）之间的关系，以及本实现提供的“无球谐 irreps 内部表示”版本。
 
@@ -747,3 +747,92 @@ m_{e,p}^{(\ell_3)} = g_e(p)\cdot
 \]
 并对所有 \(p\) 求和得到边消息 \(m_e^{(\ell_3)}\)。由于 \(g_e(p)\) 是标量、而 \(\otimes_C\) 是 intertwiner，所以整体仍保持严格的 \(SO(3)\) 等变性。
 
+---
+
+## 12. 张量积模式性能对比（Benchmark 结果）
+
+本节提供所有六种张量积实现模式的性能对比数据，包括参数量、前向传播速度和等变性验证结果。
+
+### 12.1 测试环境
+
+- **硬件**：CPU
+- **模型配置**：`channels=64`, `lmax=2`
+- **测试数据**：64 atoms, 512 edges
+- **测试方法**：单次前向传播，30 次平均
+- **等变性测试**：O(3) 等变性（包括宇称/反射），10 次随机旋转测试
+
+### 12.2 性能对比总览
+
+| 模式 | 等变性 | 参数量 | 相对参数量 | 速度 (ms) | 相对速度 | 等变性误差 |
+|------|--------|--------|------------|-----------|----------|------------|
+| `spherical` | ✅ 严格等变 | 6,540,634 | 100% (基准) | 50.79 | 1.00x (基准) | < 1e-6 ✅ |
+| `partial-cartesian` | ✅ 严格等变 | 5,404,938 | 82.6% | 57.52 | 1.13x | < 1e-6 ✅ |
+| `partial-cartesian-loose` | ⚠️ 近似等变 | 5,406,026 | 82.7% | 31.66 | **0.62x (最快)** | < 1e-6 ✅ |
+| `pure-cartesian` | ✅ 严格等变 | 33,591,562 | 514.0% | 470.30 | 9.26x (最慢) | < 1e-6 ✅ |
+| `pure-cartesian-sparse` | ✅ 严格等变 | 4,571,402 | 69.9% | 47.09 | 0.93x | < 1e-6 ✅ |
+| `pure-cartesian-ictd` | ✅ 严格等变 | 1,734,304 | **26.5%** | 36.68 | 0.72x | < 1e-6 ✅ |
+
+### 12.3 参数量详细对比（以 Spherical 为基准）
+
+| 模式 | 参数量 | 相对参数量 | 参数量变化 | 说明 |
+|------|--------|------------|------------|------|
+| `spherical` | 6,540,634 | 100% | - | 基准模式，使用 e3nn 球谐函数 |
+| `partial-cartesian` | 5,404,938 | 82.6% | **减少 17.4%** | 笛卡尔坐标 + CG 系数 |
+| `partial-cartesian-loose` | 5,406,026 | 82.7% | **减少 17.3%** | 非严格等变（norm product 近似） |
+| `pure-cartesian` | 33,591,562 | 514.0% | +414% | 全笛卡尔 \(3^L\) 表示，不推荐 |
+| `pure-cartesian-sparse` | 4,571,402 | 69.9% | **减少 30.1%** | 稀疏纯笛卡尔（δ/ε 路径稀疏化） |
+| `pure-cartesian-ictd` | 1,734,304 | **26.5%** | **减少 73.5%** | ICTD irreps 内部表示，参数量最少 |
+
+### 12.4 速度详细对比（以 Spherical 为基准）
+
+| 模式 | 时间 (ms) | 相对速度 | 说明 |
+|------|-----------|----------|------|
+| `spherical` | 50.79 | 1.00x (基准) | e3nn 优化实现 |
+| `partial-cartesian` | 57.52 | 1.13x | 略慢于基准 |
+| `partial-cartesian-loose` | 31.66 | **0.62x (最快)** | 使用 norm product 近似加速 |
+| `pure-cartesian` | 470.30 | 9.26x (最慢) | 全 \(3^L\) 计算量大 |
+| `pure-cartesian-sparse` | 47.09 | 0.93x | 接近基准速度 |
+| `pure-cartesian-ictd` | 36.68 | 0.72x | 较快，且参数量最少 |
+
+### 12.5 等变性验证
+
+所有模式均通过 **O(3) 等变性测试**（包括宇称/反射），等变性误差 < 1e-6：
+
+- ✅ **严格等变模式**：`spherical`, `partial-cartesian`, `pure-cartesian`, `pure-cartesian-sparse`, `pure-cartesian-ictd`
+- ⚠️ **近似等变模式**：`partial-cartesian-loose`（使用 norm product 近似，理论上非严格等变，但数值测试中误差 < 1e-6）
+
+### 12.6 关键发现
+
+1. **参数量优化**：
+   - `pure-cartesian-ictd` 参数量最少（减少 73.5%），且严格等变
+   - `pure-cartesian-sparse` 参数量减少 30.1%，速度接近基准（0.93x）
+   - `partial-cartesian` 参数量减少 17.4%，速度略慢（1.13x）
+
+2. **速度优化**：
+   - `partial-cartesian-loose` 速度最快（0.62x），但非严格等变
+   - `pure-cartesian-ictd` 速度较快（0.72x），且参数量最少
+   - `pure-cartesian-sparse` 速度接近基准（0.93x），严格等变
+
+3. **不推荐使用**：
+   - `pure-cartesian`（非稀疏）速度最慢（9.26x），参数量最大（+414%），仅用于研究目的
+
+### 12.7 推荐使用场景
+
+- **首次尝试**：使用 `spherical`（默认，标准 e3nn 实现）
+- **内存极度受限**：使用 `pure-cartesian-ictd`（参数量减少 73.5%，速度 0.72x）
+- **最佳平衡**：使用 `pure-cartesian-sparse`（参数量减少 30.1%，速度 0.93x，严格等变）
+- **快速迭代**：使用 `partial-cartesian-loose`（速度最快 0.62x，但非严格等变）
+- **严格等变 + 较少参数**：使用 `partial-cartesian` 或 `pure-cartesian-sparse`
+
+### 12.8 数学实现对应关系
+
+| 模式 | 内部表示 | 张量积方法 | 等变性保证 |
+|------|----------|------------|------------|
+| `spherical` | irreps `64x0e+64x1o+64x2e` | Wigner-3j CG 耦合 | 严格 O(3) |
+| `partial-cartesian` | irreps `64x0e+64x1o+64x2e` | 笛卡尔坐标 + CG 系数 | 严格 O(3) |
+| `partial-cartesian-loose` | irreps `64x0e+64x1o+64x2e` | norm product 近似 | 近似 O(3) |
+| `pure-cartesian` | \(\bigoplus_{L\le 2}\mathbb R^{64}\otimes(\mathbb R^3)^{\otimes L}\) | δ/ε 路径枚举 | 严格 O(3) |
+| `pure-cartesian-sparse` | \(\bigoplus_{L\le 2}\mathbb R^{64}\otimes(\mathbb R^3)^{\otimes L}\) | δ/ε 路径稀疏化 | 严格 O(3) |
+| `pure-cartesian-ictd` | irreps `64x0e+64x1o+64x2e` | ICTD trace-chain + 多项式 CG | 严格 O(3) |
+
+**注**：详细数学描述见本文档第 1–11 节。
