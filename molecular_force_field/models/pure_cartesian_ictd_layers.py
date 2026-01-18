@@ -25,6 +25,7 @@ from molecular_force_field.models.ictd_irreps import (
     direction_harmonics,
 )
 from molecular_force_field.models.mlp import RobustScalarWeightedSum
+from molecular_force_field.models.mlp import MainNet
 
 
 def _irreps_total_dim(channels: int, lmax: int) -> int:
@@ -47,6 +48,23 @@ def _merge_irreps(blocks: dict[int, torch.Tensor], channels: int, lmax: int) -> 
     for l in range(lmax + 1):
         parts.append(blocks[l].reshape(*blocks[l].shape[:-2], channels * (2 * l + 1)))
     return torch.cat(parts, dim=-1)
+
+def _irreps_elementwise_tensor_product_0e(x1: torch.Tensor, x2: torch.Tensor, channels: int, lmax: int) -> torch.Tensor:
+    """
+    Irreps analogue of e3nn ElementwiseTensorProduct filtered to 0e:
+    for each l-block, contract over m (angular index) to produce one scalar per channel.
+
+    x: (..., channels*(lmax+1)^2) arranged as concat over l=0..lmax of (channels, 2l+1).
+    Returns: (..., channels*(lmax+1)) arranged as concat over l=0..lmax of (channels).
+    """
+    b1 = _split_irreps(x1, channels, lmax)
+    b2 = _split_irreps(x2, channels, lmax)
+    outs = []
+    for l in range(lmax + 1):
+        # (..., channels, 2l+1) -> (..., channels)
+        # e3nn-style component normalization: divide by sqrt(2l+1)
+        outs.append((b1[l] * b2[l]).sum(dim=-1) / ((2 * l + 1) ** 0.5))
+    return torch.cat(outs, dim=-1)
 
 
 class ICTDIrrepsE3Conv(nn.Module):
@@ -225,6 +243,9 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             nn.Linear(embed_size[0], 17),
         )
         self.weighted_sum = RobustScalarWeightedSum(17, init_weights="zero")
+        # Match e3nn-style product_5:
+        # T = cat([f1, f2, scalars]); ElementwiseTensorProduct(T,T)->0e
+        self.proj_total = MainNet(2 * (self.channels * (self.lmax + 1)) + 32, embed_size, 17)
 
     def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell):
         dtype = next(self.parameters()).dtype
@@ -266,17 +287,19 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         f_combine = torch.cat([f1, f2], dim=-1)  # (N, 2C*(lmax+1)^2)
 
         xb = _split_irreps(f_combine, self.channels * 2, self.lmax)
-        invs = []
         scalars = torch.zeros(f_combine.shape[0], 32, device=f_combine.device, dtype=f_combine.dtype)
         for l in range(self.lmax + 1):
             t = xb[l]  # (N,2C,2l+1)
-            gram = torch.einsum("ncm,ndm->ncd", t, t)  # (N,2C,2C)
+            # e3nn-style component normalization: divide by sqrt(2l+1)
+            gram = torch.einsum("ncm,ndm->ncd", t, t) / ((2 * l + 1) ** 0.5)  # (N,2C,2C)
             scalars = scalars + torch.einsum("ocd,ncd->no", self.W_read[l], gram)
-            invs.append((t * t).sum(dim=-1))  # (N,2C)
-        invs_cat = torch.cat(invs, dim=-1)
 
-        readout_in = torch.cat([scalars, invs_cat], dim=-1)
-        proj = self.readout_linear(readout_in)
-        e_out = self.weighted_sum(proj)
+        inv1 = _irreps_elementwise_tensor_product_0e(f1, f1, self.channels, self.lmax)
+        inv2 = _irreps_elementwise_tensor_product_0e(f2, f2, self.channels, self.lmax)
+        inv3 = scalars * scalars
+        f_prod5 = torch.cat([inv1, inv2, inv3], dim=-1)
+
+        product_proj = self.proj_total(f_prod5)
+        e_out = self.weighted_sum(product_proj)
         return e_out.sum(dim=-1, keepdim=True)
 

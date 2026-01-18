@@ -12,8 +12,8 @@
   - `spherical`: e3nn-based spherical harmonics (strictly equivariant, default)
   - `partial-cartesian`: Cartesian tensor products with CG coefficients (strictly equivariant, -17.4% params)
   - `partial-cartesian-loose`: Optimized Cartesian tensor products (approximate equivariance, fastest)
-  - `pure-cartesian-sparse`: Sparse pure Cartesian with δ/ε contractions (strictly equivariant, -30.1% params)
-  - `pure-cartesian-ictd`: ICTD trace-chain invariants (strictly equivariant, -73.5% params, best for memory)
+  - `pure-cartesian-sparse`: Sparse pure Cartesian with δ/ε contractions (strictly equivariant, -29.6% params)
+  - `pure-cartesian-ictd`: ICTD trace-chain invariants (strictly equivariant, -72.1% params, best for memory)
   
 - **E(3)-Equivariant**: All modes maintain rotational equivariance and parity conservation
   
@@ -90,10 +90,10 @@ mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-pr
 # Partial-Cartesian-Loose (fastest, approximate equivariance)
 mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode partial-cartesian-loose
 
-# Pure-Cartesian-Sparse (strictly equivariant, -30.1% params)
+# Pure-Cartesian-Sparse (strictly equivariant, -29.6% params)
 mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode pure-cartesian-sparse
 
-# Pure-Cartesian-ICTD (strictly equivariant, -73.5% params, best for memory)
+# Pure-Cartesian-ICTD (strictly equivariant, -72.1% params, best for memory)
 mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode pure-cartesian-ictd
 ```
 
@@ -253,23 +253,23 @@ molecular_force_field/
 
 The library supports **six tensor product modes**, each optimized for different use cases:
 
-| Mode | Equivariance | Speed* | Parameters* | Use Case |
-|------|--------------|--------|-------------|----------|
-| `spherical` | ✅ Strict | 1.00x (baseline) | 100% (baseline) | Default, maximum compatibility, research/publication |
-| `partial-cartesian` | ✅ Strict | 1.13x | 82.6% (-17.4%) | Strict equivariance with fewer parameters |
-| `partial-cartesian-loose` | ⚠️ Approximate | **0.62x (fastest)** | 82.7% (-17.3%) | Fast iteration, approximate equivariance acceptable |
-| `pure-cartesian-sparse` | ✅ Strict | 0.93x | 69.9% (-30.1%) | Best balance: fewer params, near-baseline speed |
-| `pure-cartesian-ictd` | ✅ Strict | 0.72x | **26.5% (-73.5%)** | **Best for memory**: fewest params, fast, strictly equivariant |
-| `pure-cartesian` | ✅ Strict | 9.26x (slowest) | 514.0% (+414%) | ❌ Not recommended (too slow, too many params) |
+| Mode | Equivariance | Speed* | Parameters* | Equivariance Error* | Use Case |
+|------|--------------|--------|-------------|---------------------|----------|
+| `spherical` | ✅ Strict | 1.00x (baseline) | 100% (baseline) | 4.41e-07 | Default, maximum compatibility, research/publication |
+| `partial-cartesian` | ✅ Strict | 1.08x | 82.6% (-17.4%) | 1.83e-07 | Strict equivariance with fewer parameters |
+| `partial-cartesian-loose` | ⚠️ Approximate | **0.64x (fastest)** | 82.7% (-17.3%) | 6.52e-08 | Fast iteration, approximate equivariance acceptable |
+| `pure-cartesian-sparse` | ✅ Strict | 1.02x | 70.4% (-29.6%) | 3.03e-07 | Best balance: fewer params, near-baseline speed |
+| `pure-cartesian-ictd` | ✅ Strict | **0.67x (fastest)** | **27.9% (-72.1%)** | 1.08e-07 | **Best for memory**: fewest params, fast, strictly equivariant |
+| `pure-cartesian` | ✅ Strict | 9.56x (slowest) | 514.0% (+414%) | 2.20e-07 | ❌ Not recommended (too slow, too many params) |
 
-*Benchmark results on GPU (CUDA), channels=64, lmax=2, 64 atoms, 512 edges. All modes pass O(3) equivariance tests (error < 1e-6).
+*Benchmark results on CPU, channels=64, lmax=2, 64 atoms, 512 edges. All modes pass O(3) equivariance tests (including parity/reflection, error < 1e-6).
 
 ### Quick Recommendations
 
 - **First time / Research**: Use `spherical` (default)
-- **Memory constrained**: Use `pure-cartesian-ictd` (73.5% fewer parameters)
-- **Speed priority**: Use `partial-cartesian-loose` (fastest, but approximate equivariance)
-- **Best balance**: Use `pure-cartesian-sparse` (30.1% fewer params, 0.93x speed)
+- **Memory constrained**: Use `pure-cartesian-ictd` (72.1% fewer parameters, 0.67x speed, fastest)
+- **Speed priority**: Use `partial-cartesian-loose` (0.64x, fastest, but approximate equivariance)
+- **Best balance**: Use `pure-cartesian-sparse` (29.6% fewer params, 1.02x speed, strictly equivariant)
 - **Strict equivariance + fewer params**: Use `partial-cartesian` or `pure-cartesian-sparse`
 
 For detailed performance comparison and recommendations, see [USAGE.md](USAGE.md#张量积模式对比).

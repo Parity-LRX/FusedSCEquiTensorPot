@@ -225,6 +225,61 @@ def get_irreps_str(channels: int, lmax: int) -> str:
     return " + ".join(parts)
 
 
+def reorder_concatenated_irreps(f1: torch.Tensor, f2: torch.Tensor, channels: int, lmax: int) -> torch.Tensor:
+    """
+    Reorder concatenated irreps features to match e3nn's expected format.
+    
+    When concatenating two irreps features f1 and f2, the naive concatenation
+    `torch.cat([f1, f2], dim=-1)` produces:
+        [f1的l=0部分, f2的l=0部分, f1的l=1部分, f2的l=1部分, ...]
+    
+    But e3nn's Irreps expects:
+        [所有l=0部分, 所有l=1部分, ...]
+    
+    This function reorders the concatenated features to match e3nn's format.
+    
+    Args:
+        f1: First irreps features, shape (..., channels * sum(2*l+1 for l in range(lmax+1)))
+        f2: Second irreps features, same shape as f1
+        channels: Number of channels per angular momentum
+        lmax: Maximum angular momentum
+    
+    Returns:
+        Reordered concatenated features, shape (..., 2*channels * sum(2*l+1 for l in range(lmax+1)))
+    
+    Example:
+        For lmax=2, channels=64:
+        - f1 shape: (N, 576) = [64个0e, 192个1o, 320个2e]
+        - f2 shape: (N, 576) = [64个0e, 192个1o, 320个2e]
+        - Naive concat: [f1的64个0e, f2的64个0e, f1的192个1o, f2的192个1o, f1的320个2e, f2的320个2e]
+        - Reordered: [f1的64个0e, f2的64个0e, f1的192个1o, f2的192个1o, f1的320个2e, f2的320个2e]
+        - Actually, the reordered version groups by l: [所有128个0e, 所有128个1o, 所有128个2e]
+    """
+    batch_shape = f1.shape[:-1]
+    dims = [2 * l + 1 for l in range(lmax + 1)]  # [1, 3, 5] for lmax=2
+    
+    # Split f1 and f2 by angular momentum
+    parts = []
+    idx1 = 0
+    idx2 = 0
+    
+    for l in range(lmax + 1):
+        dim_l = dims[l]
+        # Extract l-th part from f1 and f2
+        size_l = channels * dim_l
+        f1_l = f1[..., idx1:idx1 + size_l]  # (..., channels * dim_l)
+        f2_l = f2[..., idx2:idx2 + size_l]  # (..., channels * dim_l)
+        
+        # Concatenate: [f1的l部分, f2的l部分]
+        parts.append(torch.cat([f1_l, f2_l], dim=-1))
+        
+        idx1 += size_l
+        idx2 += size_l
+    
+    # Concatenate all parts in order of l
+    return torch.cat(parts, dim=-1)
+
+
 # ============================================================================
 # Irreducible Cartesian Tensor Decomposition (ICTD)
 # Based on: "Irreducible Cartesian tensor decomposition" theory
@@ -2586,8 +2641,12 @@ class CartesianTransformerLayer(nn.Module):
         # Second convolution
         f2 = self.e3_conv_emb2(f1, pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
         
-        # Combine features: f_combine has shape (N, combined_channels * total_sh_dim)
-        f_combine = torch.cat([f1, f2], dim=-1)
+        # Combine features: reorder to match e3nn's expected irreps format
+        # This ensures that f_combine has the correct structure for EquivariantTensorProduct
+        # Without reordering, the concatenation [f1, f2] produces:
+        #   [f1的l=0部分, f2的l=0部分, f1的l=1部分, f2的l=1部分, ...]
+        # But e3nn expects: [所有l=0部分, 所有l=1部分, ...]
+        f_combine = reorder_concatenated_irreps(f1, f2, self.channels, self.lmax)
         
         # product_3: 高阶 ⊗ 高阶 → 32x0e (标量)
         f_prod3 = self.product_3(f_combine, f_combine)  # (N, 32)
@@ -3525,8 +3584,10 @@ class CartesianTransformerLayerLoose(nn.Module):
         # Second convolution
         f2 = self.e3_conv_emb2(f1, pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
         
-        # Combine features: f_combine has shape (N, combined_channels * total_sh_dim)
-        f_combine = torch.cat([f1, f2], dim=-1)
+        # Combine features: reorder to match e3nn's expected irreps format
+        # This ensures consistency with CartesianTransformerLayer, even though
+        # CartesianFullyConnectedTensorProduct uses norm product (rotation-invariant)
+        f_combine = reorder_concatenated_irreps(f1, f2, self.channels, self.lmax)
         
         # product_3: 高阶 ⊗ 高阶 → 32x0e (标量)
         f_prod3 = self.product_3(f_combine, f_combine)  # (N, 32)

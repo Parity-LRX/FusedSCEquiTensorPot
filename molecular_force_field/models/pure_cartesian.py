@@ -119,6 +119,83 @@ def merge_by_rank_o3(blocks: Dict[Tuple[int, int], torch.Tensor], channels: int,
             parts.append(t.reshape(*batch_shape, channels * rank_dim(L)))
     return torch.cat(parts, dim=-1)
 
+def _o3_elementwise_tensor_product_0e_from_blocks(
+    blocks1: Dict[Tuple[int, int], torch.Tensor],
+    blocks2: Dict[Tuple[int, int], torch.Tensor],
+    channels: int,
+    Lmax: int,
+) -> torch.Tensor:
+    """
+    Pure-Cartesian O(3) elementwise tensor product, filtered to 0e scalars only.
+
+    Inputs are O(3)-graded blocks keyed by (s, L):
+      - s=0: true tensor
+      - s=1: pseudotensor
+
+    For each rank L and each channel c, we compute the O(3)-even scalar:
+        out[L,c] = <x1[(0,L)][c], x2[(0,L)][c]> + <x1[(1,L)][c], x2[(1,L)][c]>
+
+    where the inner product is the full δ-contraction over all tensor indices.
+
+    This mirrors e3nn's `o3.ElementwiseTensorProduct(..., ["0e"])` behavior:
+      - it does NOT output pseudoscalars (0o), so we do not include cross terms (0·1 or 1·0).
+
+    Returns:
+      (..., channels * (Lmax+1)) with blocks concatenated in L=0..Lmax order.
+    """
+    batch_shape = blocks1[(0, 0)].shape[:-1]
+    outs: List[torch.Tensor] = []
+    for L in range(Lmax + 1):
+        t10 = blocks1[(0, L)]
+        t11 = blocks1[(1, L)]
+        t20 = blocks2[(0, L)]
+        t21 = blocks2[(1, L)]
+        # Flatten tensor indices -> (..., channels, 3^L)
+        if L == 0:
+            t10f = t10.reshape(*batch_shape, channels, 1)
+            t11f = t11.reshape(*batch_shape, channels, 1)
+            t20f = t20.reshape(*batch_shape, channels, 1)
+            t21f = t21.reshape(*batch_shape, channels, 1)
+        else:
+            t10f = t10.reshape(*batch_shape, channels, -1)
+            t11f = t11.reshape(*batch_shape, channels, -1)
+            t20f = t20.reshape(*batch_shape, channels, -1)
+            t21f = t21.reshape(*batch_shape, channels, -1)
+        # e3nn-style component normalization:
+        # if each Cartesian component has unit variance, Σ_i x_i y_i has variance = dim.
+        # Divide by sqrt(dim) to keep output components ~ unit scale.
+        scale = 1.0 / math.sqrt(rank_dim(L))
+        inv = ((t10f * t20f).sum(dim=-1) + (t11f * t21f).sum(dim=-1)) * scale  # (..., channels)
+        outs.append(inv)
+    return torch.cat(outs, dim=-1)
+
+
+class PureCartesianElementwiseTensorProductO3(nn.Module):
+    """
+    O(3)-graded pure-cartesian analogue of `e3nn.o3.ElementwiseTensorProduct(..., ["0e"])`.
+
+    It maps two O(3)-graded feature vectors of shape (..., total_dim_o3(channels, Lmax))
+    to a concatenation of rank-wise 0e scalar invariants of shape (..., channels*(Lmax+1)).
+    """
+
+    def __init__(self, channels: int, Lmax: int):
+        super().__init__()
+        self.channels = int(channels)
+        self.Lmax = int(Lmax)
+
+    @property
+    def dim_in(self) -> int:
+        return total_dim_o3(self.channels, self.Lmax)
+
+    @property
+    def dim_out(self) -> int:
+        return self.channels * (self.Lmax + 1)
+
+    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        blocks1 = split_by_rank_o3(x1, self.channels, self.Lmax)
+        blocks2 = split_by_rank_o3(x2, self.channels, self.Lmax)
+        return _o3_elementwise_tensor_product_0e_from_blocks(blocks1, blocks2, self.channels, self.Lmax)
+
 
 def epsilon_tensor(device=None, dtype=None) -> torch.Tensor:
     """
@@ -441,6 +518,14 @@ class PureCartesianTensorProduct(nn.Module):
         # Iterate paths and accumulate
         w_idx = 0
         for p in self.paths:
+            # e3nn-style component normalization for index contractions:
+            # - each contracted index sums over 3 components
+            # - delta: k_delta contracted indices
+            # - epsilon: consumes 2 indices (one from each input) and sums them (3*3)
+            n_contract = p.k_delta + (2 if p.use_epsilon else 0)
+            contract_dim = (3 ** n_contract)
+            norm = 1.0 / math.sqrt(contract_dim) if contract_dim > 1 else 1.0
+
             # slice weights for this path
             if per_sample:
                 Wp = w[..., w_idx:w_idx + self.Cout * self.C1 * self.C2].view(*batch_shape, self.Cout, self.C1, self.C2)
@@ -471,9 +556,9 @@ class PureCartesianTensorProduct(nn.Module):
                 t2_use = t2
                 eq, _, _ = _einsum_for_path(p.L1, p.L2, p.k_delta, p.use_epsilon)
                 if p.use_epsilon:
-                    out_ab = torch.einsum(eq, t1_use, t2_use, eps)
+                    out_ab = torch.einsum(eq, t1_use, t2_use, eps) * norm
                 else:
-                    out_ab = torch.einsum(eq, t1_use, t2_use)
+                    out_ab = torch.einsum(eq, t1_use, t2_use) * norm
 
             # Mix channels: (..., C1, C2, tensor_indices...) with Wp -> (..., Cout, tensor_indices...)
             if p.Lout == 0:
@@ -549,6 +634,10 @@ class PureCartesianTensorProductO3(nn.Module):
 
         w_idx = 0
         for p in self.paths:
+            # e3nn-style component normalization for index contractions
+            n_contract = p.k_delta + (2 if p.use_epsilon else 0)
+            contract_dim = (3 ** n_contract)
+            norm = 1.0 / math.sqrt(contract_dim) if contract_dim > 1 else 1.0
             # For each (s1,s2) we have a distinct W tensor (Cout,C1,C2)
             for s1 in (0, 1):
                 for s2 in (0, 1):
@@ -575,9 +664,9 @@ class PureCartesianTensorProductO3(nn.Module):
                     else:
                         eq, _, _ = _einsum_for_path(p.L1, p.L2, p.k_delta, p.use_epsilon)
                         if p.use_epsilon:
-                            out_ab = torch.einsum(eq, t1, t2, eps)
+                            out_ab = torch.einsum(eq, t1, t2, eps) * norm
                         else:
-                            out_ab = torch.einsum(eq, t1, t2)
+                            out_ab = torch.einsum(eq, t1, t2) * norm
 
                     s_out = s1 ^ s2 ^ (1 if p.use_epsilon else 0)
 
@@ -676,6 +765,10 @@ class PureCartesianTensorProductO3Sparse(nn.Module):
 
         w_idx = 0
         for p in self.paths:
+            # e3nn-style component normalization for index contractions
+            n_contract = p.k_delta + (2 if p.use_epsilon else 0)
+            contract_dim = (3 ** n_contract)
+            norm = 1.0 / math.sqrt(contract_dim) if contract_dim > 1 else 1.0
             # Fastest path: pseudo inputs are guaranteed 0 and epsilon disabled.
             # Only s1=s2=0 contributes, and s_out=0 always.
             if self.assume_pseudo_zero and (not self.allow_epsilon):
@@ -701,9 +794,9 @@ class PureCartesianTensorProductO3Sparse(nn.Module):
                 else:
                     eq, _, _ = _einsum_for_path(p.L1, p.L2, p.k_delta, p.use_epsilon)
                     if p.use_epsilon:
-                        out_ab = torch.einsum(eq, t1, t2, eps)
+                        out_ab = torch.einsum(eq, t1, t2, eps) * norm
                     else:
-                        out_ab = torch.einsum(eq, t1, t2)
+                        out_ab = torch.einsum(eq, t1, t2) * norm
 
                 s_out = 0
 
@@ -764,9 +857,9 @@ class PureCartesianTensorProductO3Sparse(nn.Module):
                     else:
                         eq, _, _ = _einsum_for_path(p.L1, p.L2, p.k_delta, p.use_epsilon)
                         if p.use_epsilon:
-                            out_ab = torch.einsum(eq, t1, t2, eps)
+                            out_ab = torch.einsum(eq, t1, t2, eps) * norm
                         else:
-                            out_ab = torch.einsum(eq, t1, t2)
+                            out_ab = torch.einsum(eq, t1, t2) * norm
 
                     s_out = s1 ^ s2 ^ (1 if p.use_epsilon else 0)
                     if self.share_parity_weights:

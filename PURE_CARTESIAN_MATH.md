@@ -304,12 +304,24 @@ E_L(n_{ij}) := n_{ij}^{\otimes L}\in\mathcal T_L,
 
 这一节解释工程上常见的默认 irreps（例如 `64x0e + 64x1o + 64x2e`）在“张量操作”意义下是什么，以及它与本文档的 pure-cartesian（\(3^L\)）表示之间如何对照。
 
-### 10.1 `64x0e + 64x1o + 64x2e` 的块结构（irreps 语义）
+### 9.1 `64x0e + 64x1o + 64x2e` 的块结构
 
 这是 **不可约表示（irreps）** 的直和，表示一个特征向量按 \((\ell,p)\) 分块：
 - \(64\times 0e\)：64 个**标量**通道（\(\ell=0\)，even parity）
 - \(64\times 1o\)：64 个**极向量**通道（\(\ell=1\)，odd parity），每个通道 3 个分量
 - \(64\times 2e\)：64 个**二阶不可约张量**通道（\(\ell=2\)，even parity），每个通道 5 个分量（STF 基）
+
+> **STF（Symmetric Trace-Free，对称无迹）**：STF 张量是满足以下两个条件的张量：
+> 1. **对称性**：\(T_{ij} = T_{ji}\)（对 rank-2 张量）
+> 2. **无迹性**：\(\mathrm{tr}(T) = \sum_{i} T_{ii} = 0\)（所有迹为零）
+> 
+> 对于 rank-2 张量，全 \(3\times 3\) 矩阵有 9 个独立分量。对称性约束减少到 6 个分量（\(T_{ij} = T_{ji}\)），无迹性再减少 1 个约束（\(\sum_i T_{ii} = 0\)），因此 STF 子空间维度为 \(6-1=5\)，对应 \(SO(3)\) 的 \(\ell=2\) 不可约表示（维度 \(2\ell+1=5\)）。
+> 
+> 数学上，任意对称 rank-2 张量 \(T_{ij}\) 可以唯一分解为：
+> \[
+> T_{ij} = \underbrace{\Big(\tfrac12(T_{ij}+T_{ji})-\tfrac13\delta_{ij}T_{kk}\Big)}_{\text{STF 部分（}\ell=2\text{，5 分量）}} + \underbrace{\tfrac13\delta_{ij}T_{kk}}_{\text{迹部分（}\ell=0\text{，1 分量）}}
+> \]
+> STF 部分在旋转下按 \(\ell=2\) 不可约表示变换，是 irreps 表示中 \(\ell=2\) 块的基础。
 
 因此总维度是
 \[
@@ -327,7 +339,7 @@ x = \big(x_{0e}, x_{1o}, x_{2e}\big),
 
 这里 \(\mathbb R^{3}\) 与 \(\mathbb R^{5}\) 不是“任意 3 或 5 维向量”，而是 **O(3)/SO(3) 的不可约表示空间**（带固定的基与 \(D^\ell(R)\) 作用）。
 
-### 10.2 irreps 张量积在做什么：CG（Wigner-3j）耦合 + 通道混合
+### 9.2 irreps 张量积在做什么：CG（Wigner-3j）耦合 + 通道混合
 
 在 irreps 语义里，“张量积/双线性相互作用”不是对笛卡尔分量做随意乘法，而是对每条允许耦合路径
 \[
@@ -367,7 +379,7 @@ m_1 & m_2 & -m_3
 \]
 而宇称会决定这些输出是 \(0e/1e/2e\) 还是 \(0o/1o/2o\)（取决于输入的 \(p_1p_2\)）。
 
-### 10.3 pure-cartesian 的“张量”是什么：\(3^L\) 秩张量而非 \(2\ell+1\) irreps
+### 9.3 pure-cartesian 的“张量”是什么：\(3^L\) 秩张量而非 \(2\ell+1\) irreps
 
 pure-cartesian 改用
 \[
@@ -380,16 +392,16 @@ pure-cartesian 改用
 
 与 irreps 的关键差异在于：rank 2 在这里是“全 \(3\times 3\)”（9 分量），而 irreps 的 \(\ell=2\) 是其中的 **对称无迹（STF）** 子空间（5 分量）。
 
-### 10.4 pure-cartesian 里如何“做张量积”：只允许 δ/ε 外积与收缩
+### 9.4 pure-cartesian 里如何“做张量积”：只允许 δ/ε 外积与收缩
 
 pure-cartesian 的基本双线性算子由路径 \(p\) 定义（第 4 节）：
 - **外积**：把两个张量拼起来，秩相加
 - **δ 收缩**：用 \(\delta_{ij}\) 成对消去一个来自左侧、一个来自右侧的指标（秩减少 2）
 - **ε 收缩**：用 \(\varepsilon_{ijk}\) 消去左右各一个指标，并产生一个新指标（秩减少 1），同时引入 \(\det R\)
 
-也就是说，你的“张量操作”就是在指标层面允许这三类操作的组合；实现通过 `_einsum_for_path` 生成规范化的 Einstein 求和式来执行。
+也就是说，pure-cartesian的“张量操作”就是在指标层面允许这三类操作的组合；实现通过 `_einsum_for_path` 生成规范化的 Einstein 求和式来执行。
 
-### 10.5 为什么 pure-cartesian 需要 true/pseudo：严格 O(3)（含反射）等变
+### 9.5 为什么 pure-cartesian 需要 true/pseudo：严格 O(3)（含反射）等变
 
 因为 \(\varepsilon\) 在 \(O(3)\) 下满足
 \[
@@ -401,7 +413,7 @@ s_{\text{out}} = s_1\oplus s_2\oplus \mathbf 1_{\varepsilon}
 \]
 来追踪 \(\det R\) 因子（对应 `PureCartesianTensorProductO3` 的实现）。
 
-### 10.6 总结：两种“张量操作”语义的对照
+### 9.6 总结：两种“张量操作”语义的对照
 
 - irreps（例如 `64x0e+64x1o+64x2e`）：
   - 张量积 = CG（Wigner-3j）耦合 \(m\) 指标 + 通道混合
@@ -765,12 +777,12 @@ m_{e,p}^{(\ell_3)} = g_e(p)\cdot
 
 | 模式 | 等变性 | 参数量 | 相对参数量 | 速度 (ms) | 相对速度 | 等变性误差 |
 |------|--------|--------|------------|-----------|----------|------------|
-| `spherical` | ✅ 严格等变 | 6,540,634 | 100% (基准) | 50.79 | 1.00x (基准) | < 1e-6 ✅ |
-| `partial-cartesian` | ✅ 严格等变 | 5,404,938 | 82.6% | 57.52 | 1.13x | < 1e-6 ✅ |
-| `partial-cartesian-loose` | ⚠️ 近似等变 | 5,406,026 | 82.7% | 31.66 | **0.62x (最快)** | < 1e-6 ✅ |
-| `pure-cartesian` | ✅ 严格等变 | 33,591,562 | 514.0% | 470.30 | 9.26x (最慢) | < 1e-6 ✅ |
-| `pure-cartesian-sparse` | ✅ 严格等变 | 4,571,402 | 69.9% | 47.09 | 0.93x | < 1e-6 ✅ |
-| `pure-cartesian-ictd` | ✅ 严格等变 | 1,734,304 | **26.5%** | 36.68 | 0.72x | < 1e-6 ✅ |
+| `spherical` | ✅ 严格等变 | 6,540,634 | 100% (基准) | 32.30 | 1.00x (基准) | 4.41e-07 ✅ |
+| `partial-cartesian` | ✅ 严格等变 | 5,404,938 | 82.6% | 34.99 | 1.08x | 1.83e-07 ✅ |
+| `partial-cartesian-loose` | ⚠️ 近似等变 | 5,406,026 | 82.7% | 20.54 | **0.64x (最快)** | 6.52e-08 ✅ |
+| `pure-cartesian` | ✅ 严格等变 | 33,626,186 | 514.0% | 308.83 | 9.56x (最慢) | 2.20e-07 ✅ |
+| `pure-cartesian-sparse` | ✅ 严格等变 | 4,606,026 | 70.4% | 32.93 | 1.02x | 3.03e-07 ✅ |
+| `pure-cartesian-ictd` | ✅ 严格等变 | 1,824,497 | **27.9%** | 21.48 | **0.67x (最快)** | 1.08e-07 ✅ |
 
 ### 12.3 参数量详细对比（以 Spherical 为基准）
 
@@ -779,49 +791,49 @@ m_{e,p}^{(\ell_3)} = g_e(p)\cdot
 | `spherical` | 6,540,634 | 100% | - | 基准模式，使用 e3nn 球谐函数 |
 | `partial-cartesian` | 5,404,938 | 82.6% | **减少 17.4%** | 笛卡尔坐标 + CG 系数 |
 | `partial-cartesian-loose` | 5,406,026 | 82.7% | **减少 17.3%** | 非严格等变（norm product 近似） |
-| `pure-cartesian` | 33,591,562 | 514.0% | +414% | 全笛卡尔 \(3^L\) 表示，不推荐 |
-| `pure-cartesian-sparse` | 4,571,402 | 69.9% | **减少 30.1%** | 稀疏纯笛卡尔（δ/ε 路径稀疏化） |
-| `pure-cartesian-ictd` | 1,734,304 | **26.5%** | **减少 73.5%** | ICTD irreps 内部表示，参数量最少 |
+| `pure-cartesian` | 33,626,186 | 514.0% | +414% | 全笛卡尔 \(3^L\) 表示，不推荐 |
+| `pure-cartesian-sparse` | 4,606,026 | 70.4% | **减少 29.6%** | 稀疏纯笛卡尔（δ/ε 路径稀疏化） |
+| `pure-cartesian-ictd` | 1,824,497 | **27.9%** | **减少 72.1%** | ICTD irreps 内部表示，参数量最少 |
 
 ### 12.4 速度详细对比（以 Spherical 为基准）
 
 | 模式 | 时间 (ms) | 相对速度 | 说明 |
 |------|-----------|----------|------|
-| `spherical` | 50.79 | 1.00x (基准) | e3nn 优化实现 |
-| `partial-cartesian` | 57.52 | 1.13x | 略慢于基准 |
-| `partial-cartesian-loose` | 31.66 | **0.62x (最快)** | 使用 norm product 近似加速 |
-| `pure-cartesian` | 470.30 | 9.26x (最慢) | 全 \(3^L\) 计算量大 |
-| `pure-cartesian-sparse` | 47.09 | 0.93x | 接近基准速度 |
-| `pure-cartesian-ictd` | 36.68 | 0.72x | 较快，且参数量最少 |
+| `spherical` | 32.30 | 1.00x (基准) | e3nn 优化实现 |
+| `partial-cartesian` | 34.99 | 1.08x | 略慢于基准 |
+| `partial-cartesian-loose` | 20.54 | **0.64x (最快)** | 使用 norm product 近似加速 |
+| `pure-cartesian` | 308.83 | 9.56x (最慢) | 全 \(3^L\) 计算量大 |
+| `pure-cartesian-sparse` | 32.93 | 1.02x | 接近基准速度 |
+| `pure-cartesian-ictd` | 21.48 | **0.67x (最快)** | 较快，且参数量最少 |
 
 ### 12.5 等变性验证
 
-所有模式均通过 **O(3) 等变性测试**（包括宇称/反射），等变性误差 < 1e-6：
+**所有模式均通过 O(3) 等变性测试**（包括宇称/反射），等变性误差 < 1e-6：
 
-- ✅ **严格等变模式**：`spherical`, `partial-cartesian`, `pure-cartesian`, `pure-cartesian-sparse`, `pure-cartesian-ictd`
-- ⚠️ **近似等变模式**：`partial-cartesian-loose`（使用 norm product 近似，理论上非严格等变，但数值测试中误差 < 1e-6）
+- ✅ **严格等变模式**（误差 < 1e-6）：`spherical` (4.41e-07), `partial-cartesian` (1.83e-07), `pure-cartesian` (2.20e-07), `pure-cartesian-sparse` (3.03e-07), `pure-cartesian-ictd` (1.08e-07)
+- ⚠️ **近似等变模式**（误差 < 1e-6，但理论上非严格等变）：`partial-cartesian-loose` (6.52e-08，使用 norm product 近似，理论上非严格等变，但数值测试中误差很小)
 
 ### 12.6 关键发现
 
 1. **参数量优化**：
-   - `pure-cartesian-ictd` 参数量最少（减少 73.5%），且严格等变
-   - `pure-cartesian-sparse` 参数量减少 30.1%，速度接近基准（0.93x）
-   - `partial-cartesian` 参数量减少 17.4%，速度略慢（1.13x）
+   - `pure-cartesian-ictd` 参数量最少（减少 72.1%），且严格等变，速度最快（0.67x）
+   - `pure-cartesian-sparse` 参数量减少 29.6%，速度接近基准（1.02x），严格等变
+   - `partial-cartesian` 参数量减少 17.4%，速度略慢（1.08x），严格等变
 
 2. **速度优化**：
-   - `partial-cartesian-loose` 速度最快（0.62x），但非严格等变
-   - `pure-cartesian-ictd` 速度较快（0.72x），且参数量最少
-   - `pure-cartesian-sparse` 速度接近基准（0.93x），严格等变
+   - `partial-cartesian-loose` 速度最快（0.64x），但非严格等变
+   - `pure-cartesian-ictd` 速度最快（0.67x），且参数量最少，严格等变
+   - `pure-cartesian-sparse` 速度接近基准（1.02x），严格等变
 
 3. **不推荐使用**：
-   - `pure-cartesian`（非稀疏）速度最慢（9.26x），参数量最大（+414%），仅用于研究目的
+   - `pure-cartesian`（非稀疏）速度最慢（9.56x），参数量最大（+414%），严格等变但仅用于研究目的
 
 ### 12.7 推荐使用场景
 
 - **首次尝试**：使用 `spherical`（默认，标准 e3nn 实现）
-- **内存极度受限**：使用 `pure-cartesian-ictd`（参数量减少 73.5%，速度 0.72x）
-- **最佳平衡**：使用 `pure-cartesian-sparse`（参数量减少 30.1%，速度 0.93x，严格等变）
-- **快速迭代**：使用 `partial-cartesian-loose`（速度最快 0.62x，但非严格等变）
+- **内存极度受限**：使用 `pure-cartesian-ictd`（参数量减少 72.1%，速度 0.67x）
+- **最佳平衡**：使用 `pure-cartesian-sparse`（参数量减少 29.6%，速度 1.02x，严格等变）
+- **快速迭代**：使用 `partial-cartesian-loose`（速度最快 0.64x，但非严格等变）
 - **严格等变 + 较少参数**：使用 `partial-cartesian` 或 `pure-cartesian-sparse`
 
 ### 12.8 数学实现对应关系
@@ -835,4 +847,3 @@ m_{e,p}^{(\ell_3)} = g_e(p)\cdot
 | `pure-cartesian-sparse` | \(\bigoplus_{L\le 2}\mathbb R^{64}\otimes(\mathbb R^3)^{\otimes L}\) | δ/ε 路径稀疏化 | 严格 O(3) |
 | `pure-cartesian-ictd` | irreps `64x0e+64x1o+64x2e` | ICTD trace-chain + 多项式 CG | 严格 O(3) |
 
-**注**：详细数学描述见本文档第 1–11 节。

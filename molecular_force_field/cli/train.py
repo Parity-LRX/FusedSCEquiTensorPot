@@ -325,6 +325,14 @@ def main():
                              '"pure-cartesian" uses full rank Cartesian tensors (3^L) with delta/epsilon contractions (most pure), '
                              '"pure-cartesian-sparse" uses a sparse pure-cartesian delta/epsilon tensor product (O(3) strict) by restricting rank-rank paths, '
                              '"pure-cartesian-ictd" uses pure-cartesian message passing but ICTD trace-chain invariants for readout')
+    parser.add_argument('--max-rank-other', type=int, default=1,
+                        help='Max rank for sparse tensor product in pure-cartesian-sparse mode (default: 1). '
+                             'Only interactions where min(L1, L2) <= max_rank_other are allowed. '
+                             'Larger values allow more interactions but increase parameters and computation.')
+    parser.add_argument('--k-policy', type=str, default='k0',
+                        choices=['k0', 'k1', 'both'],
+                        help='K policy for sparse tensor product in pure-cartesian-sparse mode (default: k0). '
+                             'k0: only k=0 (promotes higher rank), k1: only k=1 (contracts to lower rank), both: keep both')
     
     args = parser.parse_args()
 
@@ -611,6 +619,7 @@ def main():
         ).to(device)
     elif args.tensor_product_mode == 'pure-cartesian-sparse':
         logging.info("Using PURE Cartesian SPARSE mode (δ/ε path-sparse within 3^L, O(3) strict)")
+        logging.info(f"  max_rank_other={args.max_rank_other}, k_policy={args.k_policy}")
         e3trans = PureCartesianSparseTransformerLayer(
             max_embed_radius=config.max_radius,
             main_max_radius=config.max_radius_main,
@@ -627,6 +636,8 @@ def main():
             num_layers=config.num_layers,
             function_type_main=config.function_type,
             lmax=config.lmax,
+            max_rank_other=args.max_rank_other,
+            k_policy=args.k_policy,
             device=device
         ).to(device)
     elif args.tensor_product_mode == 'partial-cartesian':

@@ -20,6 +20,8 @@ Equivariant bilinear mixing:
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 from e3nn.math import soft_one_hot_linspace
@@ -28,6 +30,7 @@ from torch_scatter import scatter
 from molecular_force_field.models.mlp import MainNet, RobustScalarWeightedSum
 from molecular_force_field.models.pure_cartesian import (
     PureCartesianTensorProductO3,
+    PureCartesianElementwiseTensorProductO3,
     edge_rank_powers,
     merge_by_rank,
     split_by_rank,
@@ -246,7 +249,8 @@ class PureCartesianInvariantBilinear(nn.Module):
         ])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (N, 2 * channels * sum 3^L)  (O(3)-graded: true + pseudo)
+        # x: (N, channels * sum 3^L)  (O(3)-graded: true + pseudo)
+        # Note: channels here is the actual number of channels in x (could be combined_channels)
         blocks = split_by_rank_o3(x, self.channels, self.Lmax)
         outs = []
         for L in range(self.Lmax + 1):
@@ -255,8 +259,11 @@ class PureCartesianInvariantBilinear(nn.Module):
             t0_flat = t0.reshape(t0.shape[0], self.channels, -1)
             t1_flat = t1.reshape(t1.shape[0], self.channels, -1)
             # δ-contraction over tensor indices -> channel Gram matrices (even scalars)
-            gram0 = torch.einsum("nci,ndi->ncd", t0_flat, t0_flat)  # (N, ch, ch)
-            gram1 = torch.einsum("nci,ndi->ncd", t1_flat, t1_flat)  # (N, ch, ch)
+            # e3nn-style component normalization: divide by sqrt(3^L)
+            # Use math.sqrt for better numerical precision than 3**(L/2)
+            scale = 1.0 / math.sqrt(3 ** L) if L > 0 else 1.0
+            gram0 = torch.einsum("nci,ndi->ncd", t0_flat, t0_flat) * scale  # (N, ch, ch)
+            gram1 = torch.einsum("nci,ndi->ncd", t1_flat, t1_flat) * scale  # (N, ch, ch)
             gram = gram0 + gram1
             outs.append(torch.einsum("ocd,ncd->no", self.W[L], gram))
         return sum(outs)  # (N, out_channels)
@@ -317,19 +324,18 @@ class PureCartesianTransformerLayer(nn.Module):
             function_type=function_type_main,
         )
 
-        combined_channels = self.channels * 2
-        self.combined_dim = total_dim_o3(combined_channels, self.Lmax)
+        self.combined_channels = self.channels * 2
+        self.combined_dim = total_dim_o3(self.combined_channels, self.Lmax)
 
         # product_3: invariant bilinear to 32 scalars
-        self.product_3 = PureCartesianInvariantBilinear(channels=combined_channels, out_channels=32, Lmax=self.Lmax)
+        # Note: product_3 receives combined_channels (2 * channels) as input
+        self.product_3 = PureCartesianInvariantBilinear(channels=self.combined_channels, out_channels=32, Lmax=self.Lmax)
 
-        # product_5: invariants from T=T_high + scalars
-        # We'll use simple per-rank self-inner invariants to produce readout features:
-        self.readout_linear = nn.Sequential(
-            nn.Linear(32 + (self.Lmax + 1) * combined_channels, embed_size[0]),
-            nn.SiLU(),
-            nn.Linear(embed_size[0], 17),
-        )
+        # product_5 (matches e3nn_layers.py: T=cat([f1,f2,f_prod3]); ElementwiseTensorProduct(T,T)->0e)
+        # For each O(3)-graded rank block, we produce one 0e scalar per channel (sum of true/pseudo self-dots).
+        # f1,f2 contribute 2 * (Lmax+1) * channels scalars, and product_3 contributes 32 scalars.
+        self.product_5_o3 = PureCartesianElementwiseTensorProductO3(channels=self.channels, Lmax=self.Lmax)
+        self.proj_total = MainNet(2 * self.product_5_o3.dim_out + 32, embed_size, 17)
         self.weighted_sum = RobustScalarWeightedSum(17, init_weights="zero")
 
     def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell):
@@ -346,22 +352,31 @@ class PureCartesianTransformerLayer(nn.Module):
         f1 = self.e3_conv_emb(pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
         f2 = self.e3_conv_emb2(f1, pos, batch, edge_src, edge_dst, edge_shifts, cell)
 
-        f_combine = torch.cat([f1, f2], dim=-1)  # (N, combined_dim)
+        # Combine features correctly: split by rank, merge true/pseudo separately
+        # f1 and f2 are each (N, channels * sum 3^L) with format [true, pseudo]
+        # We need (N, 2*channels * sum 3^L) with format [combined_true, combined_pseudo]
+        f1_blocks = split_by_rank_o3(f1, self.channels, self.Lmax)
+        f2_blocks = split_by_rank_o3(f2, self.channels, self.Lmax)
+        combined_blocks = {}
+        for s in (0, 1):
+            for L in range(self.Lmax + 1):
+                # Concatenate f1 and f2 blocks along channel dimension
+                # For L=0: shape is (N, channels), cat on dim=1 -> (N, 2*channels)
+                # For L>0: shape is (N, channels, 3,...), cat on dim=1 -> (N, 2*channels, 3,...)
+                combined_blocks[(s, L)] = torch.cat([f1_blocks[(s, L)], f2_blocks[(s, L)]], dim=1)
+        f_combine = merge_by_rank_o3(combined_blocks, self.combined_channels, self.Lmax)  # (N, combined_dim)
 
         f_prod3 = self.product_3(f_combine)  # (N, 32)
 
-        # Additional simple invariants per rank: channelwise L2 norms
-        blocks = split_by_rank_o3(f_combine, self.channels * 2, self.Lmax)
-        invs = []
-        # Use only true-tensor (s=0) norms for invariants; pseudoscalars would flip under reflections.
-        for L in range(self.Lmax + 1):
-            t = blocks[(0, L)]
-            t = t.reshape(t.shape[0], self.channels * 2, -1)
-            invs.append((t * t).sum(dim=-1))
-        invs_cat = torch.cat(invs, dim=-1)  # (N, (Lmax+1)*combined_channels)
+        # product_5: build T implicitly by concatenating per-block invariants (0e only)
+        # - f1,f2: O(3)-graded rank features -> (N, channels*(Lmax+1)) each
+        # - f_prod3: 32 scalars -> elementwise product with itself
+        inv1 = self.product_5_o3(f1, f1)
+        inv2 = self.product_5_o3(f2, f2)
+        inv3 = f_prod3 * f_prod3
+        f_prod5 = torch.cat([inv1, inv2, inv3], dim=-1)
 
-        readout_in = torch.cat([f_prod3, invs_cat], dim=-1)
-        proj = self.readout_linear(readout_in)
-        e_out = self.weighted_sum(proj)
+        product_proj = self.proj_total(f_prod5)
+        e_out = self.weighted_sum(product_proj)
         return e_out.sum(dim=-1, keepdim=True)
 
