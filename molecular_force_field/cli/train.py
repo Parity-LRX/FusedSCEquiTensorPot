@@ -333,6 +333,16 @@ def main():
                         choices=['k0', 'k1', 'both'],
                         help='K policy for sparse tensor product in pure-cartesian-sparse mode (default: k0). '
                              'k0: only k=0 (promotes higher rank), k1: only k=1 (contracts to lower rank), both: keep both')
+
+    # ICTD path pruning controls (pure-cartesian-ictd only)
+    parser.add_argument('--ictd-tp-path-policy', type=str, default='full',
+                        choices=['full', 'max_rank_other'],
+                        help='Path policy for ICTD tensor products in pure-cartesian-ictd mode (default: full). '
+                             'full: keep all CG-allowed (l1,l2->l3) paths; '
+                             'max_rank_other: keep only paths with min(l1,l2) <= --ictd-tp-max-rank-other.')
+    parser.add_argument('--ictd-tp-max-rank-other', type=int, default=None,
+                        help='Used when --ictd-tp-path-policy=max_rank_other. '
+                             'Keeps only paths with min(l1,l2) <= this value (e.g. 1 keeps scalar/vector couplings).')
     
     args = parser.parse_args()
 
@@ -599,6 +609,7 @@ def main():
         ).to(device)
     elif args.tensor_product_mode == 'pure-cartesian-ictd':
         logging.info("Using PURE Cartesian ICTD mode (trace-chain invariants for readout)")
+        logging.info(f"  ictd_tp_path_policy={args.ictd_tp_path_policy}, ictd_tp_max_rank_other={args.ictd_tp_max_rank_other}")
         e3trans = PureCartesianICTDTransformerLayer(
             max_embed_radius=config.max_radius,
             main_max_radius=config.max_radius_main,
@@ -615,6 +626,8 @@ def main():
             num_layers=config.num_layers,
             function_type_main=config.function_type,
             lmax=config.lmax,
+            ictd_tp_path_policy=args.ictd_tp_path_policy,
+            ictd_tp_max_rank_other=args.ictd_tp_max_rank_other,
             device=device,
         ).to(device)
     elif args.tensor_product_mode == 'pure-cartesian-sparse':

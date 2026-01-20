@@ -4,16 +4,17 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.12%2B-orange)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-**FusedEquiSCTensorPot** is an E(3)-equivariant neural potential for predicting molecular energies and forces. Built with PyTorch and e3nn, it supports multiple tensor product modes including spherical harmonics and Cartesian implementations.
+**FusedSCEquiTensorPot** is an E(3)-equivariant neural potential for predicting molecular energies and forces. Built with PyTorch, it supports **six equivariant tensor product modes**, including e3nn-based spherical harmonics and five self-implemented Cartesian tensor product methods.
 
 ## ✨ Features
 
-- **Multiple Tensor Product Modes**: 
-  - `spherical`: e3nn-based spherical harmonics (strictly equivariant, default)
+- **Six Equivariant Tensor Product Modes**: 
+  - `spherical`: e3nn-based spherical harmonics (strictly equivariant, default, standard implementation)
   - `partial-cartesian`: Cartesian tensor products with CG coefficients (strictly equivariant, -17.4% params)
-  - `partial-cartesian-loose`: Optimized Cartesian tensor products (approximate equivariance, fastest)
+  - `partial-cartesian-loose`: Optimized Cartesian tensor products (approximate equivariance, faster)
+  - `pure-cartesian`: Pure Cartesian \(3^L\) representation (strictly equivariant, very slow, not recommended)
   - `pure-cartesian-sparse`: Sparse pure Cartesian with δ/ε contractions (strictly equivariant, -29.6% params)
-  - `pure-cartesian-ictd`: ICTD trace-chain invariants (strictly equivariant, -72.1% params, best for memory)
+  - `pure-cartesian-ictd`: ICTD irreps internal representation (strictly equivariant, -72.1% params, fastest, best for memory)
   
 - **E(3)-Equivariant**: All modes maintain rotational equivariance and parity conservation
   
@@ -251,26 +252,43 @@ molecular_force_field/
 
 ## 🎯 Choosing Tensor Product Mode
 
-The library supports **six tensor product modes**, each optimized for different use cases:
+The library supports **six equivariant tensor product modes**, each optimized for different use cases:
 
-| Mode | Equivariance | Speed* | Parameters* | Equivariance Error* | Use Case |
-|------|--------------|--------|-------------|---------------------|----------|
-| `spherical` | ✅ Strict | 1.00x (baseline) | 100% (baseline) | 4.41e-07 | Default, maximum compatibility, research/publication |
-| `partial-cartesian` | ✅ Strict | 1.08x | 82.6% (-17.4%) | 1.83e-07 | Strict equivariance with fewer parameters |
-| `partial-cartesian-loose` | ⚠️ Approximate | **0.64x (fastest)** | 82.7% (-17.3%) | 6.52e-08 | Fast iteration, approximate equivariance acceptable |
-| `pure-cartesian-sparse` | ✅ Strict | 1.02x | 70.4% (-29.6%) | 3.03e-07 | Best balance: fewer params, near-baseline speed |
-| `pure-cartesian-ictd` | ✅ Strict | **0.67x (fastest)** | **27.9% (-72.1%)** | 1.08e-07 | **Best for memory**: fewest params, fast, strictly equivariant |
-| `pure-cartesian` | ✅ Strict | 9.56x (slowest) | 514.0% (+414%) | 2.20e-07 | ❌ Not recommended (too slow, too many params) |
+1. **`spherical`**: e3nn-based spherical harmonics (default, standard implementation)
+2. **`partial-cartesian`**: Cartesian coordinates + CG coefficients (strictly equivariant)
+3. **`partial-cartesian-loose`**: Approximate equivariant (norm product approximation)
+4. **`pure-cartesian`**: Pure Cartesian \(3^L\) representation (strictly equivariant, very slow)
+5. **`pure-cartesian-sparse`**: Sparse pure Cartesian (strictly equivariant, parameter-optimized)
+6. **`pure-cartesian-ictd`**: ICTD irreps internal representation (strictly equivariant, fastest, fewest parameters)
 
-*Benchmark results on CPU, channels=64, lmax=2, 64 atoms, 512 edges. All modes pass O(3) equivariance tests (including parity/reflection, error < 1e-6).
+All modes maintain O(3) equivariance (including rotation and reflection). Performance comparison:
+
+| Mode | Equivariance | Speed (CPU)* | Speed (GPU)** | Parameters* | Equivariance Error* | Use Case |
+|------|--------------|-------------|---------------|-------------|---------------------|----------|
+| `spherical` | ✅ Strict | 1.00x (baseline) | 1.00x (baseline) | 100% (baseline) | ~1e-15 | Default, maximum compatibility, research/publication |
+| `partial-cartesian` | ✅ Strict | 0.16x-1.06x | 0.75x (lmax=2) | 82.6% (-17.4%) | ~1e-14 | Strict equivariance with fewer parameters |
+| `partial-cartesian-loose` | ⚠️ Approximate | 0.17x-1.37x | 1.15x (lmax=2) | 82.7% (-17.3%) | ~1e-15 | Fast iteration (CPU, lmax≤3), approximate equivariance acceptable |
+| `pure-cartesian-sparse` | ✅ Strict | 0.53x-1.39x | **1.17x (lmax=2)** | 70.4% (-29.6%) | ~1e-15 | Best balance: fewer params, stable performance |
+| `pure-cartesian-ictd` | ✅ Strict | **1.58x-4.12x (fastest)** | **2.10x (lmax=2, fastest)** | **27.9% (-72.1%)** | ~1e-7 | **Best overall**: fewest params, fastest on CPU/GPU, strictly equivariant |
+| `pure-cartesian` | ✅ Strict | 0.02x-0.36x (slowest) | 0.06x (lmax=2, fails at lmax≥4) | 514.0% (+414%) | ~1e-14 | ❌ Not recommended (too slow, too many params) |
+
+*CPU benchmark: channels=64, lmax=0-6, 32 atoms, 256 edges, float64. Speed shown is total training time (forward+backward) acceleration ratio relative to spherical.  
+**GPU benchmark: channels=64, lmax=0-6, 32 atoms, 256 edges, RTX 3090, float64. Speed shown is total training time (forward+backward) acceleration ratio relative to spherical.  
+All modes pass O(3) equivariance tests (including parity/reflection, error < 1e-6).
 
 ### Quick Recommendations
 
-- **First time / Research**: Use `spherical` (default)
-- **Memory constrained**: Use `pure-cartesian-ictd` (72.1% fewer parameters, 0.67x speed, fastest)
-- **Speed priority**: Use `partial-cartesian-loose` (0.64x, fastest, but approximate equivariance)
-- **Best balance**: Use `pure-cartesian-sparse` (29.6% fewer params, 1.02x speed, strictly equivariant)
-- **Strict equivariance + fewer params**: Use `partial-cartesian` or `pure-cartesian-sparse`
+#### CPU Environment (Recommended)
+- **Speed + Memory**: Use `pure-cartesian-ictd` (**1.58x-4.12x faster**, 72.1% fewer parameters, all lmax)
+- **High Precision**: Use `spherical` or `pure-cartesian-sparse` (equivariance error ~1e-15)
+- **Best Balance**: Use `pure-cartesian-sparse` (0.53x-1.39x, 29.6% fewer params, strict equivariance)
+- **Standard Baseline**: Use `spherical` (highest precision, standard implementation)
+
+#### GPU Environment (Recommended for Training)
+- **Speed + Memory**: Use `pure-cartesian-ictd` (**2.10x faster**, 72.1% fewer parameters, lmax≤3)
+- **High Precision**: Use `spherical` or `pure-cartesian-sparse` (equivariance error ~1e-15)
+- **Best Balance**: Use `pure-cartesian-sparse` (**1.17x faster**, 29.6% fewer params, strict equivariance)
+- **Avoid**: `pure-cartesian` (too slow, fails at lmax≥4)
 
 For detailed performance comparison and recommendations, see [USAGE.md](USAGE.md#张量积模式对比).
 
@@ -285,7 +303,12 @@ MIT License
 
 ## 🙏 Acknowledgments
 
-- Built on [e3nn](https://github.com/e3nn/e3nn) for equivariant neural networks
+This framework implements **six equivariant tensor product modes**:
+- **`spherical` mode**: Built on [e3nn](https://github.com/e3nn/e3nn) for spherical harmonics-based tensor products
+- **`partial-cartesian` and `partial-cartesian-loose` modes**: Partially use e3nn's Clebsch-Gordan coefficients (`e3nn.o3.wigner_3j`) and irreducible representation framework (`e3nn.o3.Irreps`) for tensor product operations
+- **Three fully self-implemented Cartesian modes**: `pure-cartesian`, `pure-cartesian-sparse`, and `pure-cartesian-ictd` are independently implemented Cartesian tensor product methods without e3nn dependencies
+
+Other dependencies and inspirations:
 - Uses [ASE](https://wiki.fysik.dtu.dk/ase/) for molecular simulations
 - Inspired by NequIP, MACE, and other equivariant neural potentials
 

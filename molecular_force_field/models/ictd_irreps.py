@@ -177,6 +177,81 @@ def direction_harmonics(n: torch.Tensor, l: int) -> torch.Tensor:
     return c
 
 
+@lru_cache(maxsize=None)
+def _dir_monomial_exps_coefs(l: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Precompute monomial exponents and multinomial coefficients for degree l.
+
+    Returns:
+      exps: (Dsym(l), 3) int64, rows are (a,b,c)
+      coefs: (Dsym(l),) float64, multinomial(l; a,b,c)
+    """
+    counts = _counts_list(l)
+    exps = torch.tensor(counts, dtype=torch.int64)  # (D,3)
+    if l == 0:
+        coefs = torch.ones(1, dtype=torch.float64)
+    else:
+        coefs_list = []
+        for (a, b, c) in counts:
+            coefs_list.append(math.factorial(l) / (math.factorial(a) * math.factorial(b) * math.factorial(c)))
+        coefs = torch.tensor(coefs_list, dtype=torch.float64)
+    return exps, coefs
+
+
+@lru_cache(maxsize=None)
+def _dir_proj_cpu_f64(l: int) -> torch.Tensor:
+    """
+    Precompute P_l = G_l @ B_l on CPU float64:
+      t (..., Dsym) -> c (..., 2l+1) via c = t @ P_l
+    """
+    if l == 0:
+        return torch.ones(1, 1, dtype=torch.float64)
+    B = _harmonic_basis_t(l, dtype=torch.float64)  # (Dsym, 2l+1)
+    G = _gram_gaussian(l)  # (Dsym, Dsym) float64
+    return (G @ B).contiguous()  # (Dsym, 2l+1)
+
+
+_dir_proj_cache_by_dev_dtype: Dict[Tuple[str, str, int], torch.Tensor] = {}
+
+
+def direction_harmonics_fast(n: torch.Tensor, l: int) -> torch.Tensor:
+    """
+    Faster version of direction_harmonics with:
+      - vectorized monomial evaluation
+      - cached projection matrix (G@B) per (device,dtype,l)
+    """
+    if l == 0:
+        return torch.ones(*n.shape[:-1], 1, device=n.device, dtype=n.dtype)
+
+    key = (str(n.device), str(n.dtype), int(l))
+    P = _dir_proj_cache_by_dev_dtype.get(key)
+    if P is None:
+        P = _dir_proj_cpu_f64(l).to(device=n.device, dtype=n.dtype)
+        _dir_proj_cache_by_dev_dtype[key] = P
+
+    exps, coefs = _dir_monomial_exps_coefs(l)
+    exps = exps.to(device=n.device)
+    coefs = coefs.to(device=n.device, dtype=n.dtype)
+
+    nx, ny, nz = n[..., 0], n[..., 1], n[..., 2]
+    a = exps[:, 0]
+    b = exps[:, 1]
+    c = exps[:, 2]
+    # (..., Dsym)
+    t = (nx.unsqueeze(-1) ** a) * (ny.unsqueeze(-1) ** b) * (nz.unsqueeze(-1) ** c)
+    t = t * coefs
+    # (..., 2l+1)
+    return t @ P
+
+
+def direction_harmonics_all(n: torch.Tensor, lmax: int) -> List[torch.Tensor]:
+    """
+    Compute direction harmonics for all l=0..lmax.
+    Returns a list Y where Y[l] has shape (..., 2l+1).
+    """
+    return [direction_harmonics_fast(n, l) for l in range(int(lmax) + 1)]
+
+
 @dataclass(frozen=True)
 class CGKey:
     l1: int
@@ -250,7 +325,23 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
     We follow the same "W[mul_out, mul1, mul2]" weight structure per (l1,l2->l3) path.
     """
 
-    def __init__(self, mul_in1: int, mul_in2: int, mul_out: int, lmax: int, internal_weights: bool = True):
+    def __init__(
+        self,
+        mul_in1: int,
+        mul_in2: int,
+        mul_out: int,
+        lmax: int,
+        internal_weights: bool = True,
+        *,
+        # e3nn-instructions-like control: explicitly choose which (l1,l2,l3) paths exist.
+        # If provided, this is the most precise "pruning" mechanism.
+        allowed_paths: List[Tuple[int, int, int]] | None = None,
+        # Convenience policy to generate allowed_paths.
+        # - "full": keep all CG-allowed paths
+        # - "max_rank_other": keep paths with min(l1,l2) <= max_rank_other (like sparse heuristic)
+        path_policy: str = "full",
+        max_rank_other: int | None = None,
+    ):
         super().__init__()
         self.mul_in1 = mul_in1
         self.mul_in2 = mul_in2
@@ -259,13 +350,26 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         self.internal_weights = internal_weights
 
         # Enumerate all valid (l1,l2,l3) with parity selection (even step)
-        self.paths: List[Tuple[int, int, int]] = []
+        all_paths: List[Tuple[int, int, int]] = []
         for l1 in range(lmax + 1):
             for l2 in range(lmax + 1):
                 for l3 in range(abs(l1 - l2), min(l1 + l2, lmax) + 1):
                     if (l1 + l2 + l3) % 2 == 1:
                         continue
-                    self.paths.append((l1, l2, l3))
+                    all_paths.append((l1, l2, l3))
+
+        if allowed_paths is not None:
+            allowed_set = set(allowed_paths)
+            self.paths = [p for p in all_paths if p in allowed_set]
+        else:
+            if path_policy == "full":
+                self.paths = all_paths
+            elif path_policy == "max_rank_other":
+                if max_rank_other is None:
+                    raise ValueError("path_policy='max_rank_other' requires max_rank_other")
+                self.paths = [p for p in all_paths if min(p[0], p[1]) <= int(max_rank_other)]
+            else:
+                raise ValueError(f"Unknown path_policy={path_policy!r}")
 
         self.num_paths = len(self.paths)
         self.weight_numel = self.num_paths * mul_out * mul_in1 * mul_in2
@@ -275,6 +379,100 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
             self.weight = nn.Parameter(torch.randn(self.num_paths, mul_out, mul_in1, mul_in2) * 0.02)
         else:
             self.register_parameter("weight", None)
+
+        # Cache CG tensors to avoid per-forward .to(device,dtype) allocations.
+        #
+        # build_cg_tensor(l1,l2,l3) returns a CPU float64 tensor (and is itself lru_cached),
+        # but calling .to(device,dtype) for every path on every forward is costly (especially
+        # for higher lmax with many paths). We keep:
+        # - a CPU float64 list (built lazily) for the paths
+        # - per-(device,dtype) converted lists for fast reuse
+        self._cg_cpu_f64: List[torch.Tensor] | None = None
+        self._cg_cache_by_dev_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
+
+        # Group paths by (l1,l2). This enables an e3nn-like factorization:
+        #   1) build the (l1,l2) tensor-product basis once (NO mul_out)
+        #   2) apply per-path (mul_out,mul1,mul2) weights as a separate contraction
+        # This avoids repeating the expensive m-contractions for every output channel and path.
+        #
+        # Each group stores:
+        #   - l1, l2
+        #   - p_indices: indices into self.paths (and self.weight / gates vector)
+        #   - l3_list: l3 per path in group (aligned with p_indices)
+        #   - segments: list of (p_idx, l3, start, end) into concatenated K_total
+        self._groups: List[Dict[str, object]] = []
+        groups_tmp: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+        for p_idx, (l1, l2, l3) in enumerate(self.paths):
+            groups_tmp.setdefault((l1, l2), []).append((p_idx, l3))
+        for (l1, l2), items in sorted(groups_tmp.items()):
+            p_indices = [p for (p, _) in items]
+            l3_list = [l3 for (_, l3) in items]
+            segments = []
+            start = 0
+            for p_idx, l3 in items:
+                kdim = 2 * l3 + 1
+                segments.append((p_idx, l3, start, start + kdim))
+                start += kdim
+            self._groups.append(
+                {
+                    "l1": l1,
+                    "l2": l2,
+                    "p_indices": p_indices,
+                    "l3_list": l3_list,
+                    "segments": segments,
+                    "k_total": start,
+                }
+            )
+
+        # Cache per-group projection matrices per (device,dtype) matching _groups:
+        #   U_g: (m1*m2, K_total), where K_total = sum_{paths in group} (2*l3+1)
+        self._proj_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
+
+    def _get_cg_list(self, device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
+        key = (str(device), str(dtype))
+        cached = self._cg_cache_by_dev_dtype.get(key)
+        if cached is not None:
+            return cached
+
+        if self._cg_cpu_f64 is None:
+            # Build CPU float64 tensors once, in path order.
+            self._cg_cpu_f64 = [build_cg_tensor(l1, l2, l3) for (l1, l2, l3) in self.paths]
+
+        cg_list = [C.to(device=device, dtype=dtype) for C in self._cg_cpu_f64]
+        self._cg_cache_by_dev_dtype[key] = cg_list
+        return cg_list
+
+    def _get_proj_group_list(self, device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
+        """
+        Returns a list of projection matrices U_g, one per (l1,l2) group:
+          U_g: (m1*m2, K_total)
+        such that for tensor-product coefficients t_{m1,m2} (flattened to m1*m2),
+        the concatenated outputs for all paths in the group are:
+          y_concat = t_flat @ U_g
+        """
+        key = (str(device), str(dtype))
+        cached = self._proj_group_cache_by_dev_dtype.get(key)
+        if cached is not None:
+            return cached
+
+        cg_list = self._get_cg_list(device=device, dtype=dtype)
+        proj_list: List[torch.Tensor] = []
+        for g in self._groups:
+            l1 = int(g["l1"])  # type: ignore[arg-type]
+            l2 = int(g["l2"])  # type: ignore[arg-type]
+            segments = g["segments"]  # type: ignore[assignment]
+            k_total = int(g["k_total"])  # type: ignore[arg-type]
+
+            m1 = 2 * l1 + 1
+            m2 = 2 * l2 + 1
+            U = torch.zeros(m1 * m2, k_total, device=device, dtype=dtype)
+            for p_idx, _l3, s, e in segments:  # type: ignore[misc]
+                C = cg_list[int(p_idx)]  # (m1,m2,kdim)
+                U[:, int(s): int(e)] = C.reshape(m1 * m2, int(e) - int(s))
+            proj_list.append(U)
+
+        self._proj_group_cache_by_dev_dtype[key] = proj_list
+        return proj_list
 
     def forward(
         self,
@@ -289,48 +487,148 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         dtype = sample.dtype
 
         if self.internal_weights:
-            w_param = self.weight.to(device=device, dtype=dtype)  # (P, o, i, j)
+            # Assume module has already been moved to the right device/dtype by caller.
+            w_param = self.weight  # (P, o, i, j)
         else:
             assert weights is not None
             w = weights
             if w.shape[-1] not in (self.weight_numel, self.num_paths):
                 raise ValueError(f"weights last-dim must be weight_numel={self.weight_numel} or num_paths={self.num_paths}, got {w.shape[-1]}")
 
+        # Make weights/gates device+dtype consistent once (avoid per-path .to()).
+        # Only convert when needed; calling .to() unconditionally can add overhead.
+        if weights is not None and (weights.device != device or weights.dtype != dtype):
+            weights = weights.to(device=device, dtype=dtype)
+
         # init output
         out: Dict[int, torch.Tensor] = {}
         for l in range(self.lmax + 1):
             out[l] = torch.zeros(*batch_shape, self.mul_out, 2 * l + 1, device=device, dtype=dtype)
 
-        idx = 0
-        for p_idx, (l1, l2, l3) in enumerate(self.paths):
-            if self.internal_weights and (weights is None or weights.shape[-1] == self.num_paths):
-                # gated shared weights: gate is (...,) scalar per path
-                gate = 1.0
-                if weights is not None:
-                    gate = weights[..., p_idx].to(device=device, dtype=dtype)
-                Wp = w_param[p_idx]  # (o,i,j)
-            else:
-                # full per-example weights: (..., weight_numel)
-                assert weights is not None
-                block = self.mul_out * self.mul_in1 * self.mul_in2
-                Wp = weights[..., idx: idx + block].view(*batch_shape, self.mul_out, self.mul_in1, self.mul_in2)
-                idx += block
-                gate = 1.0
+        # Fast path: internal_weights + per-path scalar gates (this is what our models use).
+        if self.internal_weights and (weights is None or weights.shape[-1] == self.num_paths):
+            proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+            for g_idx, g in enumerate(self._groups):
+                l1 = int(g["l1"])  # type: ignore[arg-type]
+                l2 = int(g["l2"])  # type: ignore[arg-type]
+                segments = g["segments"]  # type: ignore[assignment]
+                k_total = int(g["k_total"])  # type: ignore[arg-type]
 
-            a = x1.get(l1)
-            b = x2.get(l2)
-            if a is None or b is None:
-                continue
+                a = x1.get(l1)
+                b = x2.get(l2)
+                if a is None or b is None:
+                    continue
 
-            C = build_cg_tensor(l1, l2, l3).to(device=device, dtype=dtype)  # (m1,m2,m3)
-            # a: (..., mul1, m1), b: (..., mul2, m2), Wp: (..., mul_out, mul1, mul2)
-            if self.internal_weights and (weights is None or weights.shape[-1] == self.num_paths):
+                # e3nn-like factorization:
+                # 1) project to concatenated k space once: (..., i, j, K_total)
+                # 2) batch channel mixing for all paths in group, then segment and accumulate
+                m1 = 2 * l1 + 1
+                m2 = 2 * l2 + 1
+                U = proj_list[g_idx]  # (m1*m2, K_total)
+                # Optimized outer product: (..., i, m1) x (..., j, m2) -> (..., i, j, m1, m2)
+                # Using broadcast instead of einsum for better performance
+                t_mn = (a.unsqueeze(-2).unsqueeze(-1) * b.unsqueeze(-3).unsqueeze(-2))  # (..., i, j, m1, m2)
+                t_flat = t_mn.reshape(*batch_shape, self.mul_in1, self.mul_in2, m1 * m2)
+                y = torch.matmul(t_flat, U)  # (..., i, j, K_total)
+                if y.shape[-1] != k_total:
+                    raise RuntimeError("ICTD TP projection produced wrong K_total")
+
+                # Process each path in the group (projection is already done once for the group)
+                # The key optimization is that projection (y) is computed once per group
+                i, j = self.mul_in1, self.mul_in2
+                for p_idx, l3, s, e in segments:  # type: ignore[misc]
+                    Wp = w_param[int(p_idx)]  # (o,i,j)
+                    y_seg = y[..., :, :, int(s): int(e)]  # (..., i, j, kdim)
+                    # GEMM-style channel mixing (optimized)
+                    kdim = int(e) - int(s)
+                    y2 = y_seg.movedim(-1, -3).contiguous().view(*y_seg.shape[:-3], kdim, i * j)  # (..., k, ij)
+                    W2 = Wp.contiguous().view(Wp.shape[0], i * j)  # (o, ij)
+                    out_seg = torch.matmul(y2, W2.transpose(0, 1)).movedim(-1, -2)  # (..., o, k)
+                    if weights is not None:
+                        gate = weights[..., int(p_idx)]
+                        out_seg = out_seg * gate[..., None, None]
+                    out[int(l3)] = out[int(l3)] + out_seg
+        # Fast path: external full per-example weights (..., weight_numel).
+        # Still uses the e3nn-like factorization (projection first, then channel mixing).
+        elif weights is not None and weights.shape[-1] == self.weight_numel:
+            proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+            # Reshape once:
+            #   weights_full: (..., P, o, i, j)
+            weights_full = weights.view(*batch_shape, self.num_paths, self.mul_out, self.mul_in1, self.mul_in2)
+            for g_idx, g in enumerate(self._groups):
+                l1 = int(g["l1"])  # type: ignore[arg-type]
+                l2 = int(g["l2"])  # type: ignore[arg-type]
+                segments = g["segments"]  # type: ignore[assignment]
+                k_total = int(g["k_total"])  # type: ignore[arg-type]
+
+                a = x1.get(l1)
+                b = x2.get(l2)
+                if a is None or b is None:
+                    continue
+
+                m1 = 2 * l1 + 1
+                m2 = 2 * l2 + 1
+                U = proj_list[g_idx]  # (m1*m2, K_total)
+                # Optimized outer product: (..., i, m1) x (..., j, m2) -> (..., i, j, m1, m2)
+                # Using broadcast instead of einsum for better performance
+                t_mn = (a.unsqueeze(-2).unsqueeze(-1) * b.unsqueeze(-3).unsqueeze(-2))  # (..., i, j, m1, m2)
+                t_flat = t_mn.reshape(*batch_shape, self.mul_in1, self.mul_in2, m1 * m2)
+                y = torch.matmul(t_flat, U)  # (..., i, j, K_total)
+                if y.shape[-1] != k_total:
+                    raise RuntimeError("ICTD TP projection produced wrong K_total")
+
+                # Batch channel mixing for all paths in this group
+                num_paths_in_group = len(segments)
+                # Extract weights for this group: (..., P_g, o, i, j)
+                p_indices = [int(p_idx) for p_idx, _, _, _ in segments]
+                W_stack = weights_full[..., p_indices, :, :, :]  # (..., P_g, o, i, j)
+                
+                # Reshape y for batched matmul: (..., i*j, K_total)
+                i, j = self.mul_in1, self.mul_in2
+                y_reshaped = y.permute(*range(len(batch_shape)), -3, -2, -1).reshape(*batch_shape, i * j, k_total)  # (..., ij, K)
+                
+                # Reshape W_stack: (..., P_g, o, i*j)
+                W_reshaped = W_stack.reshape(*batch_shape, num_paths_in_group, self.mul_out, i * j)  # (..., P_g, o, ij)
+                
+                # Batched matmul: (..., ij, K) @ (..., P_g, ij, o) -> (..., P_g, o, K)
+                # We need: (..., 1, ij, K) @ (..., P_g, ij, o) -> (..., P_g, 1, o, K) -> (..., P_g, o, K)
+                y_expanded = y_reshaped.unsqueeze(-3)  # (..., 1, ij, K)
+                W_transposed = W_reshaped.transpose(-2, -1)  # (..., P_g, ij, o)
+                out_group = torch.matmul(y_expanded, W_transposed)  # (..., P_g, 1, o, K)
+                out_group = out_group.squeeze(-2).permute(*range(len(batch_shape)), 0, 1, 2)  # (..., P_g, o, K_total)
+                
+                # Segment and accumulate to output
+                for seg_idx, (p_idx, l3, s, e) in enumerate(segments):  # type: ignore[misc]
+                    kdim = int(e) - int(s)
+                    out_seg = out_group[..., seg_idx, :, int(s): int(e)]  # (..., o, kdim)
+                    out[int(l3)] = out[int(l3)] + out_seg
+        else:
+            # Fallback: original per-path loop (supports external per-example weights).
+            cg_list = self._get_cg_list(device=device, dtype=dtype)
+            idx = 0
+            for p_idx, (l1, l2, l3) in enumerate(self.paths):
+                if self.internal_weights:
+                    gate = 1.0
+                    if weights is not None and weights.shape[-1] == self.num_paths:
+                        gate = weights[..., p_idx]
+                    Wp = w_param[p_idx]  # (o,i,j)
+                else:
+                    assert weights is not None
+                    block = self.mul_out * self.mul_in1 * self.mul_in2
+                    Wp = weights[..., idx: idx + block].view(*batch_shape, self.mul_out, self.mul_in1, self.mul_in2)
+                    idx += block
+                    gate = 1.0
+
+                a = x1.get(l1)
+                b = x2.get(l2)
+                if a is None or b is None:
+                    continue
+
+                C = cg_list[p_idx]  # (m1,m2,m3)
                 out_l3 = torch.einsum("...im,...jn,mnk,oij->...ok", a, b, C, Wp)
                 if not isinstance(gate, float):
                     out_l3 = out_l3 * gate[..., None, None]
-            else:
-                out_l3 = torch.einsum("...im,...jn,mnk,...oij->...ok", a, b, C, Wp)
-            out[l3] = out[l3] + out_l3
+                out[l3] = out[l3] + out_l3
 
         return out
 

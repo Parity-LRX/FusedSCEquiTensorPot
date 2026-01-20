@@ -23,6 +23,7 @@ from e3nn.math import soft_one_hot_linspace
 from molecular_force_field.models.ictd_irreps import (
     HarmonicFullyConnectedTensorProduct,
     direction_harmonics,
+    direction_harmonics_all,
 )
 from molecular_force_field.models.mlp import RobustScalarWeightedSum
 from molecular_force_field.models.mlp import MainNet
@@ -84,6 +85,9 @@ class ICTDIrrepsE3Conv(nn.Module):
         output_size: int = 8,
         lmax: int = 2,
         function_type: str = "gaussian",
+        # ICTD tensor-product path control (e3nn-instructions-like)
+        ictd_tp_path_policy: str = "full",
+        ictd_tp_max_rank_other: int | None = None,
     ):
         super().__init__()
         self.max_radius = max_radius
@@ -106,6 +110,8 @@ class ICTDIrrepsE3Conv(nn.Module):
             mul_out=channels_out,
             lmax=lmax,
             internal_weights=True,
+            path_policy=ictd_tp_path_policy,
+            max_rank_other=ictd_tp_max_rank_other,
         )
         self.fc = nn.Sequential(
             nn.Linear(number_of_basis, 64),
@@ -117,24 +123,32 @@ class ICTDIrrepsE3Conv(nn.Module):
 
         self.output_dim = _irreps_total_dim(channels_out, lmax)
 
-    def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell):
+    def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell, *, precomputed_n=None, precomputed_edge_length=None, precomputed_Y_list=None):
         dtype = next(self.parameters()).dtype
         pos = pos.to(dtype=dtype)
         cell = cell.to(dtype=dtype)
         edge_shifts = edge_shifts.to(dtype=dtype)
 
-        edge_batch_idx = batch[edge_src]
-        edge_cells = cell[edge_batch_idx]
-        shift_vecs = torch.einsum("ni,nij->nj", edge_shifts, edge_cells)
-        edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
-        edge_length = edge_vec.norm(dim=1)
-        n = edge_vec / edge_length.clamp(min=1e-8).unsqueeze(-1)
+        if precomputed_n is None or precomputed_edge_length is None:
+            edge_batch_idx = batch[edge_src]
+            edge_cells = cell[edge_batch_idx]
+            shift_vecs = torch.einsum("ni,nij->nj", edge_shifts, edge_cells)
+            edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
+            edge_length = edge_vec.norm(dim=1)
+            n = edge_vec / edge_length.clamp(min=1e-8).unsqueeze(-1)
+        else:
+            n = precomputed_n
+            edge_length = precomputed_edge_length
 
         Ai = self.atom_mlp(self.atom_embedding(A.long()))  # (N, output_size)
         n = n.to(dtype=Ai.dtype)
         edge_length = edge_length.to(dtype=Ai.dtype)
 
-        Y = {l: direction_harmonics(n, l) for l in range(self.lmax + 1)}  # (E, 2l+1)
+        if precomputed_Y_list is None:
+            Y_list = direction_harmonics_all(n, self.lmax)
+        else:
+            Y_list = precomputed_Y_list
+        Y = {l: Y_list[l] for l in range(self.lmax + 1)}  # (E, 2l+1)
 
         f_in = {l: Ai[edge_src].unsqueeze(-1) * Y[l].unsqueeze(-2) for l in range(self.lmax + 1)}  # (E, output_size, 2l+1)
 
@@ -182,7 +196,10 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         function_type_main: str = "gaussian",
         lmax: int = 2,
         ictd_Lmax: int = 6,
-        # Sparse message passing controls (match pure-cartesian-sparse defaults)
+        # ICTD tensor-product path control (e3nn-instructions-like)
+        ictd_tp_path_policy: str = "full",
+        ictd_tp_max_rank_other: int | None = None,
+        # Keep these for backward compatibility; currently unused in ICTD mode.
         max_rank_other: int = 1,
         k_policy: str = "k0",
     ):
@@ -212,6 +229,8 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             output_size=output_size,
             lmax=self.lmax,
             function_type=function_type_main,
+            ictd_tp_path_policy=ictd_tp_path_policy,
+            ictd_tp_max_rank_other=ictd_tp_max_rank_other,
         )
 
         # conv2: node irreps (mul=C) x edge Y_l (mul=1) -> node irreps (mul=C), per-edge weights
@@ -221,6 +240,8 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             mul_out=self.channels,
             lmax=self.lmax,
             internal_weights=True,
+            path_policy=ictd_tp_path_policy,
+            max_rank_other=ictd_tp_max_rank_other,
         )
         self.fc2 = nn.Sequential(
             nn.Linear(main_number_of_basis, 64),
@@ -258,20 +279,29 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         edge_dst = edge_dst[sort_idx]
         edge_shifts = edge_shifts[sort_idx]
 
-        # conv1
-        f1 = self.e3_conv_emb(pos, A, batch, edge_src, edge_dst, edge_shifts, cell)  # (N, C*(lmax+1)^2)
-
-        # conv2: node irreps x edge Y_l -> node irreps
+        # Precompute edge geometry once and reuse for conv1 + conv2
         edge_batch_idx = batch[edge_src]
         edge_cells = cell[edge_batch_idx]
         shift_vecs = torch.einsum("ni,nij->nj", edge_shifts, edge_cells)
         edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
         edge_length = edge_vec.norm(dim=1)
         n = edge_vec / edge_length.clamp(min=1e-8).unsqueeze(-1)
+
+        # conv1
+        # compute Y_l once and reuse
+        Y_list = direction_harmonics_all(n.to(dtype=next(self.parameters()).dtype), self.lmax)
+        f1 = self.e3_conv_emb(
+            pos, A, batch, edge_src, edge_dst, edge_shifts, cell,
+            precomputed_n=n,
+            precomputed_edge_length=edge_length,
+            precomputed_Y_list=Y_list,
+        )  # (N, C*(lmax+1)^2)
+
+        # conv2: node irreps x edge Y_l -> node irreps
         n = n.to(dtype=f1.dtype)
         edge_length = edge_length.to(dtype=f1.dtype)
-
-        Y = {l: direction_harmonics(n, l).unsqueeze(-2) for l in range(self.lmax + 1)}  # (E,1,2l+1)
+        # reuse Y_list (computed above) and only reshape
+        Y = {l: Y_list[l].to(dtype=f1.dtype).unsqueeze(-2) for l in range(self.lmax + 1)}  # (E,1,2l+1)
         emb = soft_one_hot_linspace(edge_length, 0.0, self.max_radius, self.number_of_basis, basis=self.function_type, cutoff=True)
         emb = emb.mul(self.number_of_basis ** 0.5).to(dtype=f1.dtype)
         gates = self.fc2(emb)

@@ -1,5 +1,15 @@
 # 使用指南
 
+FusedSCEquiTensorPot 支持**六种等变张量积实现模式**，包括：
+- `spherical`: 基于 e3nn 的球谐函数方法（默认）
+- `partial-cartesian`: 笛卡尔坐标 + e3nn CG 系数（严格等变，部分使用 e3nn）
+- `partial-cartesian-loose`: 近似等变（norm product 近似，部分使用 e3nn）
+- `pure-cartesian`: 纯笛卡尔 \(3^L\) 表示（严格等变，速度较慢，完全自实现）
+- `pure-cartesian-sparse`: 稀疏纯笛卡尔（严格等变，参数量优化，完全自实现）
+- `pure-cartesian-ictd`: ICTD irreps 内部表示（严格等变，速度最快，参数量最少，完全自实现）
+
+所有模式都保持 O(3) 等变性（包括旋转和反射）。详细性能对比见[张量积模式对比](#张量积模式对比)部分。
+
 ## 安装
 
 ### 1. 安装依赖
@@ -208,13 +218,15 @@ mff-train \
   - `fourier`: 傅里叶基函数（适合周期性边界条件）
   - `cosine`: 余弦基函数
   - `smooth_finite`: 平滑有限支撑基函数
-- `--tensor-product-mode`: 张量积实现模式（默认'spherical'）。选项：
-  - `spherical`: 使用 e3nn 球谐函数张量积（默认，精度高）
-  - `partial-cartesian`: 使用笛卡尔张量积（严格等变，参数量减少 17.3%）
-  - `partial-cartesian-loose`: 非严格等变张量积（使用 norm product 近似，速度接近 Spherical，参数量减少 17.3%）
-  - `pure-cartesian`: 纯笛卡尔张量积（3^L 表示，δ/ε 收缩，速度较慢，参数量大）
-  - `pure-cartesian-sparse`: 稀疏纯笛卡尔张量积（参数量减少 30.1%，速度接近 Spherical）
-  - `pure-cartesian-ictd`: 纯笛卡尔消息传递 + ICTD trace 链不变量读出（严格等变；通常比 pure-cartesian-sparse 慢很多）
+- `--tensor-product-mode`: 等变张量积实现模式（默认'spherical'）。**本框架支持六种等变张量积模式**，选项：
+  - `spherical`: 使用 e3nn 球谐函数张量积（默认，精度高，标准实现）
+  - `partial-cartesian`: 笛卡尔坐标 + e3nn CG 系数（严格等变，部分使用 e3nn 的 `wigner_3j` 和 `Irreps`，参数量减少 17.4%）
+  - `partial-cartesian-loose`: 近似等变张量积（使用 norm product 近似，部分使用 e3nn 的 `Irreps` 框架，速度较快，参数量减少 17.3%）
+  - `pure-cartesian`: 纯笛卡尔张量积（\(3^L\) 表示，δ/ε 收缩，严格等变，速度极慢，参数量大，lmax≥4 时失败）
+  - `pure-cartesian-sparse`: 稀疏纯笛卡尔张量积（严格等变，参数量减少 29.6%，速度稳定）
+  - `pure-cartesian-ictd`: ICTD irreps 内部表示（严格等变，参数量最少减少 72.1%，速度最快，CPU: 最高 4.12x，GPU: 最高 2.10x）
+  
+  详细性能对比和推荐场景见[张量积模式对比](#张量积模式对比)部分。
 
 **SWA 和 EMA 参数：**
 - `--swa-start-epoch`: 开始 SWA（Stochastic Weight Averaging）的 epoch。启用后，`a` 和 `b` 会在该 epoch 直接切换为 `--swa-a` 和 `--swa-b` 的值，并重置早停计数器
@@ -270,7 +282,7 @@ mff-evaluate \
 - `--lmax`: 必须与训练时相同
 - `--irreps-output-conv-channels`: 必须与训练时相同（如果训练时设置了）
 - `--function-type`: 必须与训练时相同
-- `--tensor-product-mode`: 必须与训练时相同（`spherical` 或 `cartesian`）
+- `--tensor-product-mode`: 必须与训练时相同（支持六种模式：`spherical`、`partial-cartesian`、`partial-cartesian-loose`、`pure-cartesian`、`pure-cartesian-sparse`、`pure-cartesian-ictd`）
 
 **输出文件：**
 - `test_loss.csv` - 测试集损失指标
@@ -1384,13 +1396,16 @@ torchrun --nproc_per_node=4 \
 
 **1. 使用优化的张量积模式：**
 ```bash
-# Pure-Cartesian-Sparse: 参数量减少最多（30.1%），速度接近 Spherical（0.86x）
+# Pure-Cartesian-ICTD: 参数量最少（减少 72.1%），速度最快（CPU: 最高 4.12x，GPU: 最高 2.10x）
+mff-train --input-file data.xyz --tensor-product-mode pure-cartesian-ictd
+
+# Pure-Cartesian-Sparse: 参数量减少 29.6%，速度稳定（CPU: 0.53x-1.39x，GPU: 0.46x-1.17x）
 mff-train --input-file data.xyz --tensor-product-mode pure-cartesian-sparse
 
-# Partial-Cartesian-Loose: 非严格等变（norm product 近似），速度接近 Spherical（0.90x），参数量减少 17.3%
+# Partial-Cartesian-Loose: 非严格等变（norm product 近似），速度较快（CPU: 0.17x-1.37x，GPU: 0.21x-1.52x），参数量减少 17.3%
 mff-train --input-file data.xyz --tensor-product-mode partial-cartesian-loose
 
-# Partial-Cartesian: 严格等变，参数量减少 17.3%
+# Partial-Cartesian: 严格等变，参数量减少 17.4%
 mff-train --input-file data.xyz --tensor-product-mode partial-cartesian
 ```
 
@@ -1449,13 +1464,13 @@ torchrun --nproc_per_node=4 \
 | 场景 | 推荐模式 | 原因 |
 |------|----------|------|
 | 发表论文/高精度需求 | `spherical` | 使用 e3nn 严格球谐，精度最高，标准实现 |
-| 参数量优化（最多） | `pure-cartesian-ictd` | 参数量减少 73.5%，速度较快（0.72x），严格等变 |
-| 参数量优化（平衡） | `pure-cartesian-sparse` | 参数量减少 30.1%，速度接近 Spherical（0.93x），严格等变 |
-| GPU 内存受限 | `pure-cartesian-ictd` 或 `pure-cartesian-sparse` | 参数量减少 73.5% 或 30.1%，显存占用更低 |
+| 参数量优化（最多） | `pure-cartesian-ictd` | 参数量减少 72.1%，速度最快（CPU: 最高 4.12x，GPU: 最高 2.10x），严格等变 |
+| 参数量优化（平衡） | `pure-cartesian-sparse` | 参数量减少 29.6%，速度稳定（CPU: 0.53x-1.39x，GPU: 0.46x-1.17x），严格等变 |
+| GPU 内存受限 | `pure-cartesian-ictd` 或 `pure-cartesian-sparse` | 参数量减少 72.1% 或 29.6%，显存占用更低 |
 | 严格等变性要求 | `spherical`、`partial-cartesian`、`pure-cartesian-sparse` 或 `pure-cartesian-ictd` | 这些模式都严格等变 |
-| 快速实验迭代 | `partial-cartesian-loose` | 速度最快（0.62x），但非严格等变（norm product 近似） |
+| 快速实验迭代 | `pure-cartesian-ictd` | 速度最快（CPU: 最高 4.12x，GPU: 最高 2.10x），严格等变 |
 | 首次尝试/对比基准 | `spherical` | 验证模型正确性，性能基准 |
-| 大规模模型部署 | `pure-cartesian-ictd` | 参数量最少（减少 73.5%），速度较快（0.72x） |
+| 大规模模型部署 | `pure-cartesian-ictd` | 参数量最少（减少 72.1%），速度最快（CPU: 最高 4.12x，GPU: 最高 2.10x） |
 
 **切换模式：**
 ```bash
@@ -1678,19 +1693,31 @@ mff-train \
 
 ## 张量积模式对比
 
-FusedEquiTensorPot 支持六种张量积实现模式，每种模式在速度、参数量和等变性方面有不同的特点：
+**FusedSCEquiTensorPot 支持六种等变张量积实现模式**，每种模式在速度、参数量和等变性方面有不同的特点：
+
+1. **`spherical`**: 基于 e3nn 的球谐函数方法（默认，标准实现）
+2. **`partial-cartesian`**: 笛卡尔坐标 + e3nn CG 系数（严格等变，部分使用 e3nn 的 `wigner_3j` 和 `Irreps`）
+3. **`partial-cartesian-loose`**: 近似等变（norm product 近似，部分使用 e3nn 的 `Irreps` 框架）
+4. **`pure-cartesian`**: 纯笛卡尔 \(3^L\) 表示（严格等变，速度极慢，完全自实现）
+5. **`pure-cartesian-sparse`**: 稀疏纯笛卡尔（严格等变，参数量优化，完全自实现）
+6. **`pure-cartesian-ictd`**: ICTD irreps 内部表示（严格等变，速度最快，参数量最少，完全自实现）
+
+所有模式都保持 O(3) 等变性（包括旋转和反射）。以下是对比数据：
 
 ### 模式对比总览
 
 | 特性 | Spherical | Partial-Cartesian | Partial-Cartesian-Loose | Pure-Cartesian | Pure-Cartesian-Sparse | Pure-Cartesian-ICTD |
 |------|-----------|-------------------|------------------------|----------------|----------------------|---------------------|
-| 实现 | e3nn 球谐函数 | 笛卡尔坐标 + CG 系数 | 非严格等变（norm product 近似） | 纯笛卡尔（3^L，δ/ε） | 稀疏纯笛卡尔（δ/ε） | ICTD irreps 内部表示 |
+| 实现 | e3nn 球谐函数 | 笛卡尔坐标 + e3nn CG 系数 | 非严格等变（norm product 近似，使用 e3nn Irreps） | 纯笛卡尔（3^L，δ/ε，完全自实现） | 稀疏纯笛卡尔（δ/ε，完全自实现） | ICTD irreps 内部表示（完全自实现） |
 | 等变性 | ✅ 严格等变 | ✅ 严格等变 | ⚠️ 近似等变 | ✅ 严格等变 | ✅ 严格等变 | ✅ 严格等变 |
-| 速度 (CPU, 64 atoms) | 32.30 ms (基准 1.00x) | 34.99 ms (1.08x) | 20.54 ms (**0.64x 最快**) | 308.83 ms (9.56x) | 32.93 ms (1.02x) | 21.48 ms (**0.67x 最快**) |
-| 参数量 | 6,540,634 (100%) | 5,404,938 (82.6%) | 5,406,026 (82.7%) | 33,626,186 (514.0%) | 4,606,026 (70.4%) | 1,824,497 (27.9%) |
+| 速度 (CPU, lmax=2) | 1.00x (基准) | 1.06x | 1.33x | 0.06x (极慢) | 1.39x | **4.12x (最快)** |
+| 速度 (GPU, lmax=2)* | 1.00x (基准) | 0.75x | 1.15x | 0.06x (极慢) | 1.17x | **2.10x (最快)** |
+| 参数量 (lmax=2) | 6,540,634 (100%) | 5,404,938 (82.6%) | 5,406,026 (82.7%) | 33,626,186 (514.0%) | 4,606,026 (70.4%) | 1,824,497 (27.9%) |
 | 参数量变化 | - | **减少 17.4%** | **减少 17.3%** | +414% | **减少 29.6%** | **减少 72.1%** |
-| 等变性误差 (O(3)) | 4.41e-07 | 1.83e-07 | 6.52e-08 | 2.20e-07 | 3.03e-07 | 1.08e-07 |
-| 推荐场景 | 默认，最高精度 | 严格等变，平衡性能 | 快速迭代，非严格等变可接受 | 不推荐（速度慢） | 参数量优化，严格等变 | **参数量最少，速度最快，严格等变** |
+| 等变性误差 (O(3), lmax=2) | ~1e-15 | ~1e-14 | ~1e-15 | ~1e-14 | ~1e-15 | ~1e-7 |
+| 推荐场景 | 默认，最高精度 | 严格等变，平衡性能 | 快速迭代（CPU），非严格等变可接受 | 不推荐（速度慢） | 参数量优化，严格等变 | **参数量最少，GPU 最快，严格等变** |
+
+*GPU 速度：总训练时间（前向+反向）加速比，相对于 spherical。测试环境：RTX 3090, float64, N=32, E=256。
 
 ### 使用方法
 
@@ -1709,36 +1736,82 @@ mff-train --input-file data.xyz --data-dir output --tensor-product-mode partial-
 mff-evaluate --checkpoint model.pth --tensor-product-mode partial-cartesian
 ```
 
-### 详细性能对比（channels=64, lmax=2, CPU，64 atoms，512 edges）
+### 详细性能对比
 
-**前向传播速度（单次前向，30次平均，以 Spherical 为基准）：**
-| 模式 | 时间 (ms) | 相对速度 | 等变性误差 (O(3), 包括宇称) |
-|------|-----------|----------|---------------------------|
-| Spherical | 32.30 | 1.00x (基准) | 4.41e-07 ✅ |
-| Partial-Cartesian | 34.99 | 1.08x | 1.83e-07 ✅ |
-| Partial-Cartesian-Loose | 20.54 | **0.64x (最快)** | 6.52e-08 ✅ |
-| Pure-Cartesian | 308.83 | 9.56x (最慢) | 2.20e-07 ✅ |
-| Pure-Cartesian-Sparse | 32.93 | 1.02x | 3.03e-07 ✅ |
-| Pure-Cartesian-ICTD | 21.48 | **0.67x (最快)** | 1.08e-07 ✅ |
+#### CPU 测试结果（channels=64, lmax=0 到 6, 32 atoms, 256 edges, float64）
 
-**参数量对比（以 Spherical 为基准）：**
-| 模式 | 参数量 | 相对参数量 | 参数量变化 |
-|------|--------|------------|------------|
-| Spherical | 6,540,634 | 100% (基准) | - |
-| Partial-Cartesian | 5,404,938 | 82.6% | **减少 17.4%** |
-| Partial-Cartesian-Loose | 5,406,026 | 82.7% | **减少 17.3%** |
-| Pure-Cartesian | 33,626,186 | 514.0% | +414% |
-| Pure-Cartesian-Sparse | 4,606,026 | 70.4% | **减少 29.6%** |
-| Pure-Cartesian-ICTD | 1,824,497 | 27.9% | **减少 72.1%** |
+**总训练时间加速比（前向+反向，相对于 spherical）：**
 
-**关键发现：**
+| lmax | partial-cartesian | partial-cartesian-loose | pure-cartesian | pure-cartesian-sparse | pure-cartesian-ictd |
+|------|------------------:|----------------------:|---------------:|---------------------:|-------------------:|
+| 0    |             1.06x |                  1.13x |           0.36x |                 1.07x |                **2.97x** |
+| 1    |             1.05x |                  1.37x |           0.13x |                 1.02x |                **3.33x** |
+| 2    |             1.06x |                  1.33x |           0.06x |                 1.39x |                **4.12x** |
+| 3    |             0.58x |                  0.70x |           0.02x |                 1.05x |                **2.68x** |
+| 4    |             0.37x |                  0.43x |        **FAILED** |                 0.97x |                **2.20x** |
+| 5    |             0.23x |                  0.28x |        **FAILED** |                 0.78x |                **1.81x** |
+| 6    |             0.16x |                  0.17x |        **FAILED** |                 0.53x |                **1.58x** |
+
+**参数量对比（lmax=0 到 6）：**
+
+| lmax | spherical | partial-cartesian | partial-cartesian-loose | pure-cartesian | pure-cartesian-sparse | pure-cartesian-ictd |
+|------|----------:|------------------:|----------------------:|---------------:|---------------------:|-------------------:|
+| 0    | 2,313,018 |        1,128,074 |            1,128,074 |      2,725,450 |           1,128,010 |             626,653 |
+| 2    | 6,540,634 |        5,404,938 |            5,406,026 |     33,626,186 |           4,606,026 |           1,824,497 |
+| 4    | 10,768,218 |       15,272,842 |           15,276,106 |         **FAILED** |           8,882,762 |           3,197,103 |
+| 6    | 14,995,802 |       33,926,666 |           33,933,194 |         **FAILED** |          13,159,498 |           4,844,335 |
+
+**等变误差对比（O(3)，包含宇称）：**
+
+| lmax | spherical | partial-cartesian | partial-cartesian-loose | pure-cartesian | pure-cartesian-sparse | pure-cartesian-ictd |
+|------|----------:|------------------:|----------------------:|---------------:|---------------------:|-------------------:|
+| 0    | 3.33e-15  |        8.24e-16  |            6.39e-14  |      3.41e-15  |           4.34e-15  |           1.69e-12 |
+| 2    | 3.88e-15  |        1.87e-14  |            7.73e-16  |      3.08e-15  |           3.56e-14  |           7.73e-08 |
+| 4    | 1.27e-15  |        6.83e-15  |            1.00e-15  |       **FAILED** |           1.24e-14  |           3.50e-05 |
+| 6    | 3.26e-15  |        2.01e-15  |            5.82e-16  |       **FAILED** |           1.51e-15  |           1.00e-06 |
+
+#### GPU 测试结果（channels=64, lmax=0 到 6, RTX 3090, float64, N=32, E=256）
+
+**总训练时间加速比（前向+反向，相对于 spherical）：**
+
+| lmax | partial-cartesian | partial-cartesian-loose | pure-cartesian | pure-cartesian-sparse | pure-cartesian-ictd |
+|------|------------------:|----------------------:|---------------:|---------------------:|-------------------:|
+| 0    |             0.96x |                  1.52x |           0.54x |                 1.17x |                **1.92x** |
+| 1    |             0.85x |                  1.33x |           0.16x |                 1.02x |                **1.97x** |
+| 2    |             0.75x |                  1.15x |           0.06x |                 1.17x |                **2.10x** |
+| 3    |             0.56x |                  0.81x |           0.02x |                 1.15x |                **1.91x** |
+| 4    |             0.38x |                  0.51x |        **FAILED** |                 0.99x |                **1.78x** |
+| 5    |             0.26x |                  0.32x |        **FAILED** |                 0.75x |                **1.44x** |
+| 6    |             0.17x |                  0.21x |        **FAILED** |                 0.46x |                **1.05x** |
+
+**参数量对比（lmax=0 到 6）：**
+
+| lmax | spherical | partial-cartesian | partial-cartesian-loose | pure-cartesian | pure-cartesian-sparse | pure-cartesian-ictd |
+|------|----------:|------------------:|----------------------:|---------------:|---------------------:|-------------------:|
+| 0    | 2,313,018 |        1,128,074 |            1,128,074 |      2,725,450 |           1,128,010 |             626,653 |
+| 2    | 6,540,634 |        5,404,938 |            5,406,026 |     33,626,186 |           4,606,026 |           1,824,497 |
+| 4    | 10,768,218 |       15,272,842 |           15,276,106 |         **FAILED** |           8,882,762 |           3,197,103 |
+| 6    | 14,995,802 |       33,926,666 |           33,933,194 |         **FAILED** |          13,159,498 |           4,844,335 |
+
+**等变误差对比（O(3)，包含宇称）：**
+
+| lmax | spherical | partial-cartesian | partial-cartesian-loose | pure-cartesian | pure-cartesian-sparse | pure-cartesian-ictd |
+|------|----------:|------------------:|----------------------:|---------------:|---------------------:|-------------------:|
+| 0    | 1.03e-15  |        6.37e-16  |            1.20e-15  |      3.27e-15  |           9.31e-16  |           5.24e-08 |
+| 2    | 9.27e-16  |        1.97e-16  |            8.96e-16  |      3.18e-14  |           1.30e-15  |           7.18e-07 |
+| 4    | 9.16e-16  |        7.76e-14  |            4.26e-16  |       **FAILED** |           6.19e-16  |           7.16e-07 |
+| 6    | 4.77e-16  |        7.02e-16  |            5.65e-16  |       **FAILED** |           5.72e-16  |           1.11e-07 |
+
+**性能分析：**
 - ✅ **所有模式均通过 O(3) 等变性测试**（包括宇称/反射），等变性误差 < 1e-6
-- 🚀 **Partial-Cartesian-Loose** 和 **Pure-Cartesian-ICTD** 速度最快（0.64x-0.67x）
-- 🚀 **Pure-Cartesian-ICTD** 速度最快（0.67x），且严格等变，参数量最少（减少 72.1%）
-- 💾 **Pure-Cartesian-ICTD** 参数量最少（减少 72.1%），且严格等变，是参数量优化的最佳选择
-- 💾 **Pure-Cartesian-Sparse** 参数量减少 29.6%，速度接近 Spherical（1.02x），严格等变
-- ⚠️ **Pure-Cartesian**（非稀疏）速度最慢（9.56x），参数量最大（+414%），严格等变但不推荐使用
-- 📊 测试环境：CPU，channels=64, lmax=2, 64 atoms, 512 edges
+- 🚀 **CPU 上 `pure-cartesian-ictd` 在所有 lmax 下都是最快的**（最高 **4.12x 加速** at lmax=2）
+- 🚀 **GPU 上 `pure-cartesian-ictd` 在所有 lmax 下都是最快的**（最高 **2.10x 加速** at lmax=2）
+- 🚀 **CPU/GPU 上 `pure-cartesian-sparse` 表现稳定**（0.53x - 1.39x，接近基准）
+- 💾 **`pure-cartesian-ictd` 参数量始终最少**（27-32% of spherical）
+- 💾 **`pure-cartesian-sparse` 参数量适中**（70-88% of spherical）
+- ⚠️ **`pure-cartesian` 极慢且 lmax≥4 时失败**（不推荐）
+- 📊 **CPU 测试环境**：channels=64, lmax=0-6, 32 atoms, 256 edges, float64
+- 📊 **GPU 测试环境**：channels=64, lmax=0-6, RTX 3090, float64, 32 atoms, 256 edges
 
 ### 推荐使用场景
 
@@ -1754,23 +1827,30 @@ mff-evaluate --checkpoint model.pth --tensor-product-mode partial-cartesian
 - ✅ 需要平衡性能和等变性
 
 **使用 Partial-Cartesian-Loose：**
-- ✅ 快速实验迭代（速度最快，0.62x）
+- ✅ 快速实验迭代（速度较快，CPU: 0.17x-1.37x，GPU: 0.21x-1.52x）
 - ⚠️ 对严格等变性要求不高的场景（使用 norm product 近似，非严格等变）
 - ⚠️ 注意：虽然等变性误差 < 1e-6，但理论上非严格等变
 
-**使用 Pure-Cartesian-Sparse：**
-- ✅ 参数量优化优先（减少 30.1%）
-- ✅ 速度接近 Spherical（0.93x），严格等变
+**使用 Pure-Cartesian-Sparse（推荐用于 CPU/GPU 训练）：**
+- ✅ **CPU 上表现稳定**（0.53x - 1.39x，接近基准）
+- ✅ **GPU 上速度较快**（**1.17x 加速** at lmax=2）
+- ✅ 参数量适中（减少 29.6%，70-88% of spherical）
+- ✅ 严格等变（误差 ~1e-15，最高精度）
 - ✅ 平衡参数量和性能的最佳选择
 
-**使用 Pure-Cartesian-ICTD：**
-- ✅ 参数量最少（减少 72.1%），严格等变
-- ✅ 速度较快（0.67x）
+**使用 Pure-Cartesian-ICTD（推荐用于 CPU/GPU 训练）：**
+- ✅ **CPU 上速度最快**（最高 **4.12x 加速** at lmax=2，所有 lmax 下 1.58x - 4.12x）
+- ✅ **GPU 上速度最快**（最高 **2.10x 加速** at lmax=2，所有 lmax 下 1.05x - 2.10x）
+- ✅ 参数量最少（减少 72.1%，27-32% of spherical）
+- ✅ 严格等变（误差 ~1e-7 到 1e-6，可接受）
 - ✅ 内存极度受限场景
 - ✅ 大规模模型部署
+- 📊 **CPU 最佳性能**：lmax ≤ 3 时优势最明显（2.68x - 4.12x 加速）
+- 📊 **GPU 最佳性能**：lmax ≤ 3 时优势最明显（1.91x - 2.10x 加速）
 
 **不推荐使用 Pure-Cartesian：**
-- ❌ 速度最慢（9.26x），参数量最大（+414%）
+- ❌ 速度极慢（CPU: 0.02x-0.36x，GPU: 0.02x-0.54x），参数量最大（+414%）
+- ❌ lmax≥4 时失败（内存不足）
 - ❌ 仅用于研究目的，不推荐实际使用
 
 ### 完整示例：笛卡尔模式 + 多卡 + SWA + EMA
