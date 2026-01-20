@@ -154,6 +154,10 @@ mff-evaluate --checkpoint combined_model.pth --neb
 
 ## Python API
 
+The library supports **six tensor product modes**. Here's how to use them in Python:
+
+### Basic Usage (Spherical Mode - Default)
+
 ```python
 from molecular_force_field.models import E3_TransformerLayer_multi, MainNet
 from molecular_force_field.data import H5Dataset
@@ -184,11 +188,12 @@ model = MainNet(
     output_size=1
 ).to(device)
 
+# Spherical mode (default, e3nn-based)
 e3trans = E3_TransformerLayer_multi(
     max_embed_radius=config.max_radius,
     main_max_radius=config.max_radius_main,
     main_number_of_basis=config.number_of_basis_main,
-    irreps_input=config.get_irreps_input_conv_main(),
+    irreps_input=config.get_irreps_output_conv(),
     irreps_query=config.get_irreps_query_main(),
     irreps_key=config.get_irreps_key_main(),
     irreps_value=config.get_irreps_value_main(),
@@ -196,6 +201,14 @@ e3trans = E3_TransformerLayer_multi(
     irreps_sh=config.get_irreps_sh_transformer(),
     hidden_dim_sh=config.get_hidden_dim_sh(),
     hidden_dim=config.emb_number_main_2,
+    channel_in2=config.channel_in2,
+    embedding_dim=config.embedding_dim,
+    max_atomvalue=config.max_atomvalue,
+    output_size=config.output_size,
+    embed_size=config.embed_size,
+    main_hidden_sizes3=config.main_hidden_sizes3,
+    num_layers=config.num_layers,
+    function_type_main=config.function_type,
     device=device
 ).to(device)
 
@@ -214,32 +227,199 @@ trainer = Trainer(
 trainer.run_training()
 ```
 
+### Using Different Tensor Product Modes
+
+```python
+from molecular_force_field.models import (
+    E3_TransformerLayer_multi,           # spherical mode
+    CartesianTransformerLayer,           # partial-cartesian mode
+    CartesianTransformerLayerLoose,      # partial-cartesian-loose mode
+    PureCartesianTransformerLayer,       # pure-cartesian mode
+    PureCartesianSparseTransformerLayer, # pure-cartesian-sparse mode
+    PureCartesianICTDTransformerLayer,  # pure-cartesian-ictd mode
+    MainNet
+)
+from molecular_force_field.utils.config import ModelConfig
+import torch
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+config = ModelConfig()
+
+# Choose tensor product mode
+tensor_product_mode = "pure-cartesian-ictd"  # Options: spherical, partial-cartesian, 
+                                              # partial-cartesian-loose, pure-cartesian,
+                                              # pure-cartesian-sparse, pure-cartesian-ictd
+
+if tensor_product_mode == 'spherical':
+    e3trans = E3_TransformerLayer_multi(
+        max_embed_radius=config.max_radius,
+        main_max_radius=config.max_radius_main,
+        main_number_of_basis=config.number_of_basis_main,
+        irreps_input=config.get_irreps_output_conv(),
+        irreps_query=config.get_irreps_query_main(),
+        irreps_key=config.get_irreps_key_main(),
+        irreps_value=config.get_irreps_value_main(),
+        irreps_output=config.get_irreps_output_conv_2(),
+        irreps_sh=config.get_irreps_sh_transformer(),
+        hidden_dim_sh=config.get_hidden_dim_sh(),
+        hidden_dim=config.emb_number_main_2,
+        channel_in2=config.channel_in2,
+        embedding_dim=config.embedding_dim,
+        max_atomvalue=config.max_atomvalue,
+        output_size=config.output_size,
+        embed_size=config.embed_size,
+        main_hidden_sizes3=config.main_hidden_sizes3,
+        num_layers=config.num_layers,
+        function_type_main=config.function_type,
+        device=device
+    ).to(device)
+elif tensor_product_mode == 'partial-cartesian':
+    e3trans = CartesianTransformerLayer(
+        max_embed_radius=config.max_radius,
+        main_max_radius=config.max_radius_main,
+        main_number_of_basis=config.number_of_basis_main,
+        hidden_dim_conv=config.channel_in,
+        hidden_dim_sh=config.get_hidden_dim_sh(),
+        hidden_dim=config.emb_number_main_2,
+        channel_in2=config.channel_in2,
+        embedding_dim=config.embedding_dim,
+        max_atomvalue=config.max_atomvalue,
+        output_size=config.output_size,
+        embed_size=config.embed_size,
+        main_hidden_sizes3=config.main_hidden_sizes3,
+        num_layers=config.num_layers,
+        function_type_main=config.function_type,
+        lmax=config.lmax,
+        device=device
+    ).to(device)
+elif tensor_product_mode == 'partial-cartesian-loose':
+    e3trans = CartesianTransformerLayerLoose(
+        max_embed_radius=config.max_radius,
+        main_max_radius=config.max_radius_main,
+        main_number_of_basis=config.number_of_basis_main,
+        hidden_dim_conv=config.channel_in,
+        hidden_dim_sh=config.get_hidden_dim_sh(),
+        hidden_dim=config.emb_number_main_2,
+        channel_in2=config.channel_in2,
+        embedding_dim=config.embedding_dim,
+        max_atomvalue=config.max_atomvalue,
+        output_size=config.output_size,
+        embed_size=config.embed_size,
+        main_hidden_sizes3=config.main_hidden_sizes3,
+        num_layers=config.num_layers,
+        function_type_main=config.function_type,
+        lmax=config.lmax,
+        device=device
+    ).to(device)
+elif tensor_product_mode == 'pure-cartesian-sparse':
+    e3trans = PureCartesianSparseTransformerLayer(
+        max_embed_radius=config.max_radius,
+        main_max_radius=config.max_radius_main,
+        main_number_of_basis=config.number_of_basis_main,
+        hidden_dim_conv=config.channel_in,
+        hidden_dim_sh=config.get_hidden_dim_sh(),
+        hidden_dim=config.emb_number_main_2,
+        channel_in2=config.channel_in2,
+        embedding_dim=config.embedding_dim,
+        max_atomvalue=config.max_atomvalue,
+        output_size=config.output_size,
+        embed_size=config.embed_size,
+        main_hidden_sizes3=config.main_hidden_sizes3,
+        num_layers=config.num_layers,
+        function_type_main=config.function_type,
+        lmax=config.lmax,
+        max_rank_other=1,  # Restrict to rank≤1 interactions
+        k_policy='k0',     # Delta contraction policy
+        device=device
+    ).to(device)
+elif tensor_product_mode == 'pure-cartesian-ictd':
+    e3trans = PureCartesianICTDTransformerLayer(
+        max_embed_radius=config.max_radius,
+        main_max_radius=config.max_radius_main,
+        main_number_of_basis=config.number_of_basis_main,
+        hidden_dim_conv=config.channel_in,
+        hidden_dim_sh=config.get_hidden_dim_sh(),
+        hidden_dim=config.emb_number_main_2,
+        channel_in2=config.channel_in2,
+        embedding_dim=config.embedding_dim,
+        max_atomvalue=config.max_atomvalue,
+        output_size=config.output_size,
+        embed_size=config.embed_size,
+        main_hidden_sizes3=config.main_hidden_sizes3,
+        num_layers=config.num_layers,
+        function_type_main=config.function_type,
+        lmax=config.lmax,
+        ictd_tp_path_policy='full',  # Path pruning: 'full' or 'max_rank_other'
+        ictd_tp_max_rank_other=None, # Max rank for sparse paths (if path_policy='max_rank_other')
+        device=device
+    ).to(device)
+elif tensor_product_mode == 'pure-cartesian':
+    e3trans = PureCartesianTransformerLayer(
+        max_embed_radius=config.max_radius,
+        main_max_radius=config.max_radius_main,
+        main_number_of_basis=config.number_of_basis_main,
+        hidden_dim_conv=config.channel_in,
+        hidden_dim_sh=config.get_hidden_dim_sh(),
+        hidden_dim=config.emb_number_main_2,
+        channel_in2=config.channel_in2,
+        embedding_dim=config.embedding_dim,
+        max_atomvalue=config.max_atomvalue,
+        output_size=config.output_size,
+        embed_size=config.embed_size,
+        main_hidden_sizes3=config.main_hidden_sizes3,
+        num_layers=config.num_layers,
+        function_type_main=config.function_type,
+        lmax=config.lmax,
+        device=device
+    ).to(device)
+
+# Initialize main network
+model = MainNet(
+    input_size=config.input_dim_weight,
+    hidden_sizes=config.main_hidden_sizes4,
+    output_size=1
+).to(device)
+
+# Continue with training...
+```
+
 ## Project Structure
 
 ```
 molecular_force_field/
-├── models/              # Model definitions
-│   ├── e3nn_layers.py  # E3NN-based layers
-│   ├── mlp.py          # MLP networks
-│   └── losses.py       # Loss functions
-├── data/               # Dataset and preprocessing
-│   ├── datasets.py     # Dataset classes
-│   ├── collate.py      # Collate functions
-│   └── preprocessing.py # Data preprocessing
-├── utils/              # Utility functions
-│   ├── graph_utils.py  # Graph operations
-│   ├── tensor_utils.py # Tensor utilities
-│   └── config.py       # Configuration management
-├── training/           # Training utilities
-│   ├── trainer.py      # Trainer class
-│   └── schedulers.py   # Learning rate schedulers
-├── evaluation/         # Evaluation utilities
-│   ├── evaluator.py    # Static evaluation
-│   └── calculator.py   # ASE Calculator wrapper
-└── cli/                # Command-line interfaces
-    ├── train.py        # Training CLI
-    ├── evaluate.py     # Evaluation CLI
-    └── preprocess.py   # Preprocessing CLI
+├── models/                        # Model definitions (six tensor product modes)
+│   ├── e3nn_layers.py            # Spherical mode (e3nn-based)
+│   ├── cartesian_e3_layers.py    # Partial-cartesian modes (uses e3nn CG coefficients)
+│   ├── pure_cartesian.py         # Core pure Cartesian tensor operations
+│   ├── pure_cartesian_layers.py  # Pure-cartesian mode
+│   ├── pure_cartesian_sparse_layers.py  # Pure-cartesian-sparse mode
+│   ├── pure_cartesian_ictd_layers.py    # Pure-cartesian-ictd mode
+│   ├── ictd_irreps.py            # ICTD irreps implementation (harmonic polynomials)
+│   ├── ictd_fast.py              # ICTD fast implementation (precomputed)
+│   ├── mlp.py                    # MLP networks
+│   └── losses.py                 # Loss functions
+├── data/                          # Dataset and preprocessing
+│   ├── datasets.py               # Dataset classes
+│   ├── collate.py                # Collate functions
+│   └── preprocessing.py          # Data preprocessing
+├── utils/                        # Utility functions
+│   ├── graph_utils.py            # Graph operations
+│   ├── tensor_utils.py           # Tensor utilities
+│   └── config.py                 # Configuration management
+├── training/                     # Training utilities
+│   ├── trainer.py                # Trainer class
+│   └── schedulers.py             # Learning rate schedulers
+├── evaluation/                   # Evaluation utilities
+│   ├── evaluator.py              # Static evaluation
+│   └── calculator.py             # ASE Calculator wrapper
+├── interfaces/                   # External interfaces
+│   ├── lammps_potential.py      # LAMMPS potential interface
+│   └── self_test_lammps_potential.py  # LAMMPS self-test
+└── cli/                          # Command-line interfaces
+    ├── train.py                  # Training CLI
+    ├── evaluate.py               # Evaluation CLI
+    ├── preprocess.py             # Preprocessing CLI
+    └── lammps_interface.py       # LAMMPS interface CLI
 ```
 
 ## Requirements
@@ -318,7 +498,7 @@ If you use this library in your research, please cite:
 
 ```bibtex
 @software{fused_sc_equitensorpot,
-  title = {FusedEquiSCTensorPot},
+  title = {FusedSCEquiTensorPot},
   version = {0.1.0},
   url = {https://github.com/Parity-LRX/FusedSCEquiTensorPot}
 }
