@@ -472,6 +472,73 @@ All modes pass O(3) equivariance tests (including parity/reflection, error < 1e-
 
 For detailed performance comparison and recommendations, see [USAGE.md](USAGE.md#张量积模式对比).
 
+### Real-World Task Performance
+
+**Dataset**: Five nitrogen oxide and carbon structure reaction pathways from NEB (Nudged Elastic Band) calculations, filtered to fmax=0.2, totaling 2,788 structures. Test set: 1-2 complete or incomplete structures per reaction.
+
+**Test Configuration**: 64 channels, lmax=2, float64
+
+<table>
+<thead>
+<tr>
+<th style="text-align:center">方法</th>
+<th style="text-align:center">配置</th>
+<th style="text-align:center">模式</th>
+<th style="text-align:center">能量 RMSE<br/>(mev/atom)</th>
+<th style="text-align:center">力 RMSE<br/>(mev/Å)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td rowspan="3" style="text-align:center;vertical-align:middle"><strong>MACE</strong></td>
+<td style="text-align:center">Lmax=2, 64ch</td>
+<td style="text-align:center">-</td>
+<td style="text-align:center">0.13</td>
+<td style="text-align:center">11.6</td>
+</tr>
+<tr>
+<td style="text-align:center">Lmax=2, 128ch</td>
+<td style="text-align:center">-</td>
+<td style="text-align:center">0.12</td>
+<td style="text-align:center">11.3</td>
+</tr>
+<tr>
+<td style="text-align:center">Lmax=2, 198ch</td>
+<td style="text-align:center">-</td>
+<td style="text-align:center">0.24</td>
+<td style="text-align:center">15.1</td>
+</tr>
+<tr>
+<td rowspan="4" style="text-align:center;vertical-align:middle"><strong>FSCETP</strong></td>
+<td rowspan="4" style="text-align:center;vertical-align:middle">Lmax=2, 64ch</td>
+<td style="text-align:center"><strong>spherical</strong></td>
+<td style="text-align:center"><strong>0.044</strong> ⭐</td>
+<td style="text-align:center"><strong>7.4</strong> ⭐</td>
+</tr>
+<tr>
+<td style="text-align:center"><strong>partial-cartesian</strong></td>
+<td style="text-align:center">0.045</td>
+<td style="text-align:center"><strong>7.4</strong> ⭐</td>
+</tr>
+<tr>
+<td style="text-align:center">partial-cartesian-loose</td>
+<td style="text-align:center">0.048</td>
+<td style="text-align:center">8.4</td>
+</tr>
+<tr>
+<td style="text-align:center">pure-cartesian-ictd</td>
+<td style="text-align:center">0.046</td>
+<td style="text-align:center">9.0</td>
+</tr>
+</tbody>
+</table>
+
+**Key Findings**:
+- **Energy Accuracy**: FSCETP achieves **66.2% lower** energy RMSE than MACE (64ch) (0.044 vs 0.13 mev/atom)
+- **Force Accuracy**: FSCETP achieves **36.2% lower** force RMSE than MACE (64ch) (7.4 vs 11.6 mev/Å)
+- **Best Performance**: `spherical` and `partial-cartesian` modes show the best accuracy (Energy: 0.044-0.045, Force: 7.4)
+- **Efficiency**: `pure-cartesian-ictd` achieves competitive accuracy (Energy: 0.046, Force: 9.0) with **72.1% fewer parameters** and **2.10x faster** training speed
+
 ## 📚 Documentation
 
 For full CLI and hyperparameter documentation, see [USAGE.md](USAGE.md).

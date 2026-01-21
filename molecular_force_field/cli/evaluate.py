@@ -3,6 +3,8 @@
 import argparse
 import torch
 import logging
+import os
+import numpy as np
 from torch.utils.data import DataLoader
 
 from molecular_force_field.models import (
@@ -15,6 +17,7 @@ from molecular_force_field.models import (
 )
 from molecular_force_field.data import OnTheFlyDataset, H5Dataset
 from molecular_force_field.data.collate import on_the_fly_collate, collate_fn_h5
+from molecular_force_field.data.preprocessing import extract_data_blocks, compute_correction, save_set
 from molecular_force_field.evaluation.evaluator import Evaluator
 from molecular_force_field.evaluation.calculator import MyE3NNCalculator
 from molecular_force_field.utils.config import ModelConfig
@@ -25,6 +28,10 @@ def main():
     parser = argparse.ArgumentParser(description='Evaluate molecular force field model')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to model checkpoint')
+    parser.add_argument('--input-file', type=str, default=None,
+                        help='Path to input XYZ file. If provided, will automatically convert to read/energy/cell files for test set evaluation. '
+                             'Note: When using this option, you MUST provide atomic reference energies via --atomic-energy-file or --atomic-energy-keys/--atomic-energy-values '
+                             '(typically use the fitted_E0.csv generated during training/preprocessing).')
     parser.add_argument('--test-prefix', type=str, default='test',
                         help='Prefix for test data files')
     parser.add_argument('--data-dir', type=str, default='.',
@@ -35,6 +42,11 @@ def main():
                         help='Path to energy HDF5 file (for on-the-fly dataset)')
     parser.add_argument('--cell-file', type=str, default=None,
                         help='Path to cell HDF5 file (for on-the-fly dataset)')
+    parser.add_argument('--max-atom', type=int, default=1,
+                        help='Maximum number of atoms (for padding, used when --input-file is provided)')
+    parser.add_argument('--elements', type=str, nargs='+', default=None,
+                        help='Element symbols to recognize (default: None, recognizes all elements from periodic table). '
+                             'Used when --input-file is provided.')
     parser.add_argument('--max-radius', type=float, default=5.0,
                         help='Maximum radius for neighbor search')
     parser.add_argument('--batch-size', type=int, default=1,
@@ -109,7 +121,9 @@ def main():
     # Atomic reference energies (E0)
     parser.add_argument('--atomic-energy-file', type=str, default=None,
                         help='CSV file with columns Atom,E0 to load atomic reference energies. '
-                             'If not set, defaults to fitted_E0.csv in the current directory.')
+                             'If not set, defaults to fitted_E0.csv in the current directory. '
+                             'Note: When using --input-file, this file is REQUIRED (cannot fit from test data). '
+                             'Typically generated during preprocessing/training via least-squares fitting.')
     parser.add_argument('--atomic-energy-keys', type=int, nargs='+', default=None,
                         help='Atomic numbers for custom atomic reference energies (must match --atomic-energy-values length).')
     parser.add_argument('--atomic-energy-values', type=float, nargs='+', default=None,
@@ -152,17 +166,47 @@ def main():
     )
     
     # Atomic reference energies (E0)
-    if args.atomic_energy_keys is not None or args.atomic_energy_values is not None:
+    # If --input-file is provided, atomic energies are required (cannot fit from data)
+    if args.input_file is not None:
         if args.atomic_energy_keys is None or args.atomic_energy_values is None:
-            raise ValueError("Both --atomic-energy-keys and --atomic-energy-values must be provided together.")
-        if len(args.atomic_energy_keys) != len(args.atomic_energy_values):
-            raise ValueError("--atomic-energy-keys and --atomic-energy-values must have the same length.")
-        config.atomic_energy_keys = torch.tensor(args.atomic_energy_keys, dtype=torch.long)
-        config.atomic_energy_values = torch.tensor(args.atomic_energy_values, dtype=config.dtype)
-        logging.info("Using custom atomic reference energies from CLI.")
+            # Try to load from file
+            e0_path = args.atomic_energy_file or 'fitted_E0.csv'
+            if not os.path.exists(e0_path):
+                raise ValueError(
+                    f"When using --input-file, atomic reference energies are REQUIRED. Use one of the following:\n"
+                    f"  1. Use --atomic-energy-file to specify a CSV file path (typically use fitted_E0.csv generated during training/preprocessing)\n"
+                    f"  2. Use --atomic-energy-keys and --atomic-energy-values to provide directly\n"
+                    f"  File not found: {e0_path}\n"
+                    f"  Note: fitted_E0.csv is typically auto-generated during preprocessing (mff-preprocess) or training (mff-train)."
+                )
+            # Load from file and verify it was successful (not using defaults)
+            loaded_successfully = config.load_atomic_energies_from_file(e0_path)
+            if not loaded_successfully:
+                raise ValueError(
+                    f"When using --input-file, atomic reference energy file must be loaded successfully.\n"
+                    f"File {e0_path} exists but has incorrect format or failed to load.\n"
+                    f"Please ensure the file contains 'Atom' and 'E0' columns, or use --atomic-energy-keys and --atomic-energy-values to provide directly."
+                )
+            logging.info(f"Loaded atomic reference energies from file: {e0_path}")
+        else:
+            if len(args.atomic_energy_keys) != len(args.atomic_energy_values):
+                raise ValueError("--atomic-energy-keys and --atomic-energy-values must have the same length.")
+            config.atomic_energy_keys = torch.tensor(args.atomic_energy_keys, dtype=torch.long)
+            config.atomic_energy_values = torch.tensor(args.atomic_energy_values, dtype=config.dtype)
+            logging.info("Using atomic reference energies provided via CLI.")
     else:
-        e0_path = args.atomic_energy_file or 'fitted_E0.csv'
-        config.load_atomic_energies_from_file(e0_path)
+        # Normal case: can use defaults or load from file
+        if args.atomic_energy_keys is not None or args.atomic_energy_values is not None:
+            if args.atomic_energy_keys is None or args.atomic_energy_values is None:
+                raise ValueError("Both --atomic-energy-keys and --atomic-energy-values must be provided together.")
+            if len(args.atomic_energy_keys) != len(args.atomic_energy_values):
+                raise ValueError("--atomic-energy-keys and --atomic-energy-values must have the same length.")
+            config.atomic_energy_keys = torch.tensor(args.atomic_energy_keys, dtype=torch.long)
+            config.atomic_energy_values = torch.tensor(args.atomic_energy_values, dtype=config.dtype)
+            logging.info("Using custom atomic reference energies from CLI.")
+        else:
+            e0_path = args.atomic_energy_file or 'fitted_E0.csv'
+            config.load_atomic_energies_from_file(e0_path)
     
     # Log model hyperparameters
     logging.info("=" * 80)
@@ -215,6 +259,7 @@ def main():
             num_layers=config.num_layers,
             function_type_main=config.function_type,
             lmax=config.lmax,
+            internal_compute_dtype=config.dtype,
             device=device,
         ).to(device)
     elif args.tensor_product_mode == 'pure-cartesian-sparse':
@@ -311,6 +356,78 @@ def main():
     skip_static_eval = args.neb or args.md_sim
     
     if not skip_static_eval:
+        # Convert XYZ file to required data files if --input-file is provided
+        if args.input_file is not None:
+            if not os.path.exists(args.input_file):
+                raise FileNotFoundError(f"Input file not found: {args.input_file}")
+            
+            # Warn if user also provided read/energy/cell files (will be overridden)
+            if args.read_file is not None or args.energy_file is not None or args.cell_file is not None:
+                logging.warning(
+                    "Detected both --input-file and --read-file/--energy-file/--cell-file arguments. "
+                    "Will use files generated from XYZ conversion, ignoring user-provided file paths."
+                )
+            
+            # Warn if user specified --use-h5 (will use OnTheFlyDataset instead)
+            if args.use_h5:
+                logging.warning(
+                    "Detected both --input-file and --use-h5 arguments. "
+                    "XYZ conversion generates raw data files (read/energy/cell), will use OnTheFlyDataset for evaluation. "
+                    "To use H5Dataset, run preprocessing step first to generate processed_*.h5 files."
+                )
+                args.use_h5 = False  # Force use of OnTheFlyDataset
+            
+            logging.info(f"Converting data from XYZ file: {args.input_file}")
+            
+            # Extract data blocks from XYZ file
+            all_blocks, all_energy, all_raw_energy, all_cells, all_pbcs = extract_data_blocks(
+                args.input_file, elements=args.elements
+            )
+            logging.info(f"Extracted {len(all_blocks)} structures")
+            
+            # Use all data (no train/val split)
+            all_indices = np.arange(len(all_blocks))
+            
+            # Compute correction energies using user-provided atomic energies
+            # Verify atomic energies are set
+            if config.atomic_energy_keys is None or config.atomic_energy_values is None:
+                raise ValueError(
+                    "Atomic reference energies not set. When using --input-file, atomic reference energies are REQUIRED."
+                )
+            
+            # Convert atomic energy keys and values to numpy arrays
+            atomic_keys = config.atomic_energy_keys.cpu().numpy() if isinstance(config.atomic_energy_keys, torch.Tensor) else config.atomic_energy_keys
+            atomic_values = config.atomic_energy_values.cpu().numpy() if isinstance(config.atomic_energy_values, torch.Tensor) else config.atomic_energy_values
+            
+            logging.info("Computing correction energies using user-provided atomic reference energies...")
+            logging.info(f"Atomic reference energy keys: {atomic_keys}")
+            logging.info(f"Atomic reference energy values: {atomic_values}")
+            all_correction = compute_correction(all_blocks, all_raw_energy, atomic_keys, atomic_values)
+            
+            # Save test set files
+            logging.info(f"Saving test data files to {args.data_dir}/...")
+            save_set(
+                args.test_prefix,
+                all_indices,
+                all_blocks,
+                all_raw_energy,
+                all_correction,
+                all_cells,
+                pbc_list=all_pbcs,
+                max_atom=args.max_atom,
+                output_dir=args.data_dir
+            )
+            
+            # Set file paths to generated files
+            args.read_file = os.path.join(args.data_dir, f'read_{args.test_prefix}.h5')
+            args.energy_file = os.path.join(args.data_dir, f'raw_energy_{args.test_prefix}.h5')
+            args.cell_file = os.path.join(args.data_dir, f'cell_{args.test_prefix}.h5')
+            
+            logging.info(f"Data conversion completed. Generated files:")
+            logging.info(f"  - {args.read_file}")
+            logging.info(f"  - {args.energy_file}")
+            logging.info(f"  - {args.cell_file}")
+        
         # Static evaluation
         if args.use_h5:
             dataset = H5Dataset(args.test_prefix, data_dir=args.data_dir)
@@ -378,6 +495,12 @@ def main():
             logging.info(f"  Force threshold:   {args.neb_fmax} eV/Å")
             logging.info(f"  Output trajectory: {args.neb_output}")
             logging.info("=" * 60)
+            
+            # Validate input files exist
+            if not os.path.exists(args.neb_initial):
+                raise FileNotFoundError(f"NEB initial structure file not found: {args.neb_initial}")
+            if not os.path.exists(args.neb_final):
+                raise FileNotFoundError(f"NEB final structure file not found: {args.neb_final}")
             
             from ase.mep import NEB
             from ase.optimize import FIRE
@@ -456,6 +579,10 @@ def main():
             logging.info(f"  Output file:      {args.md_output}")
             logging.info(f"  Skip relaxation:  {args.md_no_relax}")
             logging.info("=" * 60)
+            
+            # Validate input file exists
+            if not os.path.exists(args.md_input):
+                raise FileNotFoundError(f"MD input structure file not found: {args.md_input}")
             
             try:
                 atoms = read(args.md_input)

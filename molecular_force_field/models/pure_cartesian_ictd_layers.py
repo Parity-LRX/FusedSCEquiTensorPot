@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 from torch_scatter import scatter
 from e3nn.math import soft_one_hot_linspace
+import math
 
 from molecular_force_field.models.ictd_irreps import (
     HarmonicFullyConnectedTensorProduct,
@@ -68,6 +69,46 @@ def _irreps_elementwise_tensor_product_0e(x1: torch.Tensor, x2: torch.Tensor, ch
     return torch.cat(outs, dim=-1)
 
 
+def _apply_channel_adapter_per_l(x_l: torch.Tensor, adapter: nn.Module) -> torch.Tensor:
+    """
+    Apply a channel adapter Linear/Identity to an irreps block.
+
+    x_l: (..., Cin, 2l+1)
+    adapter: maps Cin -> Cout (or Identity)
+    Returns: (..., Cout, 2l+1)
+    """
+    if isinstance(adapter, nn.Identity):
+        return x_l
+    # move channel to last dim for nn.Linear
+    # (..., Cin, m) -> (..., m, Cin) -> Linear -> (..., m, Cout) -> (..., Cout, m)
+    y = adapter(x_l.movedim(-2, -1))
+    return y.movedim(-1, -2)
+
+
+def _elementwise_tensor_product_0e_blocks(
+    b1: dict[int, torch.Tensor],
+    b2: dict[int, torch.Tensor],
+    muls_by_l: dict[int, int],
+    lmax: int,
+) -> torch.Tensor:
+    """
+    Generalized elementwise 0e invariant builder aligned with e3nn's
+    ElementwiseTensorProduct(..., ["0e"], normalization="component") semantics:
+
+      out_l[c] = sum_m x_l[c,m] * y_l[c,m] / sqrt(2l+1)
+
+    b1[l], b2[l]: (..., mul_l, 2l+1)
+    Returns concatenated (..., sum_l mul_l) in l=0..lmax order.
+    """
+    outs = []
+    for l in range(lmax + 1):
+        x = b1[l]
+        y = b2[l]
+        # component normalization like e3nn
+        outs.append((x * y).sum(dim=-1) / math.sqrt(2 * l + 1))
+    return torch.cat(outs, dim=-1)
+
+
 class ICTDIrrepsE3Conv(nn.Module):
     """
     First convolution in ICTD-irreps space:
@@ -88,6 +129,8 @@ class ICTDIrrepsE3Conv(nn.Module):
         # ICTD tensor-product path control (e3nn-instructions-like)
         ictd_tp_path_policy: str = "full",
         ictd_tp_max_rank_other: int | None = None,
+        # Internal computation dtype for ICTD operations (default: float64 for stability)
+        internal_compute_dtype: torch.dtype = torch.float64,
     ):
         super().__init__()
         self.max_radius = max_radius
@@ -112,6 +155,7 @@ class ICTDIrrepsE3Conv(nn.Module):
             internal_weights=True,
             path_policy=ictd_tp_path_policy,
             max_rank_other=ictd_tp_max_rank_other,
+            internal_compute_dtype=internal_compute_dtype,
         )
         self.fc = nn.Sequential(
             nn.Linear(number_of_basis, 64),
@@ -202,6 +246,12 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         # Keep these for backward compatibility; currently unused in ICTD mode.
         max_rank_other: int = 1,
         k_policy: str = "k0",
+        # Internal computation dtype for ICTD operations (default: float64 for stability)
+        internal_compute_dtype: torch.dtype = torch.float64,
+        # Optional: allow per-l multiplicities for the "product_5-like" scalar invariant vector.
+        # If None: keep current behavior (mul_l = channels for all l).
+        # If provided: dict l->mul_l for l=0..lmax; used only for the readout invariants.
+        product5_muls_by_l: dict[int, int] | None = None,
     ):
         super().__init__()
         if embed_size is None:
@@ -231,6 +281,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             function_type=function_type_main,
             ictd_tp_path_policy=ictd_tp_path_policy,
             ictd_tp_max_rank_other=ictd_tp_max_rank_other,
+            internal_compute_dtype=internal_compute_dtype,
         )
 
         # conv2: node irreps (mul=C) x edge Y_l (mul=1) -> node irreps (mul=C), per-edge weights
@@ -242,6 +293,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             internal_weights=True,
             path_policy=ictd_tp_path_policy,
             max_rank_other=ictd_tp_max_rank_other,
+            internal_compute_dtype=internal_compute_dtype,
         )
         self.fc2 = nn.Sequential(
             nn.Linear(main_number_of_basis, 64),
@@ -266,7 +318,32 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         self.weighted_sum = RobustScalarWeightedSum(17, init_weights="zero")
         # Match e3nn-style product_5:
         # T = cat([f1, f2, scalars]); ElementwiseTensorProduct(T,T)->0e
-        self.proj_total = MainNet(2 * (self.channels * (self.lmax + 1)) + 32, embed_size, 17)
+        if product5_muls_by_l is None:
+            self.product5_muls_by_l = {l: self.channels for l in range(self.lmax + 1)}
+        else:
+            # Validate keys and values
+            self.product5_muls_by_l = {int(k): int(v) for k, v in product5_muls_by_l.items()}
+            for l in range(self.lmax + 1):
+                if l not in self.product5_muls_by_l:
+                    raise ValueError(f"product5_muls_by_l missing l={l} (must cover 0..lmax)")
+                if self.product5_muls_by_l[l] <= 0:
+                    raise ValueError(f"product5_muls_by_l[{l}] must be positive, got {self.product5_muls_by_l[l]}")
+
+        # Optional per-l channel adapters for f1 and f2 to match desired muls_by_l.
+        # Default is identity (mul_l == channels).
+        self._p5_adapt_f1 = nn.ModuleDict()
+        self._p5_adapt_f2 = nn.ModuleDict()
+        for l in range(self.lmax + 1):
+            out_ch = self.product5_muls_by_l[l]
+            if out_ch == self.channels:
+                self._p5_adapt_f1[str(l)] = nn.Identity()
+                self._p5_adapt_f2[str(l)] = nn.Identity()
+            else:
+                self._p5_adapt_f1[str(l)] = nn.Linear(self.channels, out_ch, bias=False)
+                self._p5_adapt_f2[str(l)] = nn.Linear(self.channels, out_ch, bias=False)
+
+        sum_mul = sum(self.product5_muls_by_l[l] for l in range(self.lmax + 1))
+        self.proj_total = MainNet(2 * sum_mul + 32, embed_size, 17)
 
     def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell):
         dtype = next(self.parameters()).dtype
@@ -324,8 +401,29 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             gram = torch.einsum("ncm,ndm->ncd", t, t) / ((2 * l + 1) ** 0.5)  # (N,2C,2C)
             scalars = scalars + torch.einsum("ocd,ncd->no", self.W_read[l], gram)
 
-        inv1 = _irreps_elementwise_tensor_product_0e(f1, f1, self.channels, self.lmax)
-        inv2 = _irreps_elementwise_tensor_product_0e(f2, f2, self.channels, self.lmax)
+        # Build product_5-like invariant vector aligned with e3nn ElementwiseTensorProduct(..., ["0e"]):
+        # allow per-l multiplicities via optional adapters.
+        # Fast path: if all adapters are Identity (default config), reuse old function directly.
+        all_identity = all(
+            isinstance(self._p5_adapt_f1[str(l)], nn.Identity) and isinstance(self._p5_adapt_f2[str(l)], nn.Identity)
+            for l in range(self.lmax + 1)
+        )
+        if all_identity:
+            # Fast path: no adapters needed, use old optimized function
+            inv1 = _irreps_elementwise_tensor_product_0e(f1, f1, self.channels, self.lmax)
+            inv2 = _irreps_elementwise_tensor_product_0e(f2, f2, self.channels, self.lmax)
+        else:
+            # Slow path: per-l adapters needed
+            b1 = _split_irreps(f1, self.channels, self.lmax)
+            b2 = _split_irreps(f2, self.channels, self.lmax)
+            b1a: dict[int, torch.Tensor] = {}
+            b2a: dict[int, torch.Tensor] = {}
+            for l in range(self.lmax + 1):
+                b1a[l] = _apply_channel_adapter_per_l(b1[l], self._p5_adapt_f1[str(l)])
+                b2a[l] = _apply_channel_adapter_per_l(b2[l], self._p5_adapt_f2[str(l)])
+
+            inv1 = _elementwise_tensor_product_0e_blocks(b1a, b1a, self.product5_muls_by_l, self.lmax)
+            inv2 = _elementwise_tensor_product_0e_blocks(b2a, b2a, self.product5_muls_by_l, self.lmax)
         inv3 = scalars * scalars
         f_prod5 = torch.cat([inv1, inv2, inv3], dim=-1)
 

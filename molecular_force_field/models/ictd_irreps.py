@@ -341,6 +341,8 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         # - "max_rank_other": keep paths with min(l1,l2) <= max_rank_other (like sparse heuristic)
         path_policy: str = "full",
         max_rank_other: int | None = None,
+        # Internal computation dtype for CG tensors and projections (default: float64 for stability)
+        internal_compute_dtype: torch.dtype = torch.float64,
     ):
         super().__init__()
         self.mul_in1 = mul_in1
@@ -348,6 +350,7 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         self.mul_out = mul_out
         self.lmax = lmax
         self.internal_weights = internal_weights
+        self.internal_compute_dtype = internal_compute_dtype
 
         # Enumerate all valid (l1,l2,l3) with parity selection (even step)
         all_paths: List[Tuple[int, int, int]] = []
@@ -429,7 +432,9 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         self._proj_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
 
     def _get_cg_list(self, device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
-        key = (str(device), str(dtype))
+        # Use internal_compute_dtype for CG tensors (for numerical stability)
+        compute_dtype = self.internal_compute_dtype
+        key = (str(device), str(compute_dtype))
         cached = self._cg_cache_by_dev_dtype.get(key)
         if cached is not None:
             return cached
@@ -438,7 +443,7 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
             # Build CPU float64 tensors once, in path order.
             self._cg_cpu_f64 = [build_cg_tensor(l1, l2, l3) for (l1, l2, l3) in self.paths]
 
-        cg_list = [C.to(device=device, dtype=dtype) for C in self._cg_cpu_f64]
+        cg_list = [C.to(device=device, dtype=compute_dtype) for C in self._cg_cpu_f64]
         self._cg_cache_by_dev_dtype[key] = cg_list
         return cg_list
 
@@ -450,7 +455,9 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         the concatenated outputs for all paths in the group are:
           y_concat = t_flat @ U_g
         """
-        key = (str(device), str(dtype))
+        # Use internal_compute_dtype for projection matrices (for numerical stability)
+        compute_dtype = self.internal_compute_dtype
+        key = (str(device), str(compute_dtype))
         cached = self._proj_group_cache_by_dev_dtype.get(key)
         if cached is not None:
             return cached
@@ -465,7 +472,7 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
 
             m1 = 2 * l1 + 1
             m2 = 2 * l2 + 1
-            U = torch.zeros(m1 * m2, k_total, device=device, dtype=dtype)
+            U = torch.zeros(m1 * m2, k_total, device=device, dtype=compute_dtype)
             for p_idx, _l3, s, e in segments:  # type: ignore[misc]
                 C = cg_list[int(p_idx)]  # (m1,m2,kdim)
                 U[:, int(s): int(e)] = C.reshape(m1 * m2, int(e) - int(s))
@@ -485,6 +492,7 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         batch_shape = sample.shape[:-2]
         device = sample.device
         dtype = sample.dtype
+        compute_dtype = self.internal_compute_dtype
 
         if self.internal_weights:
             # Assume module has already been moved to the right device/dtype by caller.
@@ -524,12 +532,15 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                 # 2) batch channel mixing for all paths in group, then segment and accumulate
                 m1 = 2 * l1 + 1
                 m2 = 2 * l2 + 1
-                U = proj_list[g_idx]  # (m1*m2, K_total)
+                U = proj_list[g_idx]  # (m1*m2, K_total) in compute_dtype
+                # Convert inputs to compute_dtype for numerical stability
+                a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
+                b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
                 # Optimized outer product: (..., i, m1) x (..., j, m2) -> (..., i, j, m1, m2)
                 # Using broadcast instead of einsum for better performance
-                t_mn = (a.unsqueeze(-2).unsqueeze(-1) * b.unsqueeze(-3).unsqueeze(-2))  # (..., i, j, m1, m2)
+                t_mn = (a_comp.unsqueeze(-2).unsqueeze(-1) * b_comp.unsqueeze(-3).unsqueeze(-2))  # (..., i, j, m1, m2)
                 t_flat = t_mn.reshape(*batch_shape, self.mul_in1, self.mul_in2, m1 * m2)
-                y = torch.matmul(t_flat, U)  # (..., i, j, K_total)
+                y = torch.matmul(t_flat, U)  # (..., i, j, K_total) in compute_dtype
                 if y.shape[-1] != k_total:
                     raise RuntimeError("ICTD TP projection produced wrong K_total")
 
@@ -538,12 +549,15 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                 i, j = self.mul_in1, self.mul_in2
                 for p_idx, l3, s, e in segments:  # type: ignore[misc]
                     Wp = w_param[int(p_idx)]  # (o,i,j)
-                    y_seg = y[..., :, :, int(s): int(e)]  # (..., i, j, kdim)
+                    Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                    y_seg = y[..., :, :, int(s): int(e)]  # (..., i, j, kdim) in compute_dtype
                     # GEMM-style channel mixing (optimized)
                     kdim = int(e) - int(s)
                     y2 = y_seg.movedim(-1, -3).contiguous().view(*y_seg.shape[:-3], kdim, i * j)  # (..., k, ij)
-                    W2 = Wp.contiguous().view(Wp.shape[0], i * j)  # (o, ij)
-                    out_seg = torch.matmul(y2, W2.transpose(0, 1)).movedim(-1, -2)  # (..., o, k)
+                    W2 = Wp_comp.contiguous().view(Wp_comp.shape[0], i * j)  # (o, ij)
+                    out_seg = torch.matmul(y2, W2.transpose(0, 1)).movedim(-1, -2)  # (..., o, k) in compute_dtype
+                    # Convert back to output dtype
+                    out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
                     if weights is not None:
                         gate = weights[..., int(p_idx)]
                         out_seg = out_seg * gate[..., None, None]
@@ -568,12 +582,15 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
 
                 m1 = 2 * l1 + 1
                 m2 = 2 * l2 + 1
-                U = proj_list[g_idx]  # (m1*m2, K_total)
+                U = proj_list[g_idx]  # (m1*m2, K_total) in compute_dtype
+                # Convert inputs to compute_dtype for numerical stability
+                a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
+                b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
                 # Optimized outer product: (..., i, m1) x (..., j, m2) -> (..., i, j, m1, m2)
                 # Using broadcast instead of einsum for better performance
-                t_mn = (a.unsqueeze(-2).unsqueeze(-1) * b.unsqueeze(-3).unsqueeze(-2))  # (..., i, j, m1, m2)
+                t_mn = (a_comp.unsqueeze(-2).unsqueeze(-1) * b_comp.unsqueeze(-3).unsqueeze(-2))  # (..., i, j, m1, m2)
                 t_flat = t_mn.reshape(*batch_shape, self.mul_in1, self.mul_in2, m1 * m2)
-                y = torch.matmul(t_flat, U)  # (..., i, j, K_total)
+                y = torch.matmul(t_flat, U)  # (..., i, j, K_total) in compute_dtype
                 if y.shape[-1] != k_total:
                     raise RuntimeError("ICTD TP projection produced wrong K_total")
 
@@ -582,20 +599,23 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                 # Extract weights for this group: (..., P_g, o, i, j)
                 p_indices = [int(p_idx) for p_idx, _, _, _ in segments]
                 W_stack = weights_full[..., p_indices, :, :, :]  # (..., P_g, o, i, j)
+                W_stack_comp = W_stack.to(dtype=compute_dtype) if W_stack.dtype != compute_dtype else W_stack
                 
                 # Reshape y for batched matmul: (..., i*j, K_total)
                 i, j = self.mul_in1, self.mul_in2
                 y_reshaped = y.permute(*range(len(batch_shape)), -3, -2, -1).reshape(*batch_shape, i * j, k_total)  # (..., ij, K)
                 
                 # Reshape W_stack: (..., P_g, o, i*j)
-                W_reshaped = W_stack.reshape(*batch_shape, num_paths_in_group, self.mul_out, i * j)  # (..., P_g, o, ij)
+                W_reshaped = W_stack_comp.reshape(*batch_shape, num_paths_in_group, self.mul_out, i * j)  # (..., P_g, o, ij)
                 
                 # Batched matmul: (..., ij, K) @ (..., P_g, ij, o) -> (..., P_g, o, K)
                 # We need: (..., 1, ij, K) @ (..., P_g, ij, o) -> (..., P_g, 1, o, K) -> (..., P_g, o, K)
                 y_expanded = y_reshaped.unsqueeze(-3)  # (..., 1, ij, K)
                 W_transposed = W_reshaped.transpose(-2, -1)  # (..., P_g, ij, o)
-                out_group = torch.matmul(y_expanded, W_transposed)  # (..., P_g, 1, o, K)
+                out_group = torch.matmul(y_expanded, W_transposed)  # (..., P_g, 1, o, K) in compute_dtype
                 out_group = out_group.squeeze(-2).permute(*range(len(batch_shape)), 0, 1, 2)  # (..., P_g, o, K_total)
+                # Convert back to output dtype
+                out_group = out_group.to(dtype=dtype) if out_group.dtype != dtype else out_group
                 
                 # Segment and accumulate to output
                 for seg_idx, (p_idx, l3, s, e) in enumerate(segments):  # type: ignore[misc]
@@ -624,8 +644,14 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                 if a is None or b is None:
                     continue
 
-                C = cg_list[p_idx]  # (m1,m2,m3)
-                out_l3 = torch.einsum("...im,...jn,mnk,oij->...ok", a, b, C, Wp)
+                # Convert to compute_dtype for numerical stability
+                a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
+                b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
+                Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                C = cg_list[p_idx]  # (m1,m2,m3) in compute_dtype
+                out_l3 = torch.einsum("...im,...jn,mnk,oij->...ok", a_comp, b_comp, C, Wp_comp)
+                # Convert back to output dtype
+                out_l3 = out_l3.to(dtype=dtype) if out_l3.dtype != dtype else out_l3
                 if not isinstance(gate, float):
                     out_l3 = out_l3 * gate[..., None, None]
                 out[l3] = out[l3] + out_l3

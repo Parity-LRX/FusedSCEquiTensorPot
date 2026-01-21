@@ -1848,6 +1848,73 @@ mff-evaluate --checkpoint model.pth --tensor-product-mode partial-cartesian
 - 📊 **CPU 最佳性能**：lmax ≤ 3 时优势最明显（2.68x - 4.12x 加速）
 - 📊 **GPU 最佳性能**：lmax ≤ 3 时优势最明显（1.91x - 2.10x 加速）
 
+### 实际任务测试结果
+
+**数据集**：五条氮氧化物和碳结构反应路径的 NEB（Nudged Elastic Band）数据，截取到 fmax=0.2，总共 2,788 条数据。测试集：每个反应选取 1-2 条完整或不完整的数据。
+
+**测试配置**：64 channels, lmax=2, float64
+
+<table>
+<thead>
+<tr>
+<th style="text-align:center">方法</th>
+<th style="text-align:center">配置</th>
+<th style="text-align:center">模式</th>
+<th style="text-align:center">能量 RMSE<br/>(mev/atom)</th>
+<th style="text-align:center">力 RMSE<br/>(mev/Å)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td rowspan="3" style="text-align:center;vertical-align:middle"><strong>MACE</strong></td>
+<td style="text-align:center">Lmax=2, 64ch</td>
+<td style="text-align:center">-</td>
+<td style="text-align:center">0.13</td>
+<td style="text-align:center">11.6</td>
+</tr>
+<tr>
+<td style="text-align:center">Lmax=2, 128ch</td>
+<td style="text-align:center">-</td>
+<td style="text-align:center">0.12</td>
+<td style="text-align:center">11.3</td>
+</tr>
+<tr>
+<td style="text-align:center">Lmax=2, 198ch</td>
+<td style="text-align:center">-</td>
+<td style="text-align:center">0.24</td>
+<td style="text-align:center">15.1</td>
+</tr>
+<tr>
+<td rowspan="4" style="text-align:center;vertical-align:middle"><strong>FSCETP</strong></td>
+<td rowspan="4" style="text-align:center;vertical-align:middle">Lmax=2, 64ch</td>
+<td style="text-align:center"><strong>spherical</strong></td>
+<td style="text-align:center"><strong>0.044</strong> ⭐</td>
+<td style="text-align:center"><strong>7.4</strong> ⭐</td>
+</tr>
+<tr>
+<td style="text-align:center"><strong>partial-cartesian</strong></td>
+<td style="text-align:center">0.045</td>
+<td style="text-align:center"><strong>7.4</strong> ⭐</td>
+</tr>
+<tr>
+<td style="text-align:center">partial-cartesian-loose</td>
+<td style="text-align:center">0.048</td>
+<td style="text-align:center">8.4</td>
+</tr>
+<tr>
+<td style="text-align:center">pure-cartesian-ictd</td>
+<td style="text-align:center">0.046</td>
+<td style="text-align:center">9.0</td>
+</tr>
+</tbody>
+</table>
+
+**结果分析**：
+- **能量精度对比**：FSCETP 相比 MACE (64ch) 的能量 RMSE 降低了 66.2%（0.044 vs 0.13 mev/atom）
+- **力精度对比**：FSCETP 相比 MACE (64ch) 的力 RMSE 降低了 36.2%（7.4 vs 11.6 mev/Å）
+- **最佳性能模式**：`spherical` 和 `partial-cartesian` 模式达到最优精度（能量：0.044-0.045 mev/atom，力：7.4 mev/Å）
+- **精度与效率平衡**：`pure-cartesian-ictd` 在保持接近最优精度（能量：0.046 mev/atom，力：9.0 mev/Å）的同时，参数量减少 72.1%，训练速度提升 2.10x（GPU，lmax=2）
+
 **不推荐使用 Pure-Cartesian：**
 - ❌ 速度极慢（CPU: 0.02x-0.36x，GPU: 0.02x-0.54x），参数量最大（+414%）
 - ❌ lmax≥4 时失败（内存不足）

@@ -936,7 +936,98 @@ m_{e,p}^{(\ell_3)} = g_e(p)\cdot
 - **平衡选择**：使用 `pure-cartesian-sparse`（1.17x 加速，高精度，参数量适中）
 - **避免使用**：`pure-cartesian`（速度极慢，lmax≥4 时失败）
 
-### 12.10 数学实现对应关系
+### 12.10 实际任务测试结果
+
+**数据集**：五条氮氧化物和碳结构反应路径的 NEB（Nudged Elastic Band）数据，截取到 fmax=0.2，总共 2,788 条数据。测试集：每个反应选取 1-2 条完整或不完整的数据。
+
+**测试配置**：64 channels, lmax=2, float64
+
+#### 12.10.1 能量和力精度对比
+
+<table>
+<thead>
+<tr>
+<th style="text-align:center">方法</th>
+<th style="text-align:center">配置</th>
+<th style="text-align:center">模式</th>
+<th style="text-align:center">能量 RMSE<br/>(mev/atom)</th>
+<th style="text-align:center">力 RMSE<br/>(mev/Å)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td rowspan="3" style="text-align:center;vertical-align:middle"><strong>MACE</strong></td>
+<td style="text-align:center">Lmax=2, 64ch</td>
+<td style="text-align:center">-</td>
+<td style="text-align:center">0.13</td>
+<td style="text-align:center">11.6</td>
+</tr>
+<tr>
+<td style="text-align:center">Lmax=2, 128ch</td>
+<td style="text-align:center">-</td>
+<td style="text-align:center">0.12</td>
+<td style="text-align:center">11.3</td>
+</tr>
+<tr>
+<td style="text-align:center">Lmax=2, 198ch</td>
+<td style="text-align:center">-</td>
+<td style="text-align:center">0.24</td>
+<td style="text-align:center">15.1</td>
+</tr>
+<tr>
+<td rowspan="4" style="text-align:center;vertical-align:middle"><strong>FSCETP</strong></td>
+<td rowspan="4" style="text-align:center;vertical-align:middle">Lmax=2, 64ch</td>
+<td style="text-align:center"><strong>spherical</strong></td>
+<td style="text-align:center"><strong>0.044</strong> ⭐</td>
+<td style="text-align:center"><strong>7.4</strong> ⭐</td>
+</tr>
+<tr>
+<td style="text-align:center"><strong>partial-cartesian</strong></td>
+<td style="text-align:center">0.045</td>
+<td style="text-align:center"><strong>7.4</strong> ⭐</td>
+</tr>
+<tr>
+<td style="text-align:center">partial-cartesian-loose</td>
+<td style="text-align:center">0.048</td>
+<td style="text-align:center">8.4</td>
+</tr>
+<tr>
+<td style="text-align:center">pure-cartesian-ictd</td>
+<td style="text-align:center">0.046</td>
+<td style="text-align:center">9.0</td>
+</tr>
+</tbody>
+</table>
+
+**说明**：
+- 数值越小越好
+- ⭐ 表示该指标的最佳结果
+
+#### 12.10.2 性能分析
+
+**能量精度对比**：
+- **FSCETP 相比 MACE (64ch) 的能量 RMSE 降低了 66.2%**
+  - FSCETP 最优结果：0.044 mev/atom（`spherical` 模式）
+  - MACE (64ch) 基准值：0.13 mev/atom
+  - 相对误差比：0.34（FSCETP / MACE）
+
+**力精度对比**：
+- **FSCETP 相比 MACE (64ch) 的力 RMSE 降低了 36.2%**
+  - FSCETP 最优结果：7.4 mev/Å（`spherical` 和 `partial-cartesian` 模式）
+  - MACE (64ch) 基准值：11.6 mev/Å
+  - 相对误差比：0.64（FSCETP / MACE）
+
+**模式性能总结**：
+- **能量精度最优模式**：`spherical`（0.044 mev/atom）
+- **力精度最优模式**：`spherical` 和 `partial-cartesian`（7.4 mev/Å）
+- **精度与效率平衡模式**：`pure-cartesian-ictd` 在保持接近最优精度（能量：0.046 mev/atom，力：9.0 mev/Å）的同时，参数量减少 72.1%，训练速度提升 2.10x（GPU，lmax=2）
+
+**结论**：
+- 所有 FSCETP 模式在真实化学反应路径数据集上均显著优于 MACE（64ch、128ch 和 198ch 配置）
+- `spherical` 和 `partial-cartesian` 模式在精度和效率之间达到最佳平衡
+- `pure-cartesian-ictd` 模式在保持竞争性精度的同时，提供了显著的参数效率和速度优势
+
+### 12.11 数学实现对应关系
 
 | 模式 | 内部表示 | 张量积方法 | 等变性保证 |
 |------|----------|------------|------------|

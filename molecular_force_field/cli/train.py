@@ -628,6 +628,7 @@ def main():
             lmax=config.lmax,
             ictd_tp_path_policy=args.ictd_tp_path_policy,
             ictd_tp_max_rank_other=args.ictd_tp_max_rank_other,
+            internal_compute_dtype=config.dtype,
             device=device,
         ).to(device)
     elif args.tensor_product_mode == 'pure-cartesian-sparse':
