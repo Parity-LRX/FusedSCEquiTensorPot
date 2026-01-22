@@ -486,6 +486,11 @@ def main():
         calc = MyE3NNCalculator(e3trans, ref_energies_dict, device, args.max_radius)
         
         if args.neb:
+            # Create logfile for NEB optimization (records fmax and optimization details)
+            neb_logfile = args.neb_output.replace('.traj', '.log').replace('.xyz', '.log')
+            if neb_logfile == args.neb_output:
+                neb_logfile = 'neb.log'
+            
             logging.info("=" * 60)
             logging.info("NEB Calculation")
             logging.info("=" * 60)
@@ -494,6 +499,7 @@ def main():
             logging.info(f"  Number of images:  {args.neb_images}")
             logging.info(f"  Force threshold:   {args.neb_fmax} eV/Å")
             logging.info(f"  Output trajectory: {args.neb_output}")
+            logging.info(f"  Optimization log: {neb_logfile} (contains fmax for each step)")
             logging.info("=" * 60)
             
             # Validate input files exist
@@ -529,7 +535,7 @@ def main():
                     image.set_pbc(False)
                 image.set_calculator(calc)
             
-            optimizer = FIRE(neb, trajectory=args.neb_output)
+            optimizer = FIRE(neb, trajectory=args.neb_output, logfile=neb_logfile)
             
             def log_neb_status():
                 energies = [img.get_potential_energy() for img in images]

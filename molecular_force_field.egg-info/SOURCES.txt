@@ -25,8 +25,14 @@ molecular_force_field/interfaces/self_test_lammps_potential.py
 molecular_force_field/models/__init__.py
 molecular_force_field/models/cartesian_e3_layers.py
 molecular_force_field/models/e3nn_layers.py
+molecular_force_field/models/ictd_fast.py
+molecular_force_field/models/ictd_irreps.py
 molecular_force_field/models/losses.py
 molecular_force_field/models/mlp.py
+molecular_force_field/models/pure_cartesian.py
+molecular_force_field/models/pure_cartesian_ictd_layers.py
+molecular_force_field/models/pure_cartesian_layers.py
+molecular_force_field/models/pure_cartesian_sparse_layers.py
 molecular_force_field/training/__init__.py
 molecular_force_field/training/schedulers.py
 molecular_force_field/training/trainer.py
@@ -34,4 +40,3 @@ molecular_force_field/utils/__init__.py
 molecular_force_field/utils/config.py
 molecular_force_field/utils/graph_utils.py
 molecular_force_field/utils/tensor_utils.py
-tests/test_equivariance.py

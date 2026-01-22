@@ -1,0 +1,1980 @@
+# Usage Guide
+
+FusedSCEquiTensorPot supports **six equivariant tensor product implementation modes**, including:
+- `spherical`: e3nn-based spherical harmonics method (default)
+- `partial-cartesian`: Cartesian coordinates + e3nn CG coefficients (strictly equivariant, partially uses e3nn)
+- `partial-cartesian-loose`: Approximate equivariant (norm product approximation, partially uses e3nn)
+- `pure-cartesian`: Pure Cartesian \(3^L\) representation (strictly equivariant, slower, fully self-implemented)
+- `pure-cartesian-sparse`: Sparse pure Cartesian (strictly equivariant, parameter-optimized, fully self-implemented)
+- `pure-cartesian-ictd`: ICTD irreps internal representation (strictly equivariant, fastest, fewest parameters, fully self-implemented)
+
+All modes maintain O(3) equivariance (including rotation and reflection). For detailed performance comparison, see the [Tensor Product Mode Comparison](#tensor-product-mode-comparison) section.
+
+## Installation
+
+### 1. Install Dependencies
+
+```bash
+# Install all dependencies
+pip install -r requirements.txt
+
+# Or install the package directly (dependencies will be installed automatically)
+pip install -e .
+```
+
+### 2. Verify Installation
+
+After installation, you can verify that the CLI is available using the following commands:
+
+```bash
+mff-preprocess --help
+mff-train --help
+mff-evaluate --help
+```
+
+## Complete Workflow
+
+### Step 1: Data Preprocessing
+
+First, you need to preprocess your raw XYZ file into a format that the library can use.
+
+```bash
+mff-preprocess \
+    --input-file 2000.xyz \
+    --output-dir data \
+    --max-atom 5 \
+    --train-ratio 0.95 \
+    --preprocess-h5 \
+    --max-radius 5.0 \
+    --num-workers 8
+```
+
+**Parameter Description:**
+- `--input-file`: Path to input XYZ file
+- `--output-dir`: Output directory (default 'data'), all preprocessed files will be saved in this directory
+- `--max-atom`: Maximum number of atoms per structure (for padding)
+- `--train-ratio`: Training set ratio (default 0.95)
+- `--preprocess-h5`: Whether to preprocess H5 files (precompute neighbor lists to accelerate training)
+- `--max-radius`: Maximum radius for neighbor search
+- `--num-workers`: Number of parallel processing workers
+
+**Output Files (in `data/` directory):**
+- `read_train.h5`, `read_val.h5` - Atomic data
+- `raw_energy_train.h5`, `raw_energy_val.h5` - Raw energies
+- `correction_energy_train.h5`, `correction_energy_val.h5` - Correction energies
+- `cell_train.h5`, `cell_val.h5` - Cell information
+- `processed_train.h5`, `processed_val.h5` - Preprocessed data (if --preprocess-h5 is used)
+- `fitted_E0.csv` - Fitted atomic reference energies (default: fitted from training set using least squares)
+
+### Step 2: Train Model
+
+**Method 1: Using Preprocessed Data**
+```bash
+mff-train \
+    --data-dir data \
+    --train-prefix train \
+    --val-prefix val \
+    --epochs 1000 \
+    --batch-size 8 \
+    --learning-rate 1e-3 \
+    --min-learning-rate 2e-5 \
+    --warmup-batches 1000 \
+    --warmup-start-ratio 0.1 \
+    --lr-decay-patience 1000 \
+    --lr-decay-factor 0.98 \
+    -a 1.0 \
+    -b 10.0 \
+    --update-param 1000 \
+    --weight-a-growth 1.01 \
+    --weight-b-decay 0.99 \
+    --force-shift-value 1.0 \
+    --patience 20 \
+    --vhat-clamp-interval 2000 \
+    --max-vhat-growth 5.0 \
+    --max-grad-norm 0.5 \
+    --grad-log-interval 500 \
+    --dump-frequency 250 \
+    --energy-log-frequency 10 \
+    --device cuda \
+    --dtype float64 \
+    --num-workers 8 \
+    --max-radius 5.0
+```
+
+**Custom Atomic Energies (E0)** (Optional):
+- **Default behavior**: Use `fitted_E0.csv` under `--data-dir` (fitted from training set using least squares)
+- **Method 1: Specify from CSV**:
+
+```bash
+mff-train \
+    --data-dir data \
+    --atomic-energy-file data/fitted_E0.csv
+```
+
+- **Method 2: Specify directly in CLI**:
+
+```bash
+mff-train \
+    --data-dir data \
+    --atomic-energy-keys 1 6 7 8 \
+    --atomic-energy-values -430.53299511 -821.03326787 -1488.18856918 -2044.3509823
+```
+
+**Method 2: Auto Preprocess and Train (One Step)**
+```bash
+mff-train \
+    --input-file 2000.xyz \
+    --data-dir data \
+    --epochs 1000 \
+    --batch-size 8 \
+    --device cuda
+```
+If there are no preprocessed files in the `data/` directory, it will automatically preprocess from the XYZ file specified by `--input-file`.
+
+**Quick Start Example (Using Default Parameters):**
+```bash
+# Simplest training command (using all default values)
+mff-train --input-file 2000.xyz --device cuda
+```
+
+**Complete Parameter Example:**
+```bash
+mff-train \
+    --input-file 2000.xyz \
+    --data-dir data \
+    --epochs 2000 \
+    --batch-size 8 \
+    --learning-rate 1e-3 \
+    --min-learning-rate 1e-5 \
+    --warmup-batches 1000 \
+    --warmup-start-ratio 0.1 \
+    --lr-decay-patience 1000 \
+    --lr-decay-factor 0.98 \
+    -a 1.0 \
+    -b 10.0 \
+    --update-param 1000 \
+    --patience 20 \
+    --dump-frequency 250 \
+    --device cuda \
+    --dtype float64
+```
+
+**Parameter Description:**
+
+**Data Parameters:**
+- `--data-dir`: Data directory containing preprocessed files (default 'data')
+- `--input-file`: Path to input XYZ file for auto preprocessing (optional)
+- `--train-prefix`: Training data file prefix (default 'train')
+- `--val-prefix`: Validation data file prefix (default 'val')
+
+**Basic Parameters:**
+- `--epochs`: Number of training epochs (default 1000)
+- `--batch-size`: Batch size (default 8). If GPU memory is insufficient, you can reduce this value (e.g., 4 or 2)
+- `--checkpoint`: Model save path (default 'combined_model.pth'). The final model will be saved after training, and models will also be saved periodically during training
+- `--device`: Device ('cuda' or 'cpu', default auto-detect). If GPU is available, strongly recommend using 'cuda'
+- `--dump-frequency`: Frequency of validation and model saving (every N batches, default 250). Validation and model checkpoint saving will occur every N batches
+- `--energy-log-frequency`: Frequency of energy prediction logging (every N batches, default 10). These logs are only written to files, not output to console
+- `--dtype`: Tensor data type ('float32' or 'float64', default 'float64'). float64 has higher precision but is slower, float32 is faster but has slightly lower precision
+- `--patience`: Early stopping patience value (default 20). If the **weighted validation loss** (`a × energy loss + b × force loss`) does not improve for N consecutive epochs, training will automatically stop
+
+**Learning Rate Parameters:**
+- `--learning-rate`: Target learning rate (default 2e-4). This is the learning rate after warmup
+- `--min-learning-rate`: Minimum learning rate (default 1e-5). Learning rate will not go below this value
+- `--warmup-batches`: Number of batches for learning rate warmup (default 1000). For the first N batches, learning rate linearly increases from `learning_rate × warmup_start_ratio` to `learning_rate`
+- `--warmup-start-ratio`: Starting ratio of learning rate during warmup (default 0.1). For example, if `--learning-rate 2e-4` and `--warmup-start-ratio 0.1`, learning rate will linearly increase from `2e-5` to `2e-4`
+- `--lr-decay-patience`: Interval in batches for learning rate decay (default 1000). Every N batches, if validation metrics do not improve, learning rate will be multiplied by `--lr-decay-factor`
+- `--lr-decay-factor`: Learning rate decay factor (default 0.98). Learning rate is multiplied by this value each time it decays (0.98 means 2% reduction)
+
+**Loss Weight Parameters:**
+- `--energy-weight` (or `-a`): Initial weight for energy loss (default 1.0). Total loss = `a × energy loss + b × force loss`
+- `--force-weight` (or `-b`): Initial weight for force loss (default 10.0). Force loss typically needs larger weight because there are far more forces than energies
+- `--update-param`: Frequency of automatic adjustment of weights `a` and `b` (every N batches, default 1000). Every N batches, weights will be adjusted according to `--weight-a-growth` and `--weight-b-decay`
+- `--weight-a-growth`: Growth rate of energy weight `a` (default 1.01, i.e., 1% increase each time). Recommended values: 1.005 (slow, suitable for very long training), 1.01 (medium, recommended), 1.02 (fast, suitable for short training)
+- `--weight-b-decay`: Decay rate of force weight `b` (default 0.99, i.e., 1% decrease each time). Recommended values: 0.995 (slow), 0.99 (medium, recommended), 0.98 (fast)
+- `--force-shift-value`: Scaling factor for force labels (default 1.0). Adjust this value if force units need conversion
+
+**Optimizer Parameters:**
+- `--vhat-clamp-interval`: Frequency of optimizer `v_hat` clamping (every N batches, default 2000). Used to prevent Adam optimizer's second moment estimate from becoming too large
+- `--max-vhat-growth`: Maximum growth factor for `v_hat` (default 5.0). Limits `v_hat` to not exceed N times the historical maximum value
+- `--max-grad-norm`: Gradient clipping threshold (default 0.5). If gradient norm exceeds this value, it will be clipped to this value to prevent gradient explosion
+- `--grad-log-interval`: Frequency of gradient statistics logging (every N batches, default 500). Used to monitor training stability
+
+**Data Processing Parameters:**
+- `--num-workers`: Number of parallel processes for data processing (default 8). Uses all during preprocessing, DataLoader automatically allocates during training (half for training, quarter for validation)
+- `--max-radius`: Maximum radius for neighbor search (default 5.0 Å). Atoms beyond this distance will not be considered as neighbors
+
+**Model Architecture Hyperparameters:**
+- `--max-atomvalue`: Maximum atomic number for atom embedding (default 10). If dataset contains elements with atomic number > 10, need to increase this value
+- `--embedding-dim`: Atom embedding dimension (default 16). Increasing this value can enhance model expressiveness but will increase computation
+- `--lmax`: Maximum order of spherical harmonics (default 2). Controls the highest order of irreducible representations
+- `--irreps-output-conv-channels`: Number of channels for irreps_output_conv (default 64). Together with `--lmax` determines the irreps form. For example:
+  - `lmax=2, channels=64` → "64x0e + 64x1o + 64x2e"
+  - `lmax=1, channels=64` → "64x0e + 64x1o"
+  - `lmax=3, channels=64` → "64x0e + 64x1o + 64x2e + 64x3o"
+  - Increasing channel number can improve model capacity but will significantly increase memory and computation
+- `--function-type`: Radial basis function type (default 'gaussian'). Options:
+  - `gaussian`: Gaussian basis functions (default, smooth and easy to optimize)
+  - `bessel`: Bessel basis functions (suitable for periodic systems)
+  - `fourier`: Fourier basis functions (suitable for periodic boundary conditions)
+  - `cosine`: Cosine basis functions
+  - `smooth_finite`: Smooth finite support basis functions
+- `--tensor-product-mode`: Equivariant tensor product implementation mode (default 'spherical'). **This framework supports six equivariant tensor product modes**, options:
+  - `spherical`: Use e3nn spherical harmonics tensor product (default, high precision, standard implementation)
+  - `partial-cartesian`: Cartesian coordinates + e3nn CG coefficients (strictly equivariant, partially uses e3nn's `wigner_3j` and `Irreps`, 17.4% parameter reduction)
+  - `partial-cartesian-loose`: Approximate equivariant tensor product (uses norm product approximation, partially uses e3nn's `Irreps` framework, faster, 17.3% parameter reduction)
+  - `pure-cartesian`: Pure Cartesian tensor product (\(3^L\) representation, δ/ε contractions, strictly equivariant, very slow, large parameters, fails at lmax≥4)
+  - `pure-cartesian-sparse`: Sparse pure Cartesian tensor product (strictly equivariant, 29.6% parameter reduction, stable speed)
+  - `pure-cartesian-ictd`: ICTD irreps internal representation (strictly equivariant, 72.1% parameter reduction, fastest, CPU: up to 4.12x, GPU: up to 2.10x)
+  
+  For detailed performance comparison and recommended scenarios, see the [Tensor Product Mode Comparison](#tensor-product-mode-comparison) section.
+
+**SWA and EMA Parameters:**
+- `--swa-start-epoch`: Epoch to start SWA (Stochastic Weight Averaging). After enabling, `a` and `b` will directly switch to `--swa-a` and `--swa-b` values at this epoch, and reset the early stopping counter
+- `--swa-a`: Energy weight `a` for SWA phase (must be used with `--swa-start-epoch`)
+- `--swa-b`: Force weight `b` for SWA phase (must be used with `--swa-start-epoch`)
+- `--ema-start-epoch`: Epoch to start EMA (Exponential Moving Average). EMA model is the exponential moving average of main model parameters, typically enabled in later training stages
+- `--ema-decay`: EMA decay coefficient (default 0.999). Larger values are smoother but respond slower
+- `--use-ema-for-validation`: Use EMA model for validation (instead of main model)
+- `--save-ema-model`: Save EMA model weights in checkpoint
+
+**Distributed Training Parameters:**
+- `--distributed`: Enable distributed training (DDP mode). Requires `torchrun` or `torch.distributed.launch`
+- `--local-rank`: Local process rank (usually automatically set by `torchrun`, no need to specify manually)
+- `--backend`: Distributed backend (default 'nccl' for GPU, 'gloo' for CPU)
+
+**Training Output:**
+- `combined_model.pth` - Model checkpoint
+- `combined_model_epoch{epoch}_batch_count{batch_count}.pth` - Periodically saved models (frequency controlled by `--dump-frequency`, default every 250 batches)
+- `training_YYYYMMDD_HHMMSS.log` - Training log (contains detailed batch-level information)
+- `training_YYYYMMDD_HH_loss.csv` - Loss records
+- `val_energy_epoch{epoch}_batch{batch_count}.csv` - Validation set energy predictions (frequency matches model saving)
+- `val_force_epoch{epoch}_batch{batch_count}.csv` - Validation set force predictions (frequency matches model saving)
+
+### Step 3: Evaluate Model
+
+#### 3.1 Static Evaluation (Compute RMSE and MAE)
+
+**Note: Evaluation must use the same model hyperparameters as training!**
+
+```bash
+mff-evaluate \
+    --checkpoint combined_model.pth \
+    --test-prefix test \
+    --output-prefix test \
+    --batch-size 1 \
+    --max-atomvalue 10 \
+    --embedding-dim 16 \
+    --lmax 2 \
+    --irreps-output-conv-channels 64 \
+    --function-type gaussian \
+    --tensor-product-mode spherical \
+    --device cuda
+```
+
+**Parameter Description:**
+- `--checkpoint`: Model checkpoint path
+- `--test-prefix`: Test data file prefix
+- `--output-prefix`: Output file prefix
+- `--use-h5`: Use H5Dataset (if preprocessed), otherwise use OnTheFlyDataset
+- `--batch-size`: Batch size (default 1)
+- `--max-atomvalue`: Must be the same as training
+- `--embedding-dim`: Must be the same as training
+- `--lmax`: Must be the same as training
+- `--irreps-output-conv-channels`: Must be the same as training (if set during training)
+- `--function-type`: Must be the same as training
+- `--tensor-product-mode`: Must be the same as training (supports six modes: `spherical`, `partial-cartesian`, `partial-cartesian-loose`, `pure-cartesian`, `pure-cartesian-sparse`, `pure-cartesian-ictd`)
+
+**Output Files:**
+- `test_loss.csv` - Test set loss metrics
+- `test_energy.csv` - Test set energy predictions
+- `test_force.csv` - Test set force predictions
+
+#### 3.2 Molecular Dynamics (MD) Simulation
+
+Use ASE's Langevin thermostat for molecular dynamics simulation. MD simulation will automatically skip static evaluation and proceed directly to dynamics calculation.
+
+**Basic Usage:**
+```bash
+mff-evaluate \
+    --checkpoint combined_model.pth \
+    --md-sim \
+    --md-input start.xyz \
+    --device cuda
+```
+
+**Complete Parameter Example:**
+```bash
+mff-evaluate \
+    --checkpoint combined_model.pth \
+    --md-sim \
+    --md-input molecule.xyz \
+    --md-temperature 300 \
+    --md-timestep 1.0 \
+    --md-steps 10000 \
+    --md-friction 0.01 \
+    --md-relax-fmax 0.05 \
+    --md-log-interval 10 \
+    --md-output md_traj.xyz \
+    --device cuda
+```
+
+**MD Parameter Description:**
+
+| Parameter | Default Value | Description |
+|-----------|---------------|-------------|
+| `--md-input` | `start_structure.xyz` | Input structure file (XYZ format) |
+| `--md-temperature` | 300.0 | Simulation temperature (K) |
+| `--md-timestep` | 1.0 | Timestep (fs) |
+| `--md-steps` | 10000 | Total number of steps |
+| `--md-friction` | 0.01 | Langevin friction coefficient |
+| `--md-relax-fmax` | 0.05 | Pre-optimization force convergence threshold (eV/Å) |
+| `--md-log-interval` | 10 | Log and trajectory recording interval |
+| `--md-output` | `md_traj.xyz` | Output trajectory file |
+| `--md-no-relax` | False | Skip initial structure optimization |
+
+**MD Workflow:**
+1. Load initial structure (`--md-input`)
+2. Optional: Use BFGS optimizer for structure optimization (unless `--md-no-relax` is used)
+3. Initialize Maxwell-Boltzmann velocity distribution
+4. Run Langevin dynamics simulation
+5. Periodically save trajectory and logs
+
+**Output Files:**
+- `md_traj.xyz` - MD trajectory (or file specified by `--md-output`)
+- `md_traj_log.txt` - Energy/temperature log (filename based on `--md-output`)
+- `relaxed_structure.xyz` - Optimized initial structure (if pre-optimization was performed)
+- `md_relax.log` - Pre-optimization process log
+
+**Example 1: Standard MD Simulation (300K, 10 ps)**
+```bash
+mff-evaluate \
+    --checkpoint best_model.pth \
+    --md-sim \
+    --md-input molecule.xyz \
+    --md-temperature 300 \
+    --md-timestep 1.0 \
+    --md-steps 10000 \
+    --md-output md_300K.xyz \
+    --device cuda
+```
+
+**Example 2: High Temperature MD Simulation (500K, 50 ps)**
+```bash
+# Run 50 ps at 500K
+mff-evaluate \
+    --checkpoint best_model.pth \
+    --md-sim \
+    --md-input reactant.xyz \
+    --md-temperature 500 \
+    --md-timestep 0.5 \
+    --md-steps 100000 \
+    --md-friction 0.005 \
+    --md-output md_500K.xyz \
+    --device cuda
+```
+
+**Example 3: Skip Pre-optimization and Run MD Directly**
+```bash
+mff-evaluate \
+    --checkpoint best_model.pth \
+    --md-sim \
+    --md-input pre_relaxed.xyz \
+    --md-no-relax \
+    --md-temperature 300 \
+    --md-steps 50000 \
+    --device cuda
+```
+
+**Example 4: Long MD Simulation (100 ps)**
+```bash
+mff-evaluate \
+    --checkpoint best_model.pth \
+    --md-sim \
+    --md-input system.xyz \
+    --md-temperature 300 \
+    --md-timestep 1.0 \
+    --md-steps 100000 \
+    --md-log-interval 50 \
+    --md-output md_long.xyz \
+    --device cuda
+```
+
+**Notes:**
+1. **Timestep Selection**: Usually 0.5-2.0 fs is safe. For light atoms (H), recommend using smaller timestep (0.5 fs)
+2. **Friction Coefficient**: 0.01 is a common value. Smaller values (0.001-0.005) are suitable for long simulations, larger values (0.05-0.1) are suitable for rapid equilibration
+3. **Pre-optimization**: Recommend optimizing initial structure unless it's already optimized
+4. **Periodic Boundary Conditions**: If input structure contains cell information, PBC will be automatically used
+5. **Energy Units**: All energies are in eV, forces are in eV/Å
+
+#### 3.3 NEB (Nudged Elastic Band) Calculation
+
+Use ASE's NEB method to find transition states and energy barriers for chemical reactions. NEB calculation will automatically skip static evaluation and proceed directly to path optimization.
+
+**Basic Usage:**
+```bash
+mff-evaluate \
+    --checkpoint combined_model.pth \
+    --neb \
+    --neb-initial reactant.xyz \
+    --neb-final product.xyz \
+    --device cuda
+```
+
+**Complete Parameter Example:**
+```bash
+mff-evaluate \
+    --checkpoint combined_model.pth \
+    --neb \
+    --neb-initial initial.xyz \
+    --neb-final final.xyz \
+    --neb-images 15 \
+    --neb-fmax 0.03 \
+    --neb-output neb.traj \
+    --device cuda
+```
+
+**NEB Parameter Description:**
+
+| Parameter | Default Value | Description |
+|-----------|---------------|-------------|
+| `--neb-initial` | `initial.xyz` | Initial structure (reactant) |
+| `--neb-final` | `final.xyz` | Final structure (product) |
+| `--neb-images` | 10 | Number of intermediate images (excluding endpoints) |
+| `--neb-fmax` | 0.05 | Force convergence threshold (eV/Å), uses NEB projected forces |
+| `--neb-output` | `neb.traj` | Output trajectory file (ASE Trajectory format) |
+
+**NEB Workflow:**
+1. Load initial and final structures
+2. Create NEB image chain (initial + N intermediate images + final)
+3. Linear interpolation to generate initial path
+4. Optimize path using FIRE optimizer (Climbing Image NEB)
+5. Output optimized path and barrier information
+
+**Output Files:**
+- `neb.traj` - NEB optimization trajectory (ASE Trajectory format, contains all images)
+- `neb.log` - Optimization log file (contains fmax for each step)
+
+**Output Information Includes:**
+- Forward barrier: E_saddle - E_initial
+- Reverse barrier: E_saddle - E_final
+- Reaction energy: E_final - E_initial
+- Detailed logs for each optimization step
+
+**Prepare Input Files Example:**
+```bash
+# Create initial structure (reactant)
+cat > initial.xyz << EOF
+3
+
+O  0.000  0.000  0.000
+H  0.960  0.000  0.000
+H -0.240  0.930  0.000
+EOF
+
+# Create final structure (product)
+cat > final.xyz << EOF
+3
+
+O  0.000  0.000  0.000
+H  1.500  0.000  0.000
+H -0.240  0.930  0.000
+EOF
+```
+
+**Example 1: Standard NEB Calculation**
+```bash
+mff-evaluate \
+    --checkpoint best_model.pth \
+    --neb \
+    --neb-initial reactant.xyz \
+    --neb-final product.xyz \
+    --neb-images 10 \
+    --neb-fmax 0.05 \
+    --device cuda
+```
+
+**Example 2: High Precision NEB Calculation**
+```bash
+mff-evaluate \
+    --checkpoint best_model.pth \
+    --neb \
+    --neb-initial reactant.xyz \
+    --neb-final product.xyz \
+    --neb-images 20 \
+    --neb-fmax 0.02 \
+    --neb-output neb_high_res.traj \
+    --dtype float64 \
+    --device cuda
+```
+
+**Example 3: Quick NEB Calculation (Fewer Images)**
+```bash
+mff-evaluate \
+    --checkpoint best_model.pth \
+    --neb \
+    --neb-initial reactant.xyz \
+    --neb-final product.xyz \
+    --neb-images 5 \
+    --neb-fmax 0.1 \
+    --device cuda
+```
+
+**View and Analyze NEB Results:**
+```python
+from ase.io import read
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Read NEB trajectory
+images = read('neb.traj', index=':')
+
+# Extract energies
+energies = [img.get_potential_energy() for img in images]
+
+# Plot energy curve
+plt.figure(figsize=(10, 6))
+plt.plot(range(len(energies)), energies, 'o-', linewidth=2, markersize=8)
+plt.xlabel('Image Index', fontsize=12)
+plt.ylabel('Energy (eV)', fontsize=12)
+plt.title('NEB Energy Profile', fontsize=14)
+plt.grid(True, alpha=0.3)
+plt.savefig('neb_profile.png', dpi=300)
+plt.close()
+
+# Calculate barriers and reaction energy
+e_initial = energies[0]
+e_saddle = max(energies)
+e_final = energies[-1]
+
+forward_barrier = e_saddle - e_initial
+reverse_barrier = e_saddle - e_final
+reaction_energy = e_final - e_initial
+
+print(f"Initial energy:    {e_initial:.4f} eV")
+print(f"Saddle point:      {e_saddle:.4f} eV")
+print(f"Final energy:      {e_final:.4f} eV")
+print(f"Forward barrier:   {forward_barrier:.4f} eV")
+print(f"Reverse barrier:   {reverse_barrier:.4f} eV")
+print(f"Reaction energy:   {reaction_energy:.4f} eV")
+
+# Visualize structures (using ASE GUI)
+from ase.visualize import view
+view(images)
+```
+
+**Using ASE to Analyze NEB Results:**
+```python
+from ase.io import read
+from ase.neb import NEBTools
+
+# Read trajectory
+images = read('neb.traj', index=':')
+
+# Use NEBTools for analysis
+nebtools = NEBTools(images)
+
+# Get barrier
+barrier = nebtools.get_barrier()[0]  # Forward barrier
+print(f"Forward barrier: {barrier:.4f} eV")
+
+# Get saddle point index
+saddle_index = nebtools.get_fitted_pes()[1]
+print(f"Saddle point at image: {saddle_index}")
+
+# Plot fitted potential energy surface
+nebtools.plot_band()
+```
+
+**Notes:**
+1. **Structure Requirements**: Initial and final structures must have the same number of atoms and atom types
+2. **Pre-optimization**: Recommend optimizing initial and final structures separately first to ensure they are local minima
+3. **Number of Images**: More images (15-20) provide higher path resolution but require more computation. 10 images is usually a good starting point
+4. **Convergence Criterion**: `--neb-fmax` uses NEB projected forces (not raw atomic forces), which is the correct convergence criterion
+5. **Climbing Image**: Climbing Image NEB (CI-NEB) is automatically enabled to precisely locate saddle points
+6. **Periodic Boundary Conditions**: If input structures contain cell information, PBC will be automatically used
+7. **Interpolation Method**: Uses improved tangent method for path interpolation
+8. **Optimizer**: Uses FIRE optimizer, which is particularly effective for NEB optimization
+
+
+## Python API Usage
+
+### Example 1: Data Preprocessing
+
+```python
+from molecular_force_field.data.preprocessing import (
+    extract_data_blocks,
+    fit_baseline_energies,
+    compute_correction,
+    save_set,
+    save_to_h5_parallel
+)
+
+# Extract data blocks (supports parsing energy / pbc / Lattice / Properties)
+all_blocks, all_energy, all_raw_energy, all_cells, all_pbcs = extract_data_blocks('data.xyz')
+
+# Fit baseline energies
+keys = np.array([1, 6, 7, 8], dtype=np.int64)
+fitted_values = fit_baseline_energies(
+    train_blocks, train_raw_E, keys,
+    initial_values=np.array([-0.01] * len(keys))
+)
+
+# Compute correction energies
+train_correction = compute_correction(train_blocks, train_raw_E, keys, fitted_values)
+
+# Save data (including pbc information)
+save_set('train', train_indices, train_blocks, train_raw_E, train_correction, all_cells, pbc_list=all_pbcs)
+
+# Preprocess H5 files (precompute neighbor lists)
+save_to_h5_parallel('train', max_radius=5.0, num_workers=8)
+```
+
+### Example 2: Train Model
+
+```python
+import torch
+from torch.utils.data import DataLoader
+from molecular_force_field.models import E3_TransformerLayer_multi, MainNet
+from molecular_force_field.data import H5Dataset
+from molecular_force_field.data.collate import collate_fn_h5
+from molecular_force_field.training.trainer import Trainer
+from molecular_force_field.utils.config import ModelConfig
+
+# Device setup
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load datasets
+train_dataset = H5Dataset('train')
+val_dataset = H5Dataset('val')
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=8,
+    shuffle=True,
+    collate_fn=collate_fn_h5,
+    num_workers=4,
+    pin_memory=True
+)
+
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=1,
+    shuffle=False,
+    collate_fn=collate_fn_h5,
+    num_workers=2,
+    pin_memory=True
+)
+
+# Model configuration
+config = ModelConfig()
+
+# Initialize model
+model = MainNet(
+    input_size=config.input_dim_weight,
+    hidden_sizes=config.main_hidden_sizes4,
+    output_size=1
+).to(device)
+
+e3trans = E3_TransformerLayer_multi(
+    max_embed_radius=config.max_radius,
+    main_max_radius=config.max_radius_main,
+    main_number_of_basis=config.number_of_basis_main,
+    irreps_input=config.get_irreps_input_conv_main(),
+    irreps_query=config.get_irreps_query_main(),
+    irreps_key=config.get_irreps_key_main(),
+    irreps_value=config.get_irreps_value_main(),
+    irreps_output=config.get_irreps_output_conv_2(),
+    irreps_sh=config.get_irreps_sh_transformer(),
+    hidden_dim_sh=config.get_hidden_dim_sh(),
+    hidden_dim=config.emb_number_main_2,
+    channel_in2=config.channel_in2,
+    embedding_dim=config.embedding_dim,
+    max_atomvalue=config.max_atomvalue,
+    output_size=config.output_size,
+    embed_size=config.embed_size,
+    main_hidden_sizes3=config.main_hidden_sizes3,
+    num_layers=config.num_layers,
+    device=device
+).to(device)
+
+# Create trainer
+trainer = Trainer(
+    model=model,
+    e3trans=e3trans,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    train_dataset=train_dataset,
+    val_dataset=val_dataset,
+    device=device,
+    config=config,
+    learning_rate=2e-4,
+    epoch_numbers=1000,
+    checkpoint_path='combined_model.pth',
+    atomic_energy_keys=config.atomic_energy_keys,
+    atomic_energy_values=config.atomic_energy_values,
+)
+
+# Start training
+trainer.run_training()
+```
+
+### Example 3: Evaluate Model
+
+```python
+import torch
+from torch.utils.data import DataLoader
+from molecular_force_field.models import E3_TransformerLayer_multi
+from molecular_force_field.data import OnTheFlyDataset
+from molecular_force_field.data.collate import on_the_fly_collate
+from molecular_force_field.evaluation.evaluator import Evaluator
+from molecular_force_field.utils.config import ModelConfig
+
+# Load model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+checkpoint = torch.load('combined_model.pth', map_location=device)
+
+config = ModelConfig()
+e3trans = E3_TransformerLayer_multi(...).to(device)
+e3trans.load_state_dict(checkpoint['e3trans_state_dict'])
+e3trans.eval()
+
+# Load test dataset
+test_dataset = OnTheFlyDataset(
+    'read_test.h5',
+    'raw_energy_test.h5',
+    'cell_test.h5',
+    max_radius=5.0
+)
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=1,
+    shuffle=False,
+    collate_fn=on_the_fly_collate,
+    num_workers=10
+)
+
+# Evaluate
+evaluator = Evaluator(
+    model=e3trans,
+    dataset=test_dataset,
+    device=device,
+    atomic_energy_keys=config.atomic_energy_keys,
+    atomic_energy_values=config.atomic_energy_values,
+)
+
+metrics = evaluator.evaluate(test_loader, output_prefix='test')
+print(f"Energy RMSE: {metrics['energy_rmse']:.6f}")
+print(f"Force RMSE: {metrics['force_rmse']:.6f}")
+```
+
+
+### Example 4: Using ASE Calculator for MD Simulation
+
+```python
+from ase.io import read, write
+from ase.md.langevin import Langevin
+from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
+from ase.optimize import BFGS
+from ase import units
+from ase.md import MDLogger
+from molecular_force_field.evaluation.calculator import MyE3NNCalculator
+from molecular_force_field.models import E3_TransformerLayer_multi
+from molecular_force_field.utils.config import ModelConfig
+import torch
+
+# Load model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+checkpoint = torch.load('combined_model.pth', map_location=device)
+
+config = ModelConfig()
+e3trans = E3_TransformerLayer_multi(
+    max_embed_radius=config.max_radius,
+    main_max_radius=config.max_radius_main,
+    main_number_of_basis=config.number_of_basis_main,
+    irreps_input=config.get_irreps_output_conv(),
+    irreps_query=config.get_irreps_query_main(),
+    irreps_key=config.get_irreps_key_main(),
+    irreps_value=config.get_irreps_value_main(),
+    irreps_output=config.get_irreps_output_conv_2(),
+    irreps_sh=config.get_irreps_sh_transformer(),
+    hidden_dim_sh=config.get_hidden_dim_sh(),
+    hidden_dim=config.emb_number_main_2,
+    channel_in2=config.channel_in2,
+    embedding_dim=config.embedding_dim,
+    max_atomvalue=config.max_atomvalue,
+    output_size=config.output_size,
+    embed_size=config.embed_size,
+    main_hidden_sizes3=config.main_hidden_sizes3,
+    num_layers=config.num_layers,
+    function_type_main=config.function_type,
+    device=device
+).to(device)
+
+e3trans.load_state_dict(checkpoint['e3trans_state_dict'])
+e3trans.eval()
+
+# Create calculator
+atomic_energies_dict = {
+    1: -430.53299511,
+    6: -821.03326787,
+    7: -1488.18856918,
+    8: -2044.3509823
+}
+calc = MyE3NNCalculator(e3trans, atomic_energies_dict, device, max_radius=5.0)
+
+# Read structure
+atoms = read('structure.xyz')
+atoms.set_calculator(calc)
+
+# Optional: Pre-optimize structure
+print("Relaxing structure...")
+opt = BFGS(atoms, logfile='relax.log')
+opt.run(fmax=0.05)
+write('relaxed_structure.xyz', atoms)
+
+# Initialize velocity distribution
+MaxwellBoltzmannDistribution(atoms, temperature_K=300)
+
+# Set MD parameters
+timestep = 1.0  # fs
+temperature = 300.0  # K
+friction = 0.01
+n_steps = 10000
+log_interval = 10
+
+# Create Langevin dynamics
+dyn = Langevin(
+    atoms, 
+    timestep * units.fs, 
+    temperature_K=temperature, 
+    friction=friction
+)
+
+# Add logging and trajectory recording
+dyn.attach(MDLogger(dyn, atoms, 'md_log.txt', header=True, mode="w"), interval=log_interval)
+dyn.attach(lambda: write('md_traj.xyz', atoms, append=True), interval=log_interval)
+
+# Run MD
+print(f"Starting MD: {n_steps} steps ({n_steps * timestep / 1000:.2f} ps)")
+dyn.run(n_steps)
+print("MD simulation completed!")
+```
+
+### Example 5: Using ASE NEB to Calculate Reaction Barriers
+
+```python
+from ase.io import read, write
+from ase.mep import NEB
+from ase.optimize import FIRE
+from molecular_force_field.evaluation.calculator import MyE3NNCalculator
+from molecular_force_field.models import E3_TransformerLayer_multi
+from molecular_force_field.utils.config import ModelConfig
+import torch
+
+# Load model (same as above)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+checkpoint = torch.load('combined_model.pth', map_location=device)
+
+config = ModelConfig()
+e3trans = E3_TransformerLayer_multi(...).to(device)
+e3trans.load_state_dict(checkpoint['e3trans_state_dict'])
+e3trans.eval()
+
+# Create calculator
+atomic_energies_dict = {
+    1: -430.53299511,
+    6: -821.03326787,
+    7: -1488.18856918,
+    8: -2044.3509823
+}
+calc = MyE3NNCalculator(e3trans, atomic_energies_dict, device, max_radius=5.0)
+
+# Read initial and final structures
+initial = read('reactant.xyz')
+final = read('product.xyz')
+
+# Optional: Pre-optimize endpoints
+print("Optimizing initial structure...")
+initial.set_calculator(calc)
+opt_initial = BFGS(initial)
+opt_initial.run(fmax=0.05)
+
+print("Optimizing final structure...")
+final.set_calculator(calc)
+opt_final = BFGS(final)
+opt_final.run(fmax=0.05)
+
+# Create NEB images
+n_images = 10  # Number of intermediate images
+images = [initial]
+images += [initial.copy() for _ in range(n_images)]
+images += [final]
+
+# Set calculator and cell
+for image in images:
+    if initial.cell.any():
+        image.set_cell(initial.cell)
+        image.set_pbc(initial.pbc)
+    else:
+        image.set_cell([100, 100, 100])
+        image.set_pbc(False)
+    image.set_calculator(calc)
+
+# Create NEB object
+neb = NEB(images, climb=True, method='improvedtangent', allow_shared_calculator=True)
+neb.interpolate()
+
+# Optimize path
+optimizer = FIRE(neb, trajectory='neb.traj')
+
+# Define logging function
+def log_neb_status():
+    energies = [img.get_potential_energy() for img in images]
+    neb_forces = neb.get_forces()
+    n_images_total = len(images)
+    n_atoms = len(images[0])
+    forces_reshaped = neb_forces.reshape(n_images_total, n_atoms, 3)
+    intermediate_forces = forces_reshaped[1:-1]
+    max_force = (intermediate_forces**2).sum(axis=2).max()**0.5
+    print(
+        f"NEB step {optimizer.nsteps:4d} | "
+        f"E_min = {min(energies):.6f} eV | "
+        f"E_max = {max(energies):.6f} eV | "
+        f"Barrier = {max(energies) - energies[0]:.4f} eV | "
+        f"F_max = {max_force:.4f} eV/Å"
+    )
+
+optimizer.attach(log_neb_status, interval=1)
+
+# Run optimization
+print("Starting NEB optimization...")
+optimizer.run(fmax=0.05)
+
+# Output final results
+energies = [img.get_potential_energy() for img in images]
+e_initial = energies[0]
+e_saddle = max(energies)
+e_final = energies[-1]
+
+print("\n" + "=" * 60)
+print("NEB Results:")
+print(f"  Initial energy:    {e_initial:.4f} eV")
+print(f"  Saddle point:      {e_saddle:.4f} eV")
+print(f"  Final energy:      {e_final:.4f} eV")
+print(f"  Forward barrier:   {e_saddle - e_initial:.4f} eV")
+print(f"  Reverse barrier:   {e_saddle - e_final:.4f} eV")
+print(f"  Reaction energy:   {e_final - e_initial:.4f} eV")
+print("=" * 60)
+```
+
+
+
+## Frequently Asked Questions
+
+### Q: How to view all available command-line parameters?
+
+```bash
+mff-preprocess --help
+mff-train --help
+mff-evaluate --help
+```
+
+### Q: How to resume training from a previous checkpoint?
+
+The trainer will **automatically detect and load** checkpoint files. If the file specified by `--checkpoint` already exists, training state will be automatically restored.
+
+**Automatically restored content:**
+- ✅ Model weights (`e3trans_state_dict`)
+- ✅ Epoch number (continues from interrupted epoch)
+- ✅ Batch count (cumulative batch number)
+- ✅ Loss weights `a` and `b`
+- ✅ Best validation loss (for early stopping, based on `a × energy loss + b × force loss`)
+- ✅ Early stopping counter (patience counter)
+
+**Usage example:**
+
+```bash
+# First training (interrupted at epoch 50)
+mff-train \
+    --data-dir data \
+    --epochs 100 \
+    --checkpoint my_model.pth \
+    --device cuda
+
+# After interruption, run the same command again to continue
+# Will automatically continue from epoch 51
+mff-train \
+    --data-dir data \
+    --epochs 100 \
+    --checkpoint my_model.pth \
+    --device cuda
+
+# Log will show:
+# ================================================================================
+# Checkpoint Loaded Successfully!
+#   Resuming from epoch: 51
+#   Batch count: 12500
+#   Loss weights: a=1.0234, b=9.7845
+#   Best validation loss: 0.012345
+#   Early stopping patience counter: 3/20
+# ================================================================================
+```
+
+**Notes:**
+1. Ensure using **the same hyperparameters** (`--max-atomvalue`, `--lmax`, `--function-type`, etc.)
+2. Ensure using **the same data directory** and **the same device**
+3. You can adjust `--epochs` to extend training (e.g., from 100 to 200)
+4. **Cannot** change learning rate scheduler initial settings when resuming (will reinitialize)
+
+**How to restart training from scratch (ignore existing checkpoint):**
+```bash
+# Method 1: Use a different checkpoint name
+mff-train --checkpoint new_model.pth ...
+
+# Method 2: Delete or rename old checkpoint
+mv my_model.pth my_model_backup.pth
+mff-train --checkpoint my_model.pth ...
+```
+
+### Q: How to adjust model hyperparameters?
+
+You can adjust model architecture by modifying the `ModelConfig` class in `molecular_force_field/utils/config.py`, or by passing parameters directly when using the Python API.
+
+### Q: How to adjust model hyperparameters?
+
+You can adjust model architecture via CLI parameters:
+
+**Atom embedding parameters:**
+```bash
+# Default settings (suitable for common elements like H, C, N, O)
+mff-train --max-atomvalue 10 --embedding-dim 16
+
+# Include more element types (e.g., metals)
+mff-train --max-atomvalue 50 --embedding-dim 32
+
+# Increase embedding dimension to enhance model expressiveness
+mff-train --max-atomvalue 10 --embedding-dim 32
+```
+
+**Model capacity parameters (lmax and channels):**
+```bash
+# Default settings (lmax=2, 64 channels, gaussian basis functions)
+# Generates: "64x0e + 64x1o + 64x2e"
+mff-train --lmax 2 --irreps-output-conv-channels 64
+
+# Lower maximum order (simpler systems, faster training)
+# Generates: "64x0e + 64x1o"
+mff-train --lmax 1 --irreps-output-conv-channels 64
+
+# Increase maximum order (more complex systems, stronger expressiveness)
+# Generates: "64x0e + 64x1o + 64x2e + 64x3o"
+mff-train --lmax 3 --irreps-output-conv-channels 64
+
+# Increase channel number (larger model capacity)
+# Generates: "128x0e + 128x1o + 128x2e"
+mff-train --lmax 2 --irreps-output-conv-channels 128
+
+# Increase both lmax and channels (maximum model capacity, suitable for complex systems)
+# Generates: "128x0e + 128x1o + 128x2e + 128x3o"
+mff-train --lmax 3 --irreps-output-conv-channels 128
+
+# Reduce model capacity (suitable for simple systems or memory-constrained)
+# Generates: "32x0e + 32x1o"
+mff-train --lmax 1 --irreps-output-conv-channels 32
+```
+
+**Radial basis function type:**
+```bash
+# Default: Gaussian basis functions (recommended, smooth and easy to optimize)
+mff-train --function-type gaussian
+
+# Bessel basis functions (suitable for periodic systems)
+mff-train --function-type bessel
+
+# Fourier basis functions (suitable for periodic boundary conditions)
+mff-train --function-type fourier
+
+# Cosine basis functions
+mff-train --function-type cosine
+
+# Smooth finite support basis functions
+mff-train --function-type smooth_finite
+```
+
+**Notes:**
+- `--max-atomvalue` must be greater than or equal to the maximum atomic number in the dataset
+- `--lmax` controls the maximum order of spherical harmonics, affecting model's ability to express angular information
+  - `lmax=0`: Only scalar
+  - `lmax=1`: Scalar + vector
+  - `lmax=2`: Scalar + vector + rank-2 tensor
+  - `lmax=3`: Includes rank-3 tensor
+  - Higher lmax can capture more complex geometric features but significantly increases computation
+- `--function-type` selects radial basis function type:
+  - `gaussian`: Most commonly used, suitable for most systems
+  - `bessel`: Suitable for systems with periodicity (e.g., crystals)
+  - `fourier`: Suitable for periodic boundary conditions
+  - Usually the default `gaussian` is sufficient
+- Increasing `--embedding-dim`, `--lmax`, and `--irreps-output-conv-channels` will significantly increase memory usage and training time
+- Evaluation must use the same hyperparameter values as training
+- These parameters affect model performance, recommend adjusting based on dataset size and complexity
+
+**Complete example: Large model configuration**
+```bash
+mff-train \
+    --input-file 2000.xyz \
+    --data-dir data \
+    --max-atomvalue 20 \
+    --embedding-dim 32 \
+    --lmax 3 \
+    --irreps-output-conv-channels 128 \
+    --function-type gaussian \
+    --batch-size 4 \
+    --device cuda
+```
+
+
+
+### Q: How to adjust learning rate?
+
+You can adjust learning rate strategy during training with the following parameters:
+
+**Basic learning rate settings:**
+```bash
+mff-train \
+    --learning-rate 2e-4 \      # Target learning rate (value reached after warmup)
+    --min-learning-rate 1e-5    # Minimum learning rate (prevents too small)
+```
+
+**Learning rate warmup:**
+```bash
+mff-train \
+    --warmup-batches 1000 \     # First 1000 batches for warmup
+    --warmup-start-ratio 0.1    # Start from 10% of target learning rate, linearly increase to 100%
+```
+During warmup, learning rate linearly increases from `learning_rate × warmup_start_ratio` to `learning_rate`. For example, if `--learning-rate 2e-4` and `--warmup-start-ratio 0.1`, learning rate will linearly increase from `2e-5` to `2e-4`. This helps stabilize training in early stages.
+
+**Learning rate decay:**
+```bash
+mff-train \
+    --lr-decay-patience 1000 \  # Check every 1000 batches, decay if no improvement
+    --lr-decay-factor 0.98      # Multiply learning rate by 0.98 each time it decays
+```
+For example: initial learning rate 2e-4, after every 1000 batches if validation metrics don't improve, learning rate becomes 2e-4 × 0.98 = 1.96e-4, after another 1000 batches becomes 1.96e-4 × 0.98 = 1.92e-4, and so on.
+
+**Complete examples:**
+```bash
+# Fast convergence settings (larger learning rate, fast warmup)
+mff-train \
+    --learning-rate 5e-4 \
+    --min-learning-rate 1e-5 \
+    --warmup-batches 500 \
+    --warmup-start-ratio 0.1
+
+# Stable training settings (smaller learning rate, longer warmup)
+mff-train \
+    --learning-rate 1e-4 \
+    --min-learning-rate 1e-6 \
+    --warmup-batches 2000 \
+    --warmup-start-ratio 0.05
+
+# Fine-tuning settings (small learning rate, slow decay)
+mff-train \
+    --learning-rate 1e-5 \
+    --lr-decay-factor 0.99 \
+    --lr-decay-patience 2000 \
+    --warmup-start-ratio 0.2
+```
+
+### Q: How to adjust loss weights?
+
+Loss function: `Total loss = a × energy loss + b × force loss`
+
+**Initial weight settings:**
+```bash
+# Default settings (energy weight 1.0, force weight 10.0)
+mff-train -a 1.0 -b 10.0
+
+# More emphasis on energy (if energy prediction is poor)
+mff-train -a 2.0 -b 5.0
+
+# More emphasis on forces (if force prediction is poor)
+mff-train -a 0.5 -b 20.0
+```
+
+**Automatic weight adjustment:**
+```bash
+# Adjust every 500 batches (more frequent)
+mff-train -a 1.0 -b 10.0 --update-param 500
+
+# Adjust every 2000 batches (more stable)
+mff-train -a 1.0 -b 10.0 --update-param 2000
+```
+
+**Adjustment rate control:**
+```bash
+# Slow adjustment (suitable for very long training, 200k+ batches)
+mff-train -a 1.0 -b 10.0 --weight-a-growth 1.005 --weight-b-decay 0.995
+
+# Medium adjustment (recommended, suitable for most cases)
+mff-train -a 1.0 -b 10.0 --weight-a-growth 1.01 --weight-b-decay 0.99
+
+# Fast adjustment (suitable for short training, <50k batches)
+mff-train -a 1.0 -b 10.0 --weight-a-growth 1.02 --weight-b-decay 0.98
+```
+
+Automatic adjustment rule: Every `--update-param` batches, `a` is multiplied by `--weight-a-growth` (increase), `b` is multiplied by `--weight-b-decay` (decrease), to gradually balance the importance of energy and forces. **Note: `a` and `b` have no range limits and will continue to adjust according to the above rules.**
+
+**Optional: Set ranges for a / b (Clamp)** (suitable for long training to prevent excessive weight drift):
+```bash
+# Limit a to [0.5, 10], b to [0.001, 100]
+mff-train \
+  -a 1.0 -b 10.0 \
+  --a-min 0.5 --a-max 10 \
+  --b-min 0.001 --b-max 100
+```
+
+**Rate selection recommendations:**
+- **Slow (1.005/0.995)**: Suitable for very long training (>200k batches), weight changes are gradual, training is more stable
+- **Medium (1.01/0.99)**: **Recommended default**, suitable for most training scenarios (50k-200k batches), balances stability and adjustment speed
+- **Fast (1.02/0.98)**: Suitable for short training (<50k batches), fast weight adjustment, but may cause instability in later training stages
+
+### Q: How to adjust optimizer parameters?
+
+**Gradient clipping (prevent gradient explosion):**
+```bash
+# Stricter gradient clipping (suitable when training is unstable)
+mff-train --max-grad-norm 0.3
+
+# More lenient gradient clipping (suitable when training is stable)
+mff-train --max-grad-norm 1.0
+```
+
+**Optimizer stability parameters:**
+```bash
+# Clamp v_hat more frequently (suitable when training is unstable)
+mff-train --vhat-clamp-interval 1000 --max-vhat-growth 3.0
+
+# More lenient v_hat control (suitable when training is stable)
+mff-train --vhat-clamp-interval 5000 --max-vhat-growth 10.0
+```
+
+**Monitor gradients:**
+```bash
+# Log gradient statistics every 100 batches (for debugging)
+mff-train --grad-log-interval 100
+
+# Log every 1000 batches (reduce log volume)
+mff-train --grad-log-interval 1000
+```
+
+### Q: How to choose appropriate batch size?
+
+Batch size affects training speed and memory usage:
+
+```bash
+# Small batch (suitable for small GPU memory or small datasets)
+mff-train --batch-size 4
+
+# Medium batch (default, suitable for most cases)
+mff-train --batch-size 8
+
+# Large batch (suitable when GPU memory is sufficient, can accelerate training)
+mff-train --batch-size 16
+```
+
+**Note:** Batch size affects gradient estimation stability. If batch is too small (e.g., 2 or 4), may need to reduce learning rate; if batch is too large, may need to increase learning rate.
+
+### Q: How to adjust validation and save frequency?
+
+```bash
+# More frequent validation and saving (suitable for rapid iteration)
+mff-train --dump-frequency 100
+
+# Default frequency (balance performance and monitoring)
+mff-train --dump-frequency 250
+
+# Less frequent validation (suitable for long training, reduce I/O overhead)
+mff-train --dump-frequency 500
+```
+
+**Note:** `--dump-frequency` controls the frequency of validation and model saving. More frequent validation can detect problems earlier but will increase training time.
+
+### Q: What are the data format requirements?
+
+Input XYZ files need to contain:
+- Atomic coordinates (x, y, z)
+- Atom types/atomic numbers
+- Forces (Fx, Fy, Fz)
+- Energy information (in Properties line)
+- Cell information (in Lattice attribute, optional)
+
+
+
+### Q: How to use multi-GPU parallel training?
+
+Multi-GPU training can significantly accelerate training, especially on large datasets. Steps:
+
+**1. Use torchrun (recommended, PyTorch 1.9+):**
+```bash
+# Use 4 GPUs
+torchrun --nproc_per_node=4 \
+    -m molecular_force_field.cli.train \
+    --distributed \
+    --data-dir data \
+    --epochs 1000 \
+    --batch-size 8
+```
+
+**2. Use torch.distributed.launch (compatible with older versions):**
+```bash
+python -m torch.distributed.launch \
+    --nproc_per_node=4 \
+    --master_port=29500 \
+    -m molecular_force_field.cli.train \
+    --distributed \
+    --data-dir data \
+    --epochs 1000 \
+    --batch-size 8
+```
+
+**Notes:**
+- `--nproc_per_node` specifies the number of GPUs to use
+- Must add `--distributed` parameter
+- Effective batch size per GPU = `--batch-size`, total effective batch size = `--batch-size × number of GPUs`
+- Recommend adjusting learning rate based on total effective batch size (usually linear scaling)
+- All logs, checkpoints, and CSV files are only saved on main process (rank 0)
+- Validation results are automatically aggregated from all processes
+
+**Example: 4-GPU training, batch size=8 per GPU, total effective batch size=32**
+```bash
+torchrun --nproc_per_node=4 \
+    -m molecular_force_field.cli.train \
+    --distributed \
+    --data-dir data \
+    --batch-size 8 \
+    --learning-rate 4e-3  # Can appropriately increase learning rate (4x batch size)
+```
+
+### Q: How to accelerate training?
+
+**1. Use optimized tensor product modes:**
+```bash
+# Pure-Cartesian-ICTD: Fewest parameters (72.1% reduction), fastest speed (CPU: up to 4.12x, GPU: up to 2.10x)
+mff-train --input-file data.xyz --tensor-product-mode pure-cartesian-ictd
+
+# Pure-Cartesian-Sparse: 29.6% parameter reduction, stable speed (CPU: 0.53x-1.39x, GPU: 0.46x-1.17x)
+mff-train --input-file data.xyz --tensor-product-mode pure-cartesian-sparse
+
+# Partial-Cartesian-Loose: Non-strict equivariant (norm product approximation), faster (CPU: 0.17x-1.37x, GPU: 0.21x-1.52x), 17.3% parameter reduction
+mff-train --input-file data.xyz --tensor-product-mode partial-cartesian-loose
+
+# Partial-Cartesian: Strictly equivariant, 17.4% parameter reduction
+mff-train --input-file data.xyz --tensor-product-mode partial-cartesian
+```
+
+**2. Use preprocessed data:**
+```bash
+# Use --preprocess-h5 to precompute neighbor lists during preprocessing
+mff-preprocess --input-file 2000.xyz --preprocess-h5
+
+# Use preprocessed data during training (auto-detected)
+mff-train --data-dir data
+```
+
+**3. Use GPU:**
+```bash
+mff-train --device cuda
+```
+
+**4. Increase parallel processing:**
+```bash
+# Increase number of parallel processes for data loading
+mff-train --num-workers 16
+
+# Note: num_workers will automatically adjust based on CPU cores, DataLoader uses half threads during training
+```
+
+**5. Use float32 (if precision is sufficient):**
+```bash
+# float32 is about 2x faster than float64, but slightly lower precision
+mff-train --dtype float32
+```
+
+**6. Increase batch size (if GPU memory allows):**
+```bash
+# Larger batches can better utilize GPU
+mff-train --batch-size 16
+```
+
+**7. Reduce validation frequency (during long training):**
+```bash
+# Reduce I/O overhead
+mff-train --dump-frequency 500
+```
+
+**8. Use multi-GPU parallel training (most effective):**
+```bash
+# Use 4 GPUs for parallel training, speedup close to 4x
+torchrun --nproc_per_node=4 \
+    -m molecular_force_field.cli.train \
+    --distributed \
+    --data-dir data \
+    --batch-size 8
+```
+
+### Q: Which tensor product mode should I choose?
+
+| Scenario | Recommended Mode | Reason |
+|----------|------------------|--------|
+| Publishing papers/High precision requirements | `spherical` | Uses e3nn strict spherical harmonics, highest precision, standard implementation |
+| Parameter optimization (maximum) | `pure-cartesian-ictd` | 72.1% parameter reduction, fastest speed (CPU: up to 4.12x, GPU: up to 2.10x), strictly equivariant |
+| Parameter optimization (balanced) | `pure-cartesian-sparse` | 29.6% parameter reduction, stable speed (CPU: 0.53x-1.39x, GPU: 0.46x-1.17x), strictly equivariant |
+| GPU memory constrained | `pure-cartesian-ictd` or `pure-cartesian-sparse` | 72.1% or 29.6% parameter reduction, lower memory usage |
+| Strict equivariance requirements | `spherical`, `partial-cartesian`, `pure-cartesian-sparse` or `pure-cartesian-ictd` | All these modes are strictly equivariant |
+| Fast experimental iteration | `pure-cartesian-ictd` | Fastest speed (CPU: up to 4.12x, GPU: up to 2.10x), strictly equivariant |
+| First attempt/comparison benchmark | `spherical` | Verify model correctness, performance benchmark |
+| Large-scale model deployment | `pure-cartesian-ictd` | Fewest parameters (72.1% reduction), fastest speed (CPU: up to 4.12x, GPU: up to 2.10x) |
+
+**Switch modes:**
+```bash
+# Spherical mode (default)
+mff-train --input-file data.xyz
+
+# Other modes
+mff-train --input-file data.xyz --tensor-product-mode partial-cartesian
+mff-train --input-file data.xyz --tensor-product-mode partial-cartesian-loose
+mff-train --input-file data.xyz --tensor-product-mode pure-cartesian-sparse
+mff-train --input-file data.xyz --tensor-product-mode pure-cartesian-ictd
+```
+
+**Note:** Training and evaluation must use the same mode!
+
+### Q: How to use SWA and EMA?
+
+**SWA (Stochastic Weight Averaging)** is used to fix loss weights in later training stages, avoiding weight drift:
+```bash
+# From epoch 100, fix a to 100, b to 10
+mff-train \
+    --input-file data.xyz \
+    -a 1.0 -b 10.0 \
+    --swa-start-epoch 100 --swa-a 100 --swa-b 10
+```
+
+**EMA (Exponential Moving Average)** is used to maintain sliding average of model parameters, improving stability:
+```bash
+# Enable EMA from epoch 150, decay coefficient 0.999
+mff-train \
+    --input-file data.xyz \
+    --ema-start-epoch 150 --ema-decay 0.999 \
+    --use-ema-for-validation \
+    --save-ema-model
+```
+
+**Use both SWA and EMA:**
+```bash
+mff-train \
+    --input-file data.xyz \
+    -a 1.0 -b 10.0 \
+    --swa-start-epoch 100 --swa-a 100 --swa-b 10 \
+    --ema-start-epoch 150 --ema-decay 0.999 --use-ema-for-validation --save-ema-model
+```
+
+**Recommended settings:**
+- SWA start time: 50%-70% of total epochs
+- EMA start time: 60%-80% of total epochs
+- EMA decay coefficient: 0.999 (default, larger is smoother)
+
+**Note:** When SWA starts, it will reset early stopping counter (patience_counter) and best validation loss (best_val_loss) to adapt to new loss weights.
+
+### Q: How to monitor training progress?
+
+**Console output:**
+- Validation results are output to console in real-time
+- Summary information for each epoch is output to console
+
+**Log files:**
+- `training_YYYYMMDD_HHMMSS.log` - Contains all detailed information
+  - Batch-level training metrics (every N batches, controlled by `--energy-log-frequency`)
+  - Detailed results during validation
+  - Gradient statistics (every N batches, controlled by `--grad-log-interval`)
+
+**CSV files:**
+- `training_YYYYMMDD_HH_loss.csv` - Training loss records
+- `val_energy_epoch{epoch}_batch{batch_count}.csv` - Validation set energy predictions
+- `val_force_epoch{epoch}_batch{batch_count}.csv` - Validation set force predictions
+
+**Real-time monitoring:**
+```bash
+# View log file in real-time
+tail -f training_*.log
+
+# View latest validation results
+tail -f training_*.log | grep "Validation"
+```
+
+
+
+## Complete Training Examples
+
+### Example 1: Quick Test (Small Dataset, Fast Verification)
+
+```bash
+mff-train \
+    --input-file small_test.xyz \
+    --data-dir data \
+    --epochs 100 \
+    --batch-size 4 \
+    --learning-rate 1e-3 \
+    --warmup-batches 100 \
+    --dump-frequency 50 \
+    --device cuda \
+    --dtype float32
+```
+
+**Use case:** Quickly verify code and parameter settings are correct
+
+### Example 2: Standard Training (Medium Dataset, Balanced Settings)
+
+```bash
+mff-train \
+    --input-file 2000.xyz \
+    --data-dir data \
+    --epochs 1000 \
+    --batch-size 8 \
+    --learning-rate 1e-3 \
+    --min-learning-rate 2e-5 \
+    --warmup-batches 1000 \
+    --warmup-start-ratio 0.1 \
+    --lr-decay-patience 1000 \
+    --lr-decay-factor 0.98 \
+    -a 1.0 \
+    -b 10.0 \
+    --update-param 1000 \
+    --patience 20 \
+    --dump-frequency 250 \
+    --device cuda \
+    --dtype float64
+```
+
+**Use case:** Recommended configuration for most cases
+
+### Example 3: Large-Scale Training (Large Dataset, Long Training)
+
+```bash
+mff-train \
+    --input-file large_dataset.xyz \
+    --data-dir data \
+    --epochs 5000 \
+    --batch-size 16 \
+    --learning-rate 1e-3 \
+    --min-learning-rate 5e-6 \
+    --warmup-batches 2000 \
+    --warmup-start-ratio 0.05 \
+    --lr-decay-patience 2000 \
+    --lr-decay-factor 0.99 \
+    -a 1.0 \
+    -b 10.0 \
+    --update-param 2000 \
+    --patience 50 \
+    --dump-frequency 500 \
+    --max-grad-norm 0.5 \
+    --vhat-clamp-interval 2000 \
+    --device cuda \
+    --dtype float64 \
+    --num-workers 16
+```
+
+**Use case:** Large-scale datasets, need long training to achieve best performance
+
+### Example 4: Fine-Tuning (Near Convergence, Small Step Adjustments)
+
+```bash
+mff-train \
+    --data-dir data \
+    --checkpoint combined_model.pth \
+    --epochs 500 \
+    --batch-size 8 \
+    --learning-rate 5e-5 \
+    --min-learning-rate 1e-6 \
+    --warmup-batches 500 \
+    --warmup-start-ratio 0.2 \
+    --lr-decay-patience 1000 \
+    --lr-decay-factor 0.995 \
+    -a 0.5 \
+    -b 15.0 \
+    --update-param 2000 \
+    --patience 30 \
+    --dump-frequency 100 \
+    --device cuda \
+    --dtype float64
+```
+
+**Use case:** Continue training from existing checkpoint, fine-tuning
+
+### Example 5: CPU Training (No GPU Environment)
+
+```bash
+mff-train \
+    --input-file 2000.xyz \
+    --data-dir data \
+    --epochs 500 \
+    --batch-size 4 \
+    --learning-rate 1e-3 \
+    --warmup-batches 500 \
+    --dump-frequency 100 \
+    --device cpu \
+    --dtype float32 \
+    --num-workers 4
+```
+
+**Use case:** Training on machines without GPU, use float32 and smaller batch size to accelerate
+
+## Notes
+
+1. **Memory Usage**: When using `H5Dataset`, data will be preloaded into memory, ensure sufficient memory. If memory is insufficient, consider using `OnTheFlyDataset` (but training speed will be slower).
+
+2. **GPU Memory**: If encountering GPU memory shortage (OOM errors), you can:
+   - Reduce `--batch-size` (e.g., from 8 to 4)
+   - Use `--dtype float32` instead of `float64`
+   - Reduce `--max-radius` (reduce number of neighbors)
+
+3. **Data Format**: Ensure XYZ file format is correct, especially energy and force units. Energy is usually in eV, forces in eV/Å.
+
+4. **Checkpoints**: Checkpoints will be saved periodically during training (frequency controlled by `--dump-frequency`), recommend regular backups. Final model will be saved at path specified by `--checkpoint`.
+
+5. **Logs**: Training logs are saved in `training_*.log` files, containing detailed training information. Console only shows validation results and important information, detailed logs please check log files.
+
+6. **Early Stopping**: If **weighted validation loss** (`a × energy loss + b × force loss`) does not improve for `--patience` consecutive epochs, training will automatically stop. This can prevent overfitting and save time. Early stopping criterion is consistent with total loss during training.
+
+7. **Automatic Weight Adjustment**: `a` and `b` will automatically adjust during training (every `--update-param` batches). `a` is multiplied by `--weight-a-growth` (default 1.01, i.e., 1% increase), `b` is multiplied by `--weight-b-decay` (default 0.99, i.e., 1% decrease), to balance the importance of energy and forces. If training is unstable, you can:
+   - Increase `--update-param` (reduce adjustment frequency)
+   - Use slower adjustment rate (`--weight-a-growth 1.005 --weight-b-decay 0.995`)
+   - Fix weights (set `--update-param` to a very large value, e.g., 1000000)
+
+8. **Learning Rate Strategy**: Learning rate goes through three stages:
+   - **Warmup stage** (first `--warmup-batches` batches): Linearly increases from `learning_rate × warmup_start_ratio` to `learning_rate`
+   - **Stable stage**: Maintains `learning_rate`
+   - **Decay stage**: If validation metrics don't improve, multiplied by `--lr-decay-factor` after every `--lr-decay-patience` batches
+
+
+
+## Tensor Product Mode Comparison
+
+**FusedSCEquiTensorPot supports six equivariant tensor product implementation modes**, each with different characteristics in speed, parameter count, and equivariance:
+
+1. **`spherical`**: e3nn-based spherical harmonics method (default, standard implementation)
+2. **`partial-cartesian`**: Cartesian coordinates + e3nn CG coefficients (strictly equivariant, partially uses e3nn's `wigner_3j` and `Irreps`)
+3. **`partial-cartesian-loose`**: Approximate equivariant (norm product approximation, partially uses e3nn's `Irreps` framework)
+4. **`pure-cartesian`**: Pure Cartesian \(3^L\) representation (strictly equivariant, very slow, fully self-implemented)
+5. **`pure-cartesian-sparse`**: Sparse pure Cartesian (strictly equivariant, parameter-optimized, fully self-implemented)
+6. **`pure-cartesian-ictd`**: ICTD irreps internal representation (strictly equivariant, fastest, fewest parameters, fully self-implemented)
+
+All modes maintain O(3) equivariance (including rotation and reflection). Comparison data below:
+
+### Mode Comparison Overview
+
+| Feature | Spherical | Partial-Cartesian | Partial-Cartesian-Loose | Pure-Cartesian | Pure-Cartesian-Sparse | Pure-Cartesian-ICTD |
+|---------|-----------|-------------------|------------------------|----------------|----------------------|---------------------|
+| Implementation | e3nn spherical harmonics | Cartesian coordinates + e3nn CG coefficients | Non-strict equivariant (norm product approximation, uses e3nn Irreps) | Pure Cartesian (3^L, δ/ε, fully self-implemented) | Sparse pure Cartesian (δ/ε, fully self-implemented) | ICTD irreps internal representation (fully self-implemented) |
+| Equivariance | ✅ Strictly equivariant | ✅ Strictly equivariant | ⚠️ Approximately equivariant | ✅ Strictly equivariant | ✅ Strictly equivariant | ✅ Strictly equivariant |
+| Speed (CPU, lmax=2) | 1.00x (baseline) | 1.06x | 1.33x | 0.06x (very slow) | 1.39x | **4.12x (fastest)** |
+| Speed (GPU, lmax=2)* | 1.00x (baseline) | 0.75x | 1.15x | 0.06x (very slow) | 1.17x | **2.10x (fastest)** |
+| Parameters (lmax=2) | 6,540,634 (100%) | 5,404,938 (82.6%) | 5,406,026 (82.7%) | 33,626,186 (514.0%) | 4,606,026 (70.4%) | 1,824,497 (27.9%) |
+| Parameter change | - | **17.4% reduction** | **17.3% reduction** | +414% | **29.6% reduction** | **72.1% reduction** |
+| Equivariance error (O(3), lmax=2) | ~1e-15 | ~1e-14 | ~1e-15 | ~1e-14 | ~1e-15 | ~1e-7 |
+| Recommended scenario | Default, highest precision | Strictly equivariant, balanced performance | Fast iteration (CPU), non-strict equivariance acceptable | Not recommended (slow) | Parameter optimization, strictly equivariant | **Fewest parameters, GPU fastest, strictly equivariant** |
+
+*GPU speed: Total training time (forward+backward) speedup ratio, relative to spherical. Test environment: RTX 3090, float64, N=32, E=256.
+
+### Usage
+
+**Select mode during training:**
+```bash
+# Spherical mode (default, highest precision)
+mff-train --input-file data.xyz --data-dir output
+
+# Cartesian mode (fast, fewer parameters)
+mff-train --input-file data.xyz --data-dir output --tensor-product-mode partial-cartesian
+```
+
+**Must use same mode during evaluation:**
+```bash
+# If training used cartesian
+mff-evaluate --checkpoint model.pth --tensor-product-mode partial-cartesian
+```
+
+### Detailed Performance Comparison
+
+#### CPU Test Results (channels=64, lmax=0 to 6, 32 atoms, 256 edges, float64)
+
+**Total training time speedup ratio (forward+backward, relative to spherical):**
+
+| lmax | partial-cartesian | partial-cartesian-loose | pure-cartesian | pure-cartesian-sparse | pure-cartesian-ictd |
+|------|------------------:|----------------------:|---------------:|---------------------:|-------------------:|
+| 0    |             1.06x |                  1.13x |           0.36x |                 1.07x |                **2.97x** |
+| 1    |             1.05x |                  1.37x |           0.13x |                 1.02x |                **3.33x** |
+| 2    |             1.06x |                  1.33x |           0.06x |                 1.39x |                **4.12x** |
+| 3    |             0.58x |                  0.70x |           0.02x |                 1.05x |                **2.68x** |
+| 4    |             0.37x |                  0.43x |        **FAILED** |                 0.97x |                **2.20x** |
+| 5    |             0.23x |                  0.28x |        **FAILED** |                 0.78x |                **1.81x** |
+| 6    |             0.16x |                  0.17x |        **FAILED** |                 0.53x |                **1.58x** |
+
+**Parameter count comparison (lmax=0 to 6):**
+
+| lmax | spherical | partial-cartesian | partial-cartesian-loose | pure-cartesian | pure-cartesian-sparse | pure-cartesian-ictd |
+|------|----------:|------------------:|----------------------:|---------------:|---------------------:|-------------------:|
+| 0    | 2,313,018 |        1,128,074 |            1,128,074 |      2,725,450 |           1,128,010 |             626,653 |
+| 2    | 6,540,634 |        5,404,938 |            5,406,026 |     33,626,186 |           4,606,026 |           1,824,497 |
+| 4    | 10,768,218 |       15,272,842 |           15,276,106 |         **FAILED** |           8,882,762 |           3,197,103 |
+| 6    | 14,995,802 |       33,926,666 |           33,933,194 |         **FAILED** |          13,159,498 |           4,844,335 |
+
+**Equivariance error comparison (O(3), including parity):**
+
+| lmax | spherical | partial-cartesian | partial-cartesian-loose | pure-cartesian | pure-cartesian-sparse | pure-cartesian-ictd |
+|------|----------:|------------------:|----------------------:|---------------:|---------------------:|-------------------:|
+| 0    | 3.33e-15  |        8.24e-16  |            6.39e-14  |      3.41e-15  |           4.34e-15  |           1.69e-12 |
+| 2    | 3.88e-15  |        1.87e-14  |            7.73e-16  |      3.08e-15  |           3.56e-14  |           7.73e-08 |
+| 4    | 1.27e-15  |        6.83e-15  |            1.00e-15  |       **FAILED** |           1.24e-14  |           3.50e-05 |
+| 6    | 3.26e-15  |        2.01e-15  |            5.82e-16  |       **FAILED** |           1.51e-15  |           1.00e-06 |
+
+#### GPU Test Results (channels=64, lmax=0 to 6, RTX 3090, float64, N=32, E=256)
+
+**Total training time speedup ratio (forward+backward, relative to spherical):**
+
+| lmax | partial-cartesian | partial-cartesian-loose | pure-cartesian | pure-cartesian-sparse | pure-cartesian-ictd |
+|------|------------------:|----------------------:|---------------:|---------------------:|-------------------:|
+| 0    |             0.96x |                  1.52x |           0.54x |                 1.17x |                **1.92x** |
+| 1    |             0.85x |                  1.33x |           0.16x |                 1.02x |                **1.97x** |
+| 2    |             0.75x |                  1.15x |           0.06x |                 1.17x |                **2.10x** |
+| 3    |             0.56x |                  0.81x |           0.02x |                 1.15x |                **1.91x** |
+| 4    |             0.38x |                  0.51x |        **FAILED** |                 0.99x |                **1.78x** |
+| 5    |             0.26x |                  0.32x |        **FAILED** |                 0.75x |                **1.44x** |
+| 6    |             0.17x |                  0.21x |        **FAILED** |                 0.46x |                **1.05x** |
+
+**Parameter count comparison (lmax=0 to 6):**
+
+| lmax | spherical | partial-cartesian | partial-cartesian-loose | pure-cartesian | pure-cartesian-sparse | pure-cartesian-ictd |
+|------|----------:|------------------:|----------------------:|---------------:|---------------------:|-------------------:|
+| 0    | 2,313,018 |        1,128,074 |            1,128,074 |      2,725,450 |           1,128,010 |             626,653 |
+| 2    | 6,540,634 |        5,404,938 |            5,406,026 |     33,626,186 |           4,606,026 |           1,824,497 |
+| 4    | 10,768,218 |       15,272,842 |           15,276,106 |         **FAILED** |           8,882,762 |           3,197,103 |
+| 6    | 14,995,802 |       33,926,666 |           33,933,194 |         **FAILED** |          13,159,498 |           4,844,335 |
+
+**Equivariance error comparison (O(3), including parity):**
+
+| lmax | spherical | partial-cartesian | partial-cartesian-loose | pure-cartesian | pure-cartesian-sparse | pure-cartesian-ictd |
+|------|----------:|------------------:|----------------------:|---------------:|---------------------:|-------------------:|
+| 0    | 1.03e-15  |        6.37e-16  |            1.20e-15  |      3.27e-15  |           9.31e-16  |           5.24e-08 |
+| 2    | 9.27e-16  |        1.97e-16  |            8.96e-16  |      3.18e-14  |           1.30e-15  |           7.18e-07 |
+| 4    | 9.16e-16  |        7.76e-14  |            4.26e-16  |       **FAILED** |           6.19e-16  |           7.16e-07 |
+| 6    | 4.77e-16  |        7.02e-16  |            5.65e-16  |       **FAILED** |           5.72e-16  |           1.11e-07 |
+
+**Performance Analysis:**
+- ✅ **All modes pass O(3) equivariance tests** (including parity/reflection), equivariance error < 1e-6
+- 🚀 **`pure-cartesian-ictd` is fastest on CPU at all lmax** (up to **4.12x speedup** at lmax=2)
+- 🚀 **`pure-cartesian-ictd` is fastest on GPU at all lmax** (up to **2.10x speedup** at lmax=2)
+- 🚀 **`pure-cartesian-sparse` performs stably on CPU/GPU** (0.53x - 1.39x, close to baseline)
+- 💾 **`pure-cartesian-ictd` always has fewest parameters** (27-32% of spherical)
+- 💾 **`pure-cartesian-sparse` has moderate parameters** (70-88% of spherical)
+- ⚠️ **`pure-cartesian` is very slow and fails at lmax≥4** (not recommended)
+- 📊 **CPU test environment**: channels=64, lmax=0-6, 32 atoms, 256 edges, float64
+- 📊 **GPU test environment**: channels=64, lmax=0-6, RTX 3090, float64, 32 atoms, 256 edges
+
+
+
+### Recommended Usage Scenarios
+
+**Use Spherical (default):**
+- ✅ Need highest precision and compatibility
+- ✅ Research/publishing papers (standard e3nn implementation)
+- ✅ First attempt/comparison benchmark
+- ✅ Small-scale datasets
+
+**Use Partial-Cartesian:**
+- ✅ Need strict equivariance but fewer parameters (17.4% reduction)
+- ✅ GPU memory constrained scenarios
+- ✅ Need to balance performance and equivariance
+
+**Use Partial-Cartesian-Loose:**
+- ✅ Fast experimental iteration (faster speed, CPU: 0.17x-1.37x, GPU: 0.21x-1.52x)
+- ⚠️ Scenarios where strict equivariance is not highly required (uses norm product approximation, not strictly equivariant)
+- ⚠️ Note: Although equivariance error < 1e-6, theoretically not strictly equivariant
+
+**Use Pure-Cartesian-Sparse (recommended for CPU/GPU training):**
+- ✅ **Stable performance on CPU** (0.53x - 1.39x, close to baseline)
+- ✅ **Faster on GPU** (**1.17x speedup** at lmax=2)
+- ✅ Moderate parameters (29.6% reduction, 70-88% of spherical)
+- ✅ Strictly equivariant (error ~1e-15, highest precision)
+- ✅ Best choice for balancing parameters and performance
+
+**Use Pure-Cartesian-ICTD (recommended for CPU/GPU training):**
+- ✅ **Fastest on CPU** (up to **4.12x speedup** at lmax=2, 1.58x - 4.12x at all lmax)
+- ✅ **Fastest on GPU** (up to **2.10x speedup** at lmax=2, 1.05x - 2.10x at all lmax)
+- ✅ Fewest parameters (72.1% reduction, 27-32% of spherical)
+- ✅ Strictly equivariant (error ~1e-7 to 1e-6, acceptable)
+- ✅ Extremely memory-constrained scenarios
+- ✅ Large-scale model deployment
+- 📊 **Best CPU performance**: Most obvious advantage at lmax ≤ 3 (2.68x - 4.12x speedup)
+- 📊 **Best GPU performance**: Most obvious advantage at lmax ≤ 3 (1.91x - 2.10x speedup)
+
+### Real Task Test Results
+
+**Dataset**: NEB (Nudged Elastic Band) data for five nitrogen oxide and carbon structure reaction paths, truncated to fmax=0.2, total 2,788 data points. Test set: 1-2 complete or incomplete data points selected for each reaction.
+
+**Test configuration**: 64 channels, lmax=2, float64
+
+<table>
+<thead>
+<tr>
+<th style="text-align:center">Method</th>
+<th style="text-align:center">Configuration</th>
+<th style="text-align:center">Mode</th>
+<th style="text-align:center">Energy RMSE<br/>(mev/atom)</th>
+<th style="text-align:center">Force RMSE<br/>(mev/Å)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td rowspan="3" style="text-align:center;vertical-align:middle"><strong>MACE</strong></td>
+<td style="text-align:center">Lmax=2, 64ch</td>
+<td style="text-align:center">-</td>
+<td style="text-align:center">0.13</td>
+<td style="text-align:center">11.6</td>
+</tr>
+<tr>
+<td style="text-align:center">Lmax=2, 128ch</td>
+<td style="text-align:center">-</td>
+<td style="text-align:center">0.12</td>
+<td style="text-align:center">11.3</td>
+</tr>
+<tr>
+<td style="text-align:center">Lmax=2, 198ch</td>
+<td style="text-align:center">-</td>
+<td style="text-align:center">0.24</td>
+<td style="text-align:center">15.1</td>
+</tr>
+<tr>
+<td rowspan="4" style="text-align:center;vertical-align:middle"><strong>FSCETP</strong></td>
+<td rowspan="4" style="text-align:center;vertical-align:middle">Lmax=2, 64ch</td>
+<td style="text-align:center"><strong>spherical</strong></td>
+<td style="text-align:center"><strong>0.044</strong> ⭐</td>
+<td style="text-align:center"><strong>7.4</strong> ⭐</td>
+</tr>
+<tr>
+<td style="text-align:center"><strong>partial-cartesian</strong></td>
+<td style="text-align:center">0.045</td>
+<td style="text-align:center"><strong>7.4</strong> ⭐</td>
+</tr>
+<tr>
+<td style="text-align:center">partial-cartesian-loose</td>
+<td style="text-align:center">0.048</td>
+<td style="text-align:center">8.4</td>
+</tr>
+<tr>
+<td style="text-align:center">pure-cartesian-ictd</td>
+<td style="text-align:center">0.046</td>
+<td style="text-align:center">9.0</td>
+</tr>
+</tbody>
+</table>
+
+**Result Analysis**:
+- **Energy accuracy comparison**: FSCETP reduces energy RMSE by 66.2% compared to MACE (64ch) (0.044 vs 0.13 mev/atom)
+- **Force accuracy comparison**: FSCETP reduces force RMSE by 36.2% compared to MACE (64ch) (7.4 vs 11.6 mev/Å)
+- **Best performance mode**: `spherical` and `partial-cartesian` modes achieve optimal accuracy (energy: 0.044-0.045 mev/atom, force: 7.4 mev/Å)
+- **Accuracy and efficiency balance**: `pure-cartesian-ictd` maintains near-optimal accuracy (energy: 0.046 mev/atom, force: 9.0 mev/Å) while reducing parameters by 72.1% and training speed by 2.10x (GPU, lmax=2)
+
+**Not recommended to use Pure-Cartesian:**
+- ❌ Very slow (CPU: 0.02x-0.36x, GPU: 0.02x-0.54x), largest parameters (+414%)
+- ❌ Fails at lmax≥4 (insufficient memory)
+- ❌ Only for research purposes, not recommended for practical use
+
+### Complete Example: Cartesian Mode + Multi-GPU + SWA + EMA
+
+```bash
+torchrun --nproc_per_node=4 -m molecular_force_field.cli.train \
+    --input-file large_dataset.xyz \
+    --data-dir data \
+    --tensor-product-mode partial-cartesian \
+    --distributed \
+    --epochs 2000 \
+    --batch-size 8 \
+    --lmax 2 \
+    --irreps-output-conv-channels 64 \
+    -a 1.0 -b 10.0 \
+    --swa-start-epoch 1000 --swa-a 100 --swa-b 10 \
+    --ema-start-epoch 1500 --ema-decay 0.999 --use-ema-for-validation --save-ema-model \
+    --patience 50 \
+    --device cuda
+```
+
+### Python API Usage
+
+```python
+from molecular_force_field.models import CartesianTransformerLayer
+from molecular_force_field.utils.config import ModelConfig
+
+config = ModelConfig(
+    max_atomvalue=10,
+    embedding_dim=16,
+    lmax=2,
+    channel_in=64,
+)
+
+# Create Cartesian model
+model = CartesianTransformerLayer(
+    max_embed_radius=config.max_radius,
+    main_max_radius=config.max_radius_main,
+    main_number_of_basis=config.number_of_basis_main,
+    hidden_dim_conv=config.channel_in,
+    hidden_dim_sh=config.get_hidden_dim_sh(),
+    hidden_dim=config.emb_number_main_2,
+    channel_in2=config.channel_in2,
+    embedding_dim=config.embedding_dim,
+    max_atomvalue=config.max_atomvalue,
+    output_size=config.output_size,
+    embed_size=config.embed_size,
+    main_hidden_sizes3=config.main_hidden_sizes3,
+    num_layers=config.num_layers,
+    function_type_main=config.function_type,
+    lmax=config.lmax,
+    device='cuda'
+).to('cuda')
+
+# Forward pass
+energy = model(pos, Z, batch, edge_src, edge_dst, edge_shifts, cell)
+forces = -torch.autograd.grad(energy.sum(), pos)[0]
+```
+
+### Cartesian Tensor Product API
+
+If you need to use Cartesian tensor product layers separately:
+
+```python
+from molecular_force_field.models import CartesianFullyConnectedTensorProduct
+
+# Create tensor product (similar to e3nn.o3.FullyConnectedTensorProduct)
+tp = CartesianFullyConnectedTensorProduct(
+    irreps_in1="64x0e + 64x1o + 64x2e",
+    irreps_in2="1x0e + 1x1o + 1x2e",
+    irreps_out="64x0e + 64x1o + 64x2e",
+    shared_weights=True,
+    internal_weights=True
+)
+
+# Forward pass
+out = tp(x1, x2)
+
+# Or use external weights
+tp_ext = CartesianFullyConnectedTensorProduct(
+    irreps_in1="64x0e + 64x1o + 64x2e",
+    irreps_in2="1x0e + 1x1o + 1x2e",
+    irreps_out="64x0e",
+    shared_weights=False,
+    internal_weights=False
+)
+weights = weight_network(edge_features)  # shape: (..., tp_ext.weight_numel)
+out = tp_ext(x1, x2, weights)
+```
+
