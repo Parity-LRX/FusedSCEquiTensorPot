@@ -249,19 +249,35 @@ def extract_data_blocks(file_path, elements=None):
                     vals[name] = parts[idx: idx + count]
                     idx += count
 
+                # Normalize property keys to lower-case for tolerant matching
+                vals_lower = {k.lower(): v for k, v in vals.items()}
+
                 # Species/symbol already known
-                pos_tokens = vals.get("pos", None)
+                pos_tokens = vals_lower.get("pos", None)
                 if pos_tokens is None or len(pos_tokens) != 3:
                     raise ValueError("missing pos in Properties")
                 x, y, z = (np.float64(pos_tokens[0]), np.float64(pos_tokens[1]), np.float64(pos_tokens[2]))
 
-                force_tokens = vals.get("force", None)
+                force_tokens = vals_lower.get("force", None)
+                if force_tokens is None:
+                    force_tokens = vals_lower.get("forces", None)
+                if force_tokens is None:
+                    force_tokens = vals_lower.get("f", None)
                 if force_tokens is not None and len(force_tokens) == 3:
                     fx, fy, fz = (np.float64(force_tokens[0]), np.float64(force_tokens[1]), np.float64(force_tokens[2]))
                 else:
-                    fx = fy = fz = np.float64(0.0)
+                    # Try split force components (fx, fy, fz)
+                    fx_t = vals_lower.get("fx", None)
+                    fy_t = vals_lower.get("fy", None)
+                    fz_t = vals_lower.get("fz", None)
+                    if fx_t is not None and fy_t is not None and fz_t is not None:
+                        fx, fy, fz = (np.float64(fx_t[0]), np.float64(fy_t[0]), np.float64(fz_t[0]))
+                    else:
+                        fx = fy = fz = np.float64(0.0)
 
-                z_tokens = vals.get("Z", None)
+                z_tokens = vals_lower.get("z", None)
+                if z_tokens is None:
+                    z_tokens = vals_lower.get("atomic_number", None)
                 if z_tokens is not None and len(z_tokens) == 1:
                     A = np.int64(z_tokens[0])
                 else:
@@ -270,17 +286,37 @@ def extract_data_blocks(file_path, elements=None):
                 # Fallback formats:
                 # sym x y z fx fy fz Z
                 # sym x y z fx fy fz
+                # sym x y z A fx fy fz
                 # sym x y z Z
                 x, y, z = np.float64(parts[1]), np.float64(parts[2]), np.float64(parts[3])
                 fx = fy = fz = np.float64(0.0)
                 A = np.int64(atomic_numbers.get(symbol, 0))
 
-                if len(parts) >= 7:
+                def _int_like(token):
+                    try:
+                        v = float(token)
+                        return abs(v - round(v)) < 1e-6
+                    except Exception:
+                        return False
+
+                if len(parts) >= 8:
+                    # Try: sym x y z fx fy fz Z
+                    if _int_like(parts[7]):
+                        fx = np.float64(parts[4])
+                        fy = np.float64(parts[5])
+                        fz = np.float64(parts[6])
+                        A = np.int64(float(parts[7]))
+                    # Try: sym x y z A fx fy fz
+                    elif _int_like(parts[4]):
+                        A = np.int64(float(parts[4]))
+                        fx = np.float64(parts[5])
+                        fy = np.float64(parts[6])
+                        fz = np.float64(parts[7])
+                elif len(parts) >= 7:
+                    # sym x y z fx fy fz
                     fx = np.float64(parts[4])
                     fy = np.float64(parts[5])
                     fz = np.float64(parts[6])
-                if len(parts) >= 8:
-                    A = np.int64(parts[7])
                 elif len(parts) == 5:
                     # sym x y z Z
                     A = np.int64(parts[4])

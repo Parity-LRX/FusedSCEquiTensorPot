@@ -61,6 +61,8 @@ def main():
                         help='Run MD simulation')
     parser.add_argument('--neb', action='store_true',
                         help='Run NEB calculation')
+    parser.add_argument('--phonon', action='store_true',
+                        help='Calculate phonon spectrum (Hessian matrix)')
     parser.add_argument('--dtype', type=str, default='float64',
                         choices=['float32', 'float64', 'float', 'double'],
                         help='Default dtype for tensors (float32 or float64, default: float64)')
@@ -97,11 +99,25 @@ def main():
     parser.add_argument('--neb-output', type=str, default='neb.traj',
                         help='Output trajectory file for NEB (default: neb.traj)')
     
+    # Phonon calculation parameters
+    parser.add_argument('--phonon-input', type=str, default='structure.xyz',
+                        help='Input structure file for phonon calculation (default: structure.xyz)')
+    parser.add_argument('--phonon-relax-fmax', type=float, default=0.01,
+                        help='Force convergence for structure relaxation before phonon calculation in eV/Å (default: 0.01)')
+    parser.add_argument('--phonon-output', type=str, default='phonon',
+                        help='Output prefix for phonon files (default: phonon). Will generate phonon_frequencies.txt and phonon_hessian.npy')
+    parser.add_argument('--phonon-no-relax', action='store_true',
+                        help='Skip structure relaxation before phonon calculation')
+    
     # Model architecture hyperparameters
     parser.add_argument('--max-atomvalue', type=int, default=10,
                         help='Maximum atomic number in atom embedding (default: 10)')
     parser.add_argument('--embedding-dim', type=int, default=16,
                         help='Atom embedding dimension (default: 16)')
+    parser.add_argument('--embed-size', type=int, nargs='+', default=[128, 128, 128],
+                        help='Hidden layer sizes for readout MLP (default: 128 128 128)')
+    parser.add_argument('--output-size', type=int, default=8,
+                        help='Output size for atom readout MLP (default: 8)')
     parser.add_argument('--lmax', type=int, default=2,
                         help='Maximum L value for spherical harmonics in irreps (default: 2). Controls the highest order of irreducible representations.')
     parser.add_argument('--irreps-output-conv-channels', type=int, default=None,
@@ -160,9 +176,12 @@ def main():
         dtype=config_dtype,
         max_atomvalue=args.max_atomvalue,
         embedding_dim=args.embedding_dim,
+        embed_size=args.embed_size,
+        output_size=args.output_size,
         lmax=args.lmax,
         irreps_output_conv_channels=args.irreps_output_conv_channels,
-        function_type=args.function_type
+        function_type=args.function_type,
+        max_radius=args.max_radius
     )
     
     # Atomic reference energies (E0)
@@ -213,6 +232,8 @@ def main():
     logging.info("Model Hyperparameters:")
     logging.info(f"  max_atomvalue: {config.max_atomvalue}")
     logging.info(f"  embedding_dim: {config.embedding_dim}")
+    logging.info(f"  embed_size: {config.embed_size}")
+    logging.info(f"  output_size: {config.output_size}")
     logging.info(f"  lmax: {config.lmax}")
     logging.info(f"  irreps_output_conv: {config.get_irreps_output_conv()}")
     logging.info(f"  function_type: {config.function_type}")
@@ -469,6 +490,83 @@ def main():
         metrics = evaluator.evaluate(data_loader, output_prefix=args.output_prefix)
         logging.info(f"Evaluation completed! Energy RMSE: {metrics['energy_rmse']:.6f}")
     
+    # Phonon calculation
+    if args.phonon:
+        from ase import Atoms
+        from ase.io import read, write
+        from ase.optimize import BFGS
+        from ase.data import atomic_masses, atomic_numbers
+        from ase.neighborlist import neighbor_list
+        
+        ref_energies_dict = {
+            k.item(): v.item()
+            for k, v in zip(config.atomic_energy_keys, config.atomic_energy_values)
+        }
+        calc = MyE3NNCalculator(e3trans, ref_energies_dict, device, args.max_radius)
+        
+        logging.info("=" * 60)
+        logging.info("Phonon Calculation")
+        logging.info("=" * 60)
+        logging.info(f"  Input structure: {args.phonon_input}")
+        logging.info(f"  Relaxation fmax: {args.phonon_relax_fmax} eV/Å")
+        logging.info(f"  Output prefix: {args.phonon_output}")
+        logging.info("=" * 60)
+        
+        # Read structure
+        if not os.path.exists(args.phonon_input):
+            raise FileNotFoundError(f"Input structure file not found: {args.phonon_input}")
+        
+        atoms = read(args.phonon_input)
+        atoms.calc = calc
+        
+        # Relax structure if needed
+        if not args.phonon_no_relax:
+            logging.info("Relaxing structure before phonon calculation...")
+            optimizer = BFGS(atoms, logfile=None)
+            optimizer.run(fmax=args.phonon_relax_fmax)
+            logging.info(f"Relaxation completed. Final forces: max={atoms.get_forces().max():.6f} eV/Å")
+        else:
+            logging.info("Skipping structure relaxation (--phonon-no-relax specified)")
+        
+        # Get atomic positions and numbers
+        pos = torch.tensor(atoms.get_positions(), dtype=torch.get_default_dtype(), device=device)
+        A = torch.tensor([atomic_numbers[symbol] for symbol in atoms.get_chemical_symbols()], 
+                         dtype=torch.long, device=device)
+        batch_idx = torch.zeros(len(atoms), dtype=torch.long, device=device)
+        
+        # Build graph (neighbors) using on-the-fly ASE neighbor list
+        cell_array = atoms.cell.array
+        pbc_flags = atoms.pbc
+        if cell_array is None or np.abs(cell_array).sum() <= 1e-9:
+            cell_array = np.eye(3) * 100.0
+            pbc_flags = [False, False, False]
+        atoms_nl = atoms.copy()
+        atoms_nl.cell = cell_array
+        atoms_nl.pbc = pbc_flags
+
+        edge_src_np, edge_dst_np, edge_shifts_np = neighbor_list('ijS', atoms_nl, args.max_radius)
+        edge_src = torch.tensor(edge_src_np, dtype=torch.long, device=device)
+        edge_dst = torch.tensor(edge_dst_np, dtype=torch.long, device=device)
+        edge_shifts = torch.tensor(edge_shifts_np, dtype=torch.float64, device=device)
+        cell = torch.tensor(cell_array, dtype=torch.get_default_dtype(), device=device).unsqueeze(0)
+        
+        # Compute Hessian
+        logging.info("Computing Hessian matrix...")
+        hessian = evaluator.compute_hessian(
+            pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell
+        )
+        
+        # Get atomic masses
+        masses = torch.tensor([atomic_masses[atomic_numbers[symbol]] for symbol in atoms.get_chemical_symbols()],
+                             dtype=torch.get_default_dtype())
+        
+        # Compute phonon spectrum
+        frequencies = evaluator.compute_phonon_spectrum(
+            hessian, masses, output_prefix=args.phonon_output
+        )
+        
+        logging.info("Phonon calculation completed!")
+    
     # MD simulation or NEB calculation
     if args.md_sim or args.neb:
         from ase import Atoms
@@ -486,6 +584,10 @@ def main():
         calc = MyE3NNCalculator(e3trans, ref_energies_dict, device, args.max_radius)
         
         if args.neb:
+            # Validate fmax parameter
+            if args.neb_fmax <= 0:
+                raise ValueError(f"Invalid --neb-fmax value: {args.neb_fmax}. Must be positive.")
+            
             # Create logfile for NEB optimization (records fmax and optimization details)
             neb_logfile = args.neb_output.replace('.traj', '.log').replace('.xyz', '.log')
             if neb_logfile == args.neb_output:
@@ -554,6 +656,9 @@ def main():
                 )
             
             optimizer.attach(log_neb_status, interval=1)
+            
+            # Log fmax value before optimization to confirm it's being used
+            logging.info(f"Starting NEB optimization with fmax={args.neb_fmax} eV/Å...")
             
             try:
                 optimizer.run(fmax=args.neb_fmax)

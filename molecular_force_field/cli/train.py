@@ -156,6 +156,9 @@ def setup_logging():
             # Suppress epoch training logs, but allow validation and important messages
             if 'Epoch' in msg and 'Validation' not in msg and 'Training started' not in msg and 'Training completed' not in msg and 'Early stopping' not in msg:
                 return False
+            # Note: Validation batch energy logs are controlled by log level:
+            # - logging.debug: only goes to file (console shows INFO+)
+            # - logging.info: goes to both file and console (if --log-val-batch-energy is set)
             return True
     
     # Console handler - only show validation and important messages
@@ -222,6 +225,10 @@ def main():
                         help='Default dtype for tensors (float32 or float64, default: float64)')
     parser.add_argument('--dump-frequency', type=int, default=250,
                         help='Frequency (in batches) for validation and model saving (default: 250)')
+    parser.add_argument('--train-eval-sample-ratio', type=float, default=0.2,
+                        help='Ratio of training set to evaluate during validation (0.0-1.0, default: 0.2). '
+                             'Set to 1.0 for full evaluation, or lower (e.g., 0.2 for 20%%) for faster validation. '
+                             'Useful for large datasets.')
     parser.add_argument('--energy-log-frequency', type=int, default=10,
                         help='Frequency (in batches) to log energy predictions (default: 10)')
     parser.add_argument('--energy-weight', '-a', type=float, default=1.0,
@@ -266,6 +273,9 @@ def main():
                              'Files: val_energy_epoch{N}_batch{M}.csv and val_force_epoch{N}_batch{M}.csv')
     parser.add_argument('--no-save-val-csv', dest='save_val_csv', action='store_false',
                         help='Disable saving validation CSV files to reduce I/O overhead.')
+    parser.add_argument('--log-val-batch-energy', action='store_true', default=False,
+                        help='Log validation batch energy predictions to console (default: False). '
+                             'If False, energy predictions are only logged to file, not console.')
     parser.add_argument('--force-shift-value', type=float, default=1.0,
                         help='Scaling factor for force labels (default: 1.0)')
 
@@ -310,6 +320,10 @@ def main():
                         help='Maximum atomic number in atom embedding (default: 10)')
     parser.add_argument('--embedding-dim', type=int, default=16,
                         help='Atom embedding dimension (default: 16)')
+    parser.add_argument('--embed-size', type=int, nargs='+', default=[128, 128, 128],
+                        help='Hidden layer sizes for readout MLP (default: 128 128 128)')
+    parser.add_argument('--output-size', type=int, default=8,
+                        help='Output size for atom readout MLP (default: 8)')
     parser.add_argument('--lmax', type=int, default=2,
                         help='Maximum L value for spherical harmonics in irreps (default: 2). Controls the highest order of irreducible representations.')
     parser.add_argument('--irreps-output-conv-channels', type=int, default=None,
@@ -544,9 +558,12 @@ def main():
         dtype=config_dtype,
         max_atomvalue=args.max_atomvalue,
         embedding_dim=args.embedding_dim,
+        embed_size=args.embed_size,
+        output_size=args.output_size,
         lmax=args.lmax,
         irreps_output_conv_channels=args.irreps_output_conv_channels,
-        function_type=args.function_type
+        function_type=args.function_type,
+        max_radius=args.max_radius
     )
     
     # Atomic reference energies (E0)
@@ -572,6 +589,8 @@ def main():
         logging.info("Model Hyperparameters:")
         logging.info(f"  max_atomvalue: {config.max_atomvalue}")
         logging.info(f"  embedding_dim: {config.embedding_dim}")
+        logging.info(f"  embed_size: {config.embed_size}")
+        logging.info(f"  output_size: {config.output_size}")
         logging.info(f"  lmax: {config.lmax}")
         logging.info(f"  irreps_output_conv: {config.get_irreps_output_conv()}")
         logging.info(f"  function_type: {config.function_type}")
@@ -768,7 +787,11 @@ def main():
         rank=rank,
         world_size=world_size,
         train_sampler=train_sampler,
+        val_sampler=val_sampler,
         save_val_csv=args.save_val_csv,
+        train_eval_sample_ratio=args.train_eval_sample_ratio,
+        log_val_batch_energy_to_console=args.log_val_batch_energy,
+        tensor_product_mode=args.tensor_product_mode,
     )
     
     # Start training

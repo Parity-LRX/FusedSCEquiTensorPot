@@ -38,6 +38,8 @@ class LAMMPSPotential:
                  atomic_energy_file: Optional[str] = None,
                  atomic_energy_keys: Optional[list] = None,
                  atomic_energy_values: Optional[list] = None,
+                 embed_size: Optional[list] = None,
+                 output_size: int = 8,
                  type_to_Z: Optional[Mapping[int, int]] = None):
         """
         Initialize LAMMPS potential calculator.
@@ -50,6 +52,8 @@ class LAMMPSPotential:
             atomic_energy_file: Path to CSV file with atomic energies (fitted_E0.csv)
             atomic_energy_keys: List of atomic numbers for custom E0
             atomic_energy_values: List of atomic energies (eV) corresponding to keys
+            embed_size: Hidden layer sizes for readout MLP
+            output_size: Output size for atom readout MLP
             type_to_Z: Optional mapping from LAMMPS atom type -> atomic number Z.
                 IMPORTANT: In LAMMPS, `type` is usually just a category label (1..Ntypes),
                 not the atomic number. If you don't provide this mapping, this interface
@@ -68,7 +72,7 @@ class LAMMPSPotential:
             if isinstance(dtype, str):
                 dtype = torch.float64 if dtype in ['float64', 'double'] else torch.float32
             
-            config = ModelConfig(dtype=dtype)
+            config = ModelConfig(dtype=dtype, embed_size=embed_size, output_size=output_size)
         
         # Load atomic energies
         if atomic_energy_keys is not None and atomic_energy_values is not None:
@@ -281,6 +285,8 @@ def lammps_potential_init(checkpoint_path: str, device: str = 'cuda',
                           atomic_energy_file: str = None,
                           atomic_energy_keys: list = None,
                           atomic_energy_values: list = None,
+                          embed_size: list = None,
+                          output_size: int = 8,
                           type_to_Z: dict = None,
                           **kwargs):
     """
@@ -293,6 +299,8 @@ def lammps_potential_init(checkpoint_path: str, device: str = 'cuda',
         atomic_energy_file: Path to CSV file with atomic energies
         atomic_energy_keys: List of atomic numbers for custom E0
         atomic_energy_values: List of atomic energies (eV) corresponding to keys
+        embed_size: Hidden layer sizes for readout MLP
+        output_size: Output size for atom readout MLP
         type_to_Z: Optional mapping dict from LAMMPS atom type -> atomic number Z
         **kwargs: Additional arguments (ignored)
     """
@@ -305,6 +313,8 @@ def lammps_potential_init(checkpoint_path: str, device: str = 'cuda',
         atomic_energy_file=atomic_energy_file,
         atomic_energy_keys=atomic_energy_keys,
         atomic_energy_values=atomic_energy_values,
+        embed_size=embed_size,
+        output_size=output_size,
         type_to_Z=type_to_Z
     )
     print(f"LAMMPS potential initialized with checkpoint: {checkpoint_path}")
@@ -320,6 +330,10 @@ if __name__ == '__main__':
     parser.add_argument('--max-radius', type=float, default=5.0, help='Max radius (Angstrom)')
     parser.add_argument('--atomic-energy-file', type=str, default=None,
                        help='Path to atomic energy CSV file')
+    parser.add_argument('--embed-size', type=int, nargs='+', default=None,
+                       help='Hidden layer sizes for readout MLP (default: 128 128 128)')
+    parser.add_argument('--output-size', type=int, default=8,
+                       help='Output size for atom readout MLP (default: 8)')
     
     args = parser.parse_args()
     
@@ -328,7 +342,9 @@ if __name__ == '__main__':
         args.checkpoint,
         device=args.device,
         max_radius=args.max_radius,
-        atomic_energy_file=args.atomic_energy_file
+        atomic_energy_file=args.atomic_energy_file,
+        embed_size=args.embed_size,
+        output_size=args.output_size
     )
     
     # Test with dummy data

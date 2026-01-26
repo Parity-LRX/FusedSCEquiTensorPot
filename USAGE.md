@@ -162,93 +162,134 @@ mff-train \
 **参数说明：**
 
 **数据参数：**
-- `--data-dir`: 数据目录，包含预处理文件（默认'data'）
-- `--input-file`: 输入XYZ文件路径，用于自动预处理（可选）
-- `--train-prefix`: 训练数据文件前缀（默认'train'）
-- `--val-prefix`: 验证数据文件前缀（默认'val'）
+- `--data-dir`: 数据目录，包含预处理文件（默认'data'）。所有预处理后的数据文件（如processed_train.h5, processed_val.h5）应在此目录下
+- `--input-file`: 输入XYZ文件路径，用于自动预处理（可选）。如果指定此参数且数据目录下没有预处理文件，会自动从XYZ文件进行预处理
+- `--train-prefix`: 训练数据文件前缀（默认'train'）。用于查找`processed_{train-prefix}.h5`等文件
+- `--val-prefix`: 验证数据文件前缀（默认'val'）。用于查找`processed_{val-prefix}.h5`等文件
+- `--max-radius`: 邻居搜索的最大半径（默认5.0 Å）。原子间距离超过此值不会被考虑为邻居。此参数在预处理和训练时都需要使用
 
-**基础参数：**
-- `--epochs`: 训练轮数（默认1000）
-- `--batch-size`: 批次大小（默认8）。如果GPU内存不足，可以减小此值（如4或2）
-- `--checkpoint`: 模型保存路径（默认'combined_model.pth'）。训练完成后会保存最终模型，训练过程中也会定期保存
-- `--device`: 设备（'cuda'或'cpu'，默认自动检测）。如果有GPU，强烈建议使用'cuda'
-- `--dump-frequency`: 验证和保存模型的频率（每N个batch，默认250）。每N个batch会进行一次验证并保存模型检查点
+**基础训练参数：**
+- `--epochs`: 训练轮数（默认1000）。训练会运行指定的epoch数，除非早停触发
+- `--batch-size`: 批次大小（默认8）。如果GPU内存不足，可以减小此值（如4或2）。注意：验证时batch-size固定为1
+- `--checkpoint`: 模型保存路径（默认'combined_model.pth'）。训练完成后会保存最终模型（最佳验证性能的模型）到`checkpoint/`目录下，文件名会包含张量积模式后缀（如`combined_model_pure_cartesian.pth`）。训练过程中也会定期保存中间checkpoint到`checkpoint/`目录
+- `--reset-loss-weights`: 从checkpoint恢复训练时，忽略保存的损失权重（a, b），使用命令行参数指定的值（默认False，即使用checkpoint中的权重）
+- `--device`: 设备（'cuda'或'cpu'，默认自动检测）。如果有GPU，强烈建议使用'cuda'。分布式训练时会自动为每个进程分配对应的GPU
+- `--dtype`: 张量数据类型（'float32'或'float64'，默认'float64'）。选项：'float32'/'float'（32位浮点，速度快但精度略低）或'float64'/'double'（64位浮点，精度高但速度较慢）
+- `--seed`: 随机种子（默认42）。用于确保实验可复现性。影响数据shuffle、train/val split等随机操作
+
+**验证和日志参数：**
+- `--dump-frequency`: 验证和保存模型的频率（每N个batch，默认250）。每N个batch会进行一次验证并保存模型检查点。注意：验证是基于batch_count触发的，不是固定在每个epoch结束时
+- `--train-eval-sample-ratio`: 验证时对训练集采样的比例（0.0-1.0，默认0.2）。设置为1.0表示评估整个训练集，设置为0.2表示只评估20%的训练集（更快）。对于大型数据集，建议使用较小的值以加快验证速度
 - `--energy-log-frequency`: 记录能量预测的频率（每N个batch，默认10）。这些日志只写入文件，不输出到控制台
-- `--dtype`: 张量数据类型（'float32'或'float64'，默认'float64'）。float64精度更高但速度较慢，float32速度更快但精度略低
-- `--patience`: 早停耐心值（默认20）。如果连续N个epoch**加权验证损失**（`a × 能量损失 + b × 受力损失`）没有改善，训练会自动停止
+- `--log-val-batch-energy`: 在控制台输出验证阶段每个batch的能量预测（默认False）。如果为False，验证batch能量信息只记录到日志文件，不输出到控制台；如果为True，会同时在控制台和日志文件中输出
+- `--save-val-csv`: 保存验证能量和力预测到CSV文件（默认False）。如果启用，验证结果会保存到`validation/`目录下，文件名为`val_energy_epoch{epoch}_batch{batch_count}.csv`和`val_force_epoch{epoch}_batch{batch_count}.csv`
+- `--no-save-val-csv`: 禁用保存验证CSV文件（与`--save-val-csv`互斥）。用于减少I/O开销
+
+**早停参数：**
+- `--patience`: 早停耐心值（默认20，单位：epoch）。如果连续N个epoch的验证损失（能量损失+力损失，未加权）没有改善，训练会自动停止。注意：早停使用的是未加权的验证损失，而不是加权损失（`a × 能量损失 + b × 力损失`）
 
 **学习率参数：**
-- `--learning-rate`: 目标学习率（默认2e-4）。这是预热后的学习率
-- `--min-learning-rate`: 最小学习率（默认1e-5）。学习率不会低于此值
+- `--learning-rate`: 目标学习率（默认1e-3）。这是预热后的学习率，也是训练过程中的主要学习率
+- `--min-learning-rate`: 最小学习率（默认2e-5）。学习率不会低于此值，即使经过多次衰减
 - `--warmup-batches`: 学习率预热的批次数（默认1000）。前N个batch学习率从`learning_rate × warmup_start_ratio`线性增长到`learning_rate`
-- `--warmup-start-ratio`: 预热期间学习率的起始比例（默认0.1）。例如，如果`--learning-rate 2e-4`和`--warmup-start-ratio 0.1`，则学习率会从`2e-5`线性增长到`2e-4`
+- `--warmup-start-ratio`: 预热期间学习率的起始比例（默认0.1）。例如，如果`--learning-rate 1e-3`和`--warmup-start-ratio 0.1`，则学习率会从`1e-4`线性增长到`1e-3`
 - `--lr-decay-patience`: 学习率衰减的间隔批次数（默认1000）。每N个batch后，如果验证指标没有改善，学习率会乘以`--lr-decay-factor`
-- `--lr-decay-factor`: 学习率衰减因子（默认0.98）。每次衰减时学习率乘以该值（0.98表示减少2%）
+- `--lr-decay-factor`: 学习率衰减因子（默认0.98）。每次衰减时学习率乘以该值（0.98表示减少2%）。学习率调度策略：如果验证损失在`lr-decay-patience`个batch内没有改善，学习率会乘以此因子
 
 **损失权重参数：**
-- `--energy-weight` (或 `-a`): 能量损失的初始权重（默认1.0）。总损失 = `a × 能量损失 + b × 受力损失`
-- `--force-weight` (或 `-b`): 受力损失的初始权重（默认10.0）。通常受力损失需要更大的权重，因为力的数量远多于能量
-- `--update-param`: 自动调整权重 `a` 和 `b` 的频率（每N个batch，默认1000）。每N个batch会根据 `--weight-a-growth` 和 `--weight-b-decay` 调整权重
+- `--energy-weight` (或 `-a`): 能量损失的初始权重（默认1.0）。总损失 = `a × 能量损失 + b × 受力损失`。训练过程中，`a`会根据`--weight-a-growth`自动增长
+- `--force-weight` (或 `-b`): 受力损失的初始权重（默认10.0）。通常受力损失需要更大的权重，因为力的数量远多于能量（每个原子有3个力分量）。训练过程中，`b`会根据`--weight-b-decay`自动衰减
+- `--update-param`: 自动调整权重 `a` 和 `b` 的频率（每N个batch，默认1000）。每N个batch会根据 `--weight-a-growth` 和 `--weight-b-decay` 调整权重。调整公式：`a = a × weight_a_growth`，`b = b × weight_b_decay`
 - `--weight-a-growth`: 能量权重 `a` 的增长率（默认1.01，即每次增长1%）。建议值：1.005（慢速，适合超长时间训练）、1.01（中速，推荐）、1.02（快速，适合短期训练）
 - `--weight-b-decay`: 受力权重 `b` 的衰减率（默认0.99，即每次减少1%）。建议值：0.995（慢速）、0.99（中速，推荐）、0.98（快速）
-- `--force-shift-value`: 受力标签的缩放系数（默认1.0）。如果力的单位需要转换，可以调整此值
+- `--a-min`: 能量权重 `a` 的最小值（可选，默认无限制）。如果设置了此值，`a`在增长时不会低于此值
+- `--a-max`: 能量权重 `a` 的最大值（可选，默认无限制）。如果设置了此值，`a`在增长时不会超过此值
+- `--b-min`: 受力权重 `b` 的最小值（可选，默认无限制）。如果设置了此值，`b`在衰减时不会低于此值
+- `--b-max`: 受力权重 `b` 的最大值（可选，默认无限制）。如果设置了此值，`b`在衰减时不会超过此值
+- `--force-shift-value`: 受力标签的缩放系数（默认1.0）。如果力的单位需要转换，可以调整此值。注意：此参数目前未在代码中使用，保留用于未来扩展
 
 **优化器参数：**
-- `--vhat-clamp-interval`: 优化器 `v_hat` 钳位的频率（每N个batch，默认2000）。用于防止Adam优化器的二阶矩估计过大
-- `--max-vhat-growth`: `v_hat` 的最大增长因子（默认5.0）。限制`v_hat`不超过历史最大值的N倍
-- `--max-grad-norm`: 梯度裁剪阈值（默认0.5）。如果梯度范数超过此值，会被裁剪到此值，防止梯度爆炸
-- `--grad-log-interval`: 记录梯度统计信息的频率（每N个batch，默认500）。用于监控训练稳定性
+- `--vhat-clamp-interval`: 优化器 `v_hat` 钳位的频率（每N个batch，默认2000）。用于防止Adam优化器的二阶矩估计（`v_hat`）过大。每N个batch会检查并限制`v_hat`的增长
+- `--max-vhat-growth`: `v_hat` 的最大增长因子（默认5.0）。限制`v_hat`不超过历史最大值的N倍，防止优化器不稳定
+- `--max-grad-norm`: 梯度裁剪阈值（默认0.5）。如果梯度范数超过此值，会被裁剪到此值，防止梯度爆炸。使用`torch.nn.utils.clip_grad_norm_`实现
+- `--grad-log-interval`: 记录梯度统计信息的频率（每N个batch，默认500）。用于监控训练稳定性。梯度统计信息（范数、最大值、最小值、平均值）会记录到日志文件中
 
 **数据处理参数：**
-- `--num-workers`: 数据处理的并行进程数（默认8）。预处理时使用全部，训练时DataLoader会自动分配（训练使用一半，验证使用四分之一）
-- `--max-radius`: 邻居搜索的最大半径（默认5.0 Å）。原子间距离超过此值不会被考虑为邻居
+- `--num-workers`: 数据处理的并行进程数（默认8）。预处理时使用全部进程数，训练时DataLoader会自动分配：训练DataLoader使用`max(1, num_workers // 2)`，验证DataLoader使用`max(1, num_workers // 4)`
 
 **模型架构超参数：**
-- `--max-atomvalue`: 原子嵌入的最大原子序数（默认10）。如果数据集包含原子序数 > 10 的元素，需要增大此值
-- `--embedding-dim`: 原子嵌入维度（默认16）。增大此值可以增强模型表达能力，但会增加计算量
-- `--lmax`: 球谐函数的最高阶数（默认2）。控制不可约表示的最高阶
-- `--irreps-output-conv-channels`: irreps_output_conv的通道数（默认64）。与`--lmax`共同决定irreps形式。例如：
+- `--max-atomvalue`: 原子嵌入的最大原子序数（默认10）。如果数据集包含原子序数 > 10 的元素，需要增大此值。例如，如果数据集包含Cl（原子序数17），需要设置`--max-atomvalue 17`
+- `--embedding-dim`: 原子嵌入维度（默认16）。增大此值可以增强模型表达能力，但会增加计算量和显存占用
+- `--embed-size`: 读出MLP的隐藏层大小（默认[128, 128, 128]）。可以指定多个值，例如`--embed-size 128 256 128`表示三层隐藏层，大小分别为128、256、128
+- `--output-size`: 原子读出MLP的输出大小（默认8）。这是每个原子的特征维度，用于后续的能量和力预测
+- `--lmax`: 球谐函数的最高阶数（默认2）。控制不可约表示的最高阶。增大`lmax`可以捕获更高阶的几何信息，但会显著增加计算量。常见值：1（快速，适合简单系统）、2（推荐，平衡性能和精度）、3（高精度，但计算量大）
+- `--irreps-output-conv-channels`: irreps_output_conv的通道数（可选，默认None，会使用config中的channel_in，通常为64）。与`--lmax`共同决定irreps形式。例如：
   - `lmax=2, channels=64` → "64x0e + 64x1o + 64x2e"
   - `lmax=1, channels=64` → "64x0e + 64x1o"
   - `lmax=3, channels=64` → "64x0e + 64x1o + 64x2e + 64x3o"
   - 增大通道数可以提升模型容量，但会显著增加显存和计算量
 - `--function-type`: 径向基函数类型（默认'gaussian'）。选项：
-  - `gaussian`: 高斯基函数（默认，平滑且易于优化）
+  - `gaussian`: 高斯基函数（默认，平滑且易于优化，推荐用于大多数场景）
   - `bessel`: 贝塞尔基函数（适合周期性系统）
   - `fourier`: 傅里叶基函数（适合周期性边界条件）
   - `cosine`: 余弦基函数
   - `smooth_finite`: 平滑有限支撑基函数
 - `--tensor-product-mode`: 等变张量积实现模式（默认'spherical'）。**本框架支持六种等变张量积模式**，选项：
-  - `spherical`: 使用 e3nn 球谐函数张量积（默认，精度高，标准实现）
+  - `spherical`: 使用 e3nn 球谐函数张量积（默认，精度高，标准实现，推荐用于大多数场景）
   - `partial-cartesian`: 笛卡尔坐标 + e3nn CG 系数（严格等变，部分使用 e3nn 的 `wigner_3j` 和 `Irreps`，参数量减少 17.4%）
-  - `partial-cartesian-loose`: 近似等变张量积（使用 norm product 近似，部分使用 e3nn 的 `Irreps` 框架，速度较快，参数量减少 17.3%）
-  - `pure-cartesian`: 纯笛卡尔张量积（\(3^L\) 表示，δ/ε 收缩，严格等变，速度极慢，参数量大，lmax≥4 时失败）
-  - `pure-cartesian-sparse`: 稀疏纯笛卡尔张量积（严格等变，参数量减少 29.6%，速度稳定）
-  - `pure-cartesian-ictd`: ICTD irreps 内部表示（严格等变，参数量最少减少 72.1%，速度最快，CPU: 最高 4.12x，GPU: 最高 2.10x）
+  - `partial-cartesian-loose`: 近似等变张量积（使用 norm product 近似，部分使用 e3nn 的 `Irreps` 框架，速度较快，参数量减少 17.3%，但非严格等变）
+  - `pure-cartesian`: 纯笛卡尔张量积（\(3^L\) 表示，δ/ε 收缩，严格等变，速度极慢，参数量大，lmax≥4 时失败，主要用于研究）
+  - `pure-cartesian-sparse`: 稀疏纯笛卡尔张量积（严格等变，参数量减少 29.6%，速度稳定，需要设置`--max-rank-other`和`--k-policy`）
+  - `pure-cartesian-ictd`: ICTD irreps 内部表示（严格等变，参数量最少减少 72.1%，速度最快，CPU: 最高 4.12x，GPU: 最高 2.10x，推荐用于大规模训练）
   
   详细性能对比和推荐场景见[张量积模式对比](#张量积模式对比)部分。
 
+**张量积模式特定参数（仅用于pure-cartesian-sparse和pure-cartesian-ictd）：**
+- `--max-rank-other`: 稀疏张量积的最大rank（仅用于`pure-cartesian-sparse`模式，默认1）。只允许`min(L1, L2) <= max_rank_other`的相互作用。增大此值允许更多相互作用，但会增加参数量和计算量
+- `--k-policy`: 稀疏张量积的K策略（仅用于`pure-cartesian-sparse`模式，默认'k0'）。选项：
+  - `k0`: 只保留k=0（促进更高rank，推荐）
+  - `k1`: 只保留k=1（收缩到更低rank）
+  - `both`: 保留k=0和k=1（更多相互作用，但计算量更大）
+- `--ictd-tp-path-policy`: ICTD张量积的路径策略（仅用于`pure-cartesian-ictd`模式，默认'full'）。选项：
+  - `full`: 保留所有CG允许的(l1,l2->l3)路径（推荐，性能最好）
+  - `max_rank_other`: 只保留`min(l1,l2) <= --ictd-tp-max-rank-other`的路径（减少参数量）
+- `--ictd-tp-max-rank-other`: ICTD路径剪枝的最大rank（仅用于`pure-cartesian-ictd`模式，当`--ictd-tp-path-policy=max_rank_other`时使用，默认None）。例如，设置为1时只保留标量/向量耦合
+
 **SWA 和 EMA 参数：**
-- `--swa-start-epoch`: 开始 SWA（Stochastic Weight Averaging）的 epoch。启用后，`a` 和 `b` 会在该 epoch 直接切换为 `--swa-a` 和 `--swa-b` 的值，并重置早停计数器
-- `--swa-a`: SWA 阶段的能量权重 `a`（必须与 `--swa-start-epoch` 一起使用）
-- `--swa-b`: SWA 阶段的力权重 `b`（必须与 `--swa-start-epoch` 一起使用）
-- `--ema-start-epoch`: 开始 EMA（Exponential Moving Average）的 epoch。EMA 模型是主模型参数的指数滑动平均，通常在训练后期启用
-- `--ema-decay`: EMA 衰减系数（默认 0.999）。越大越平滑，但响应越慢
-- `--use-ema-for-validation`: 使用 EMA 模型进行验证（而非主模型）
-- `--save-ema-model`: 在 checkpoint 中保存 EMA 模型权重
+- `--swa-start-epoch`: 开始 SWA（Stochastic Weight Averaging）的 epoch（可选，默认None）。启用后，`a` 和 `b` 会在该 epoch 直接切换为 `--swa-a` 和 `--swa-b` 的值，并重置早停计数器（`best_val_loss`重置为inf，`patience_counter`重置为0）。如果未设置，则使用连续的线性增长/衰减策略
+- `--swa-a`: SWA 阶段的能量权重 `a`（必须与 `--swa-start-epoch` 一起使用）。当达到`swa-start-epoch`时，`a`会直接切换为此值，不再继续增长
+- `--swa-b`: SWA 阶段的力权重 `b`（必须与 `--swa-start-epoch` 一起使用）。当达到`swa-start-epoch`时，`b`会直接切换为此值，不再继续衰减
+- `--ema-start-epoch`: 开始 EMA（Exponential Moving Average）的 epoch（可选，默认None）。EMA 模型是主模型参数的指数滑动平均，通常在训练后期启用（建议在总epoch数的60%-80%时启用）。如果未设置，EMA功能被禁用
+- `--ema-decay`: EMA 衰减系数（默认 0.999，范围0-1）。越大越平滑，但响应越慢。典型值：0.999（非常平滑，推荐）、0.99（较快响应）
+- `--use-ema-for-validation`: 使用 EMA 模型进行验证（而非主模型）。如果启用，验证时会使用EMA权重进行前向传播，通常能获得更稳定的验证结果
+- `--save-ema-model`: 在 checkpoint 中保存 EMA 模型权重。如果启用，checkpoint会包含`e3trans_ema_state_dict`，可以从checkpoint恢复EMA模型
 
 **分布式训练参数：**
-- `--distributed`: 启用分布式训练（DDP模式）。需要配合`torchrun`或`torch.distributed.launch`使用
-- `--local-rank`: 本地进程rank（通常由`torchrun`自动设置，无需手动指定）
-- `--backend`: 分布式后端（默认'nccl'用于GPU，'gloo'用于CPU）
+- `--distributed`: 启用分布式训练（DDP模式）。需要配合`torchrun`或`torch.distributed.launch`使用。启用后，训练会自动使用多GPU并行
+- `--local-rank`: 本地进程rank（默认-1，通常由`torchrun`自动设置，无需手动指定）。如果未设置，会从环境变量`LOCAL_RANK`读取
+- `--backend`: 分布式后端（默认'nccl'，选项：'nccl'或'gloo'）。'nccl'用于GPU训练（推荐），'gloo'用于CPU训练
+- `--init-method`: 分布式初始化方法（默认'env://'）。通常使用环境变量方式初始化，无需修改
+
+**原子参考能量（E0）参数：**
+- `--atomic-energy-file`: 包含原子参考能量的CSV文件路径（可选，默认None）。CSV文件应包含`Atom`和`E0`两列。如果未设置，会使用`{data-dir}/fitted_E0.csv`（由训练集最小二乘拟合得到）
+- `--atomic-energy-keys`: 原子序数列表（可选，必须与`--atomic-energy-values`一起使用）。例如：`--atomic-energy-keys 1 6 7 8`表示H、C、N、O
+- `--atomic-energy-values`: 对应的原子参考能量值（eV，可选，必须与`--atomic-energy-keys`一起使用）。例如：`--atomic-energy-values -430.53 -821.03 -1488.19 -2044.35`
 
 **训练输出：**
-- `combined_model.pth` - 模型检查点
-- `combined_model_epoch{epoch}_batch_count{batch_count}.pth` - 定期保存的模型（频率由`--dump-frequency`控制，默认每250个batch保存一次）
-- `training_YYYYMMDD_HHMMSS.log` - 训练日志（包含详细的batch级别信息）
-- `training_YYYYMMDD_HH_loss.csv` - 损失记录
-- `val_energy_epoch{epoch}_batch{batch_count}.csv` - 验证集能量预测（频率与模型保存一致）
-- `val_force_epoch{epoch}_batch{batch_count}.csv` - 验证集力预测（频率与模型保存一致）
+
+所有输出文件会保存在当前工作目录下：
+
+**模型检查点（保存在`checkpoint/`目录）：**
+- `checkpoint/combined_model_{tensor_product_mode}.pth` - 最终模型（最佳验证性能的模型，文件名包含张量积模式后缀，如`_spherical`、`_pure_cartesian`等）
+- `checkpoint/combined_model_epoch{epoch}_batch_count{batch_count}_{tensor_product_mode}.pth` - 定期保存的中间模型（频率由`--dump-frequency`控制，默认每250个batch保存一次）
+
+**验证结果（保存在`validation/`目录，仅当启用`--save-val-csv`时）：**
+- `validation/val_energy_epoch{epoch}_batch{batch_count}.csv` - 验证集能量预测（包含Target_Energy、Predicted_Energy、Delta三列）
+- `validation/val_force_epoch{epoch}_batch{batch_count}.csv` - 验证集力预测（包含Fx_True、Fy_True、Fz_True、Fx_Pred、Fy_Pred、Fz_Pred六列）
+
+**日志和记录文件（保存在当前目录）：**
+- `training_YYYYMMDD_HHMMSS.log` - 训练日志（包含详细的batch级别信息，使用RotatingFileHandler，每个文件最大1GB，保留5个备份）
+- `loss.csv` - 损失记录（包含每个验证点的训练和验证指标，如loss、RMSE、MAE等）
 
 ### 步骤 3: 评估模型
 
@@ -593,6 +634,179 @@ nebtools.plot_band()
 6. **周期性边界条件**：如果输入结构包含晶胞信息，会自动使用 PBC
 7. **插值方法**：使用改进的切线方法（improved tangent）进行路径插值
 8. **优化器**：使用 FIRE 优化器，对 NEB 优化特别有效
+
+#### 3.4 声子谱计算（Phonon Spectrum）
+
+计算声子谱（Hessian 矩阵、振动频率）。支持非周期性和周期性体系，默认使用 ASE on-the-fly 邻居构建。
+
+**基本用法：**
+```bash
+mff-evaluate \
+    --checkpoint combined_model.pth \
+    --phonon \
+    --phonon-input structure.xyz \
+    --device cuda
+```
+
+**完整参数示例：**
+```bash
+mff-evaluate \
+    --checkpoint combined_model.pth \
+    --phonon \
+    --phonon-input structure.xyz \
+    --phonon-relax-fmax 0.01 \
+    --phonon-output my_phonon \
+    --max-radius 5.0 \
+    --atomic-energy-file fitted_E0.csv \
+    --device cuda
+```
+
+**声子谱参数说明：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--phonon` | False | 启用声子谱计算（必需标志） |
+| `--phonon-input` | `structure.xyz` | 输入结构文件（XYZ 格式） |
+| `--phonon-relax-fmax` | 0.01 | 结构优化力收敛阈值 (eV/Å) |
+| `--phonon-output` | `phonon` | 输出文件前缀（生成 `{prefix}_hessian.npy` 和 `{prefix}_frequencies.txt`） |
+| `--phonon-no-relax` | False | 跳过结构优化（如果结构已优化） |
+| `--max-radius` | 5.0 | 邻居搜索最大半径 (Å) |
+| `--atomic-energy-file` | `fitted_E0.csv` | 原子参考能量文件（CSV 格式，包含 Atom 和 E0 列） |
+
+**声子谱工作流程：**
+1. 加载输入结构（`--phonon-input`）
+2. 可选：使用 BFGS 优化器进行结构优化（除非使用 `--phonon-no-relax`）
+3. 使用 ASE on-the-fly 邻居列表构建图结构（自动处理周期性边界条件）
+4. 计算 Hessian 矩阵（能量对位置的二阶导数，形状：`[N_atoms * 3, N_atoms * 3]`）
+5. 从 Hessian 矩阵计算声子频率（通过动力学矩阵对角化）
+6. 保存结果到文件
+
+**输出文件：**
+- `{prefix}_hessian.npy` - Hessian 矩阵（NumPy 格式，单位：eV/Å²）
+- `{prefix}_frequencies.txt` - 声子频率列表（单位：cm⁻¹，负值表示虚频/不稳定模式）
+
+**输出文件格式：**
+
+`{prefix}_frequencies.txt` 格式示例：
+```
+# Phonon frequencies (cm⁻¹)
+# Negative values indicate imaginary frequencies (unstable modes)
+# Index    Frequency (cm⁻¹)
+     0       1234.567890
+     1        987.654321
+     2        456.789012
+   ...
+```
+
+**示例 1：非周期性体系（分子）**
+```bash
+mff-evaluate \
+    --checkpoint best_model.pth \
+    --phonon \
+    --phonon-input water.xyz \
+    --phonon-relax-fmax 0.01 \
+    --phonon-output water_phonon \
+    --device cuda
+```
+
+**示例 2：周期性体系（晶体）**
+```bash
+mff-evaluate \
+    --checkpoint best_model.pth \
+    --phonon \
+    --phonon-input crystal.xyz \
+    --phonon-relax-fmax 0.01 \
+    --phonon-output crystal_phonon \
+    --max-radius 5.0 \
+    --device cuda
+```
+
+**示例 3：跳过结构优化（已优化结构）**
+```bash
+mff-evaluate \
+    --checkpoint best_model.pth \
+    --phonon \
+    --phonon-input pre_relaxed.xyz \
+    --phonon-no-relax \
+    --phonon-output phonon \
+    --device cuda
+```
+
+**示例 4：高精度计算（更严格的优化）**
+```bash
+mff-evaluate \
+    --checkpoint best_model.pth \
+    --phonon \
+    --phonon-input structure.xyz \
+    --phonon-relax-fmax 0.005 \
+    --phonon-output phonon_high_precision \
+    --dtype float64 \
+    --device cuda
+```
+
+**查看和分析结果：**
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+
+# 读取 Hessian 矩阵
+hessian = np.load('phonon_hessian.npy')
+print(f"Hessian shape: {hessian.shape}")
+print(f"Hessian range: [{hessian.min():.6f}, {hessian.max():.6f}] eV/Å²")
+
+# 检查对称性
+is_symmetric = np.allclose(hessian, hessian.T, atol=1e-4)
+print(f"Hessian symmetric: {is_symmetric}")
+
+# 读取频率
+frequencies = []
+with open('phonon_frequencies.txt', 'r') as f:
+    for line in f:
+        if line.strip() and not line.startswith('#'):
+            parts = line.split()
+            if len(parts) >= 2:
+                freq = float(parts[1])
+                frequencies.append(freq)
+
+frequencies = np.array(frequencies)
+print(f"\nTotal modes: {len(frequencies)}")
+print(f"Real modes (≥0): {np.sum(frequencies >= 0)}")
+print(f"Imaginary modes (<0): {np.sum(frequencies < 0)}")
+print(f"Frequency range: [{frequencies.min():.2f}, {frequencies.max():.2f}] cm⁻¹")
+
+# 绘制频率分布
+plt.figure(figsize=(10, 6))
+plt.hist(frequencies[frequencies >= 0], bins=50, alpha=0.7, label='Real frequencies')
+if np.any(frequencies < 0):
+    plt.hist(frequencies[frequencies < 0], bins=20, alpha=0.7, label='Imaginary frequencies', color='red')
+plt.xlabel('Frequency (cm⁻¹)', fontsize=12)
+plt.ylabel('Count', fontsize=12)
+plt.title('Phonon Frequency Distribution', fontsize=14)
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.savefig('phonon_frequencies.png', dpi=300)
+plt.close()
+```
+
+**注意事项：**
+1. **结构优化**：计算前建议先优化结构到能量最小值（默认启用）。如果结构未优化，可能出现虚频（负频率）
+2. **周期性边界条件**：如果输入结构包含晶胞信息（`Lattice` 属性），会自动使用 PBC 和 on-the-fly 邻居构建
+3. **邻居构建**：默认使用 ASE on-the-fly 邻居列表，自动处理非周期性和周期性体系
+4. **大系统**：对于 >100 原子的系统，Hessian 计算可能较慢（O(N²) 复杂度）
+5. **原子能量**：需要提供正确的原子参考能量（通过 `--atomic-energy-file` 或训练时生成的 `fitted_E0.csv`）
+6. **虚频**：如果出现虚频（负值），说明结构不稳定，需要进一步优化或检查结构
+7. **Hessian 对称性**：理论上 Hessian 矩阵应该是对称的，数值误差通常 < 1e-4
+8. **单位**：
+   - Hessian 矩阵：eV/Å²
+   - 频率：cm⁻¹
+   - 实频：正值（稳定模式）
+   - 虚频：负值（不稳定模式）
+
+**依赖要求：**
+```bash
+pip install scipy  # 声子谱计算需要（用于矩阵对角化）
+pip install ase    # 结构处理和邻居列表（通常已安装）
+```
 
 ## Python API 使用
 
@@ -963,6 +1177,125 @@ print(f"  Forward barrier:   {e_saddle - e_initial:.4f} eV")
 print(f"  Reverse barrier:   {e_saddle - e_final:.4f} eV")
 print(f"  Reaction energy:   {e_final - e_initial:.4f} eV")
 print("=" * 60)
+```
+
+### 示例 6: 声子谱计算（Hessian 和频率）
+
+```python
+from ase.io import read
+from ase.optimize import BFGS
+from ase.data import atomic_masses, atomic_numbers
+from ase.neighborlist import neighbor_list
+from molecular_force_field.evaluation.calculator import MyE3NNCalculator
+from molecular_force_field.evaluation.evaluator import Evaluator
+from molecular_force_field.models import E3_TransformerLayer_multi
+from molecular_force_field.utils.config import ModelConfig
+import torch
+import numpy as np
+
+# 加载模型
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+checkpoint = torch.load('combined_model.pth', map_location=device)
+
+config = ModelConfig()
+config.load_atomic_energies_from_file('fitted_E0.csv')
+
+e3trans = E3_TransformerLayer_multi(...).to(device)
+e3trans.load_state_dict(checkpoint['e3trans_state_dict'])
+e3trans.eval()
+
+# 创建计算器和评估器
+ref_energies_dict = {
+    k.item(): v.item()
+    for k, v in zip(config.atomic_energy_keys, config.atomic_energy_values)
+}
+calc = MyE3NNCalculator(e3trans, ref_energies_dict, device, max_radius=5.0)
+
+class SimpleDataset:
+    def restore_force(self, x):
+        return x
+    def restore_energy(self, x):
+        return x
+
+dataset = SimpleDataset()
+evaluator = Evaluator(
+    model=e3trans,
+    dataset=dataset,
+    device=device,
+    atomic_energy_keys=config.atomic_energy_keys,
+    atomic_energy_values=config.atomic_energy_values,
+)
+
+# 读取结构
+atoms = read('structure.xyz')
+atoms.calc = calc
+
+# 可选：优化结构
+print("Relaxing structure...")
+optimizer = BFGS(atoms, logfile=None)
+optimizer.run(fmax=0.01)
+print(f"Relaxation completed. Final forces: max={atoms.get_forces().max():.6f} eV/Å")
+
+# 准备数据
+pos = torch.tensor(atoms.get_positions(), dtype=torch.get_default_dtype(), device=device)
+A = torch.tensor([atomic_numbers[symbol] for symbol in atoms.get_chemical_symbols()], 
+                 dtype=torch.long, device=device)
+batch_idx = torch.zeros(len(atoms), dtype=torch.long, device=device)
+
+# 构建图（使用 ASE on-the-fly 邻居列表）
+cell_array = atoms.cell.array
+pbc_flags = atoms.pbc
+if cell_array is None or np.abs(cell_array).sum() <= 1e-9:
+    cell_array = np.eye(3) * 100.0
+    pbc_flags = [False, False, False]
+
+atoms_nl = atoms.copy()
+atoms_nl.cell = cell_array
+atoms_nl.pbc = pbc_flags
+
+edge_src_np, edge_dst_np, edge_shifts_np = neighbor_list('ijS', atoms_nl, max_radius=5.0)
+edge_src = torch.tensor(edge_src_np, dtype=torch.long, device=device)
+edge_dst = torch.tensor(edge_dst_np, dtype=torch.long, device=device)
+edge_shifts = torch.tensor(edge_shifts_np, dtype=torch.float64, device=device)
+cell = torch.tensor(cell_array, dtype=torch.get_default_dtype(), device=device).unsqueeze(0)
+
+# 计算 Hessian 矩阵
+print("Computing Hessian matrix...")
+hessian = evaluator.compute_hessian(
+    pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell
+)
+
+print(f"Hessian shape: {hessian.shape}")
+print(f"Hessian range: [{hessian.min():.6f}, {hessian.max():.6f}] eV/Å²")
+
+# 检查对称性
+is_symmetric = torch.allclose(hessian, hessian.T, atol=1e-4)
+print(f"Hessian symmetric: {is_symmetric}")
+
+# 获取原子质量
+masses = torch.tensor([atomic_masses[atomic_numbers[symbol]] 
+                      for symbol in atoms.get_chemical_symbols()],
+                     dtype=torch.get_default_dtype())
+
+# 计算声子谱
+print("Computing phonon spectrum...")
+frequencies = evaluator.compute_phonon_spectrum(
+    hessian, masses, output_prefix='phonon'
+)
+
+print(f"\nPhonon calculation completed!")
+print(f"Total modes: {len(frequencies)}")
+print(f"Real modes: {np.sum(frequencies >= 0)}")
+print(f"Imaginary modes: {np.sum(frequencies < 0)}")
+print(f"Frequency range: [{frequencies.min():.2f}, {frequencies.max():.2f}] cm⁻¹")
+
+# 分析结果
+if np.any(frequencies < 0):
+    print(f"\n⚠️  Warning: {np.sum(frequencies < 0)} imaginary frequencies detected!")
+    print("   This indicates the structure may not be at a local minimum.")
+    print("   Consider further optimization or checking the structure.")
+else:
+    print("\n✅ All frequencies are real (structure is stable).")
 ```
 
 ## 常见问题
@@ -1528,11 +1861,12 @@ mff-train \
 **控制台输出：**
 - 验证结果会实时输出到控制台
 - 每个epoch的摘要信息会输出到控制台
+- 验证阶段每个batch的能量预测（由`--log-val-batch-energy`控制，默认False，只记录到日志文件）
 
 **日志文件：**
 - `training_YYYYMMDD_HHMMSS.log` - 包含所有详细信息
   - Batch级别的训练指标（每N个batch，由`--energy-log-frequency`控制）
-  - 验证时的详细结果
+  - 验证时的详细结果（包括每个batch的能量预测，无论`--log-val-batch-energy`设置如何）
   - 梯度统计信息（每N个batch，由`--grad-log-interval`控制）
 
 **CSV文件：**
@@ -1677,7 +2011,7 @@ mff-train \
 
 4. **检查点**: 训练过程中会定期保存检查点（频率由`--dump-frequency`控制），建议定期备份。最终模型会保存在`--checkpoint`指定的路径。
 
-5. **日志**: 训练日志保存在 `training_*.log` 文件中，包含详细的训练信息。控制台只显示验证结果和重要信息，详细日志请查看日志文件。
+5. **日志**: 训练日志保存在 `training_*.log` 文件中，包含详细的训练信息。控制台只显示验证结果和重要信息，详细日志请查看日志文件。验证阶段每个batch的能量预测默认只记录到日志文件，如需在控制台显示，请使用 `--log-val-batch-energy` 参数。
 
 6. **早停**: 如果**加权验证损失**（`a × 能量损失 + b × 受力损失`）连续`--patience`个epoch没有改善，训练会自动停止。这可以防止过拟合并节省时间。早停依据与训练时的总损失保持一致。
 

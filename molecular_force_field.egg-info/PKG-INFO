@@ -506,7 +506,7 @@ All modes pass O(3) equivariance tests (including parity/reflection, error < 1e-
 - **Best Balance**: Use `pure-cartesian-sparse` (**1.17x faster**, 29.6% fewer params, strict equivariance)
 - **Avoid**: `pure-cartesian` (too slow, fails at lmax≥4)
 
-For detailed performance comparison and recommendations, see [USAGE.md](USAGE.md#张量积模式对比).
+For detailed performance comparison and recommendations, see [USAGE.md](USAGE.md#tensor-product-mode-comparison).
 
 ### Real-World Task Performance
 
@@ -517,11 +517,11 @@ For detailed performance comparison and recommendations, see [USAGE.md](USAGE.md
 <table>
 <thead>
 <tr>
-<th style="text-align:center">方法</th>
-<th style="text-align:center">配置</th>
-<th style="text-align:center">模式</th>
-<th style="text-align:center">能量 RMSE<br/>(mev/atom)</th>
-<th style="text-align:center">力 RMSE<br/>(mev/Å)</th>
+<th style="text-align:center">Method</th>
+<th style="text-align:center">Configuration</th>
+<th style="text-align:center">Mode</th>
+<th style="text-align:center">Energy RMSE<br/>(mev/atom)</th>
+<th style="text-align:center">Force RMSE<br/>(mev/Å)</th>
 </tr>
 </thead>
 <tbody>

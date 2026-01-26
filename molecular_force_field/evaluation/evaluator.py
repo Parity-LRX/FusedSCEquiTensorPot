@@ -214,3 +214,156 @@ class Evaluator:
             'force_rmse': val_force_rmse,
             'force_mae': val_force_mae,
         }
+    
+    def compute_hessian(self, pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell):
+        """
+        Compute Hessian matrix (second derivative of energy with respect to positions).
+        
+        Args:
+            pos: Atomic positions [N_atoms, 3]
+            A: Atomic numbers [N_atoms]
+            batch_idx: Batch indices [N_atoms]
+            edge_src: Edge source indices
+            edge_dst: Edge destination indices
+            edge_shifts: Edge shifts
+            cell: Unit cell tensor
+            
+        Returns:
+            hessian: Hessian matrix [N_atoms * 3, N_atoms * 3]
+        """
+        self.model.eval()
+        
+        pos = pos.to(self.device)
+        A = A.to(self.device)
+        batch_idx = batch_idx.to(self.device)
+        edge_src = edge_src.to(self.device)
+        edge_dst = edge_dst.to(self.device)
+        edge_shifts = edge_shifts.to(self.device)
+        cell = cell.to(self.device)
+        
+        pos.requires_grad_(True)
+        
+        n_atoms = pos.shape[0]
+        hessian = torch.zeros(n_atoms * 3, n_atoms * 3, dtype=pos.dtype, device=self.device)
+        
+        # Compute energy
+        mapped_A = map_tensor_values(A, self.keys, self.values).to(self.device)
+        E_offset = scatter(mapped_A, batch_idx, dim=0, reduce='sum')
+        
+        E_per_atom = self.model(pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
+        E_conv = scatter(E_per_atom, batch_idx, dim=0, reduce='sum')
+        E_total = E_conv.view(-1) + E_offset
+        
+        # Compute forces (first derivatives)
+        forces = -torch.autograd.grad(
+            E_total.sum(), pos, create_graph=True, retain_graph=True
+        )[0]  # [N_atoms, 3]
+        
+        # Compute Hessian by differentiating forces
+        forces_flat = forces.view(-1)  # [N_atoms * 3]
+        
+        logging.info(f"Computing Hessian matrix ({n_atoms * 3} x {n_atoms * 3})...")
+        for i in range(n_atoms * 3):
+            if (i + 1) % 10 == 0 or i == 0:
+                logging.info(f"  Computing column {i + 1}/{n_atoms * 3}")
+            
+            # Compute gradient of force[i] with respect to all positions
+            # Only retain graph if not the last iteration
+            retain = (i < n_atoms * 3 - 1)
+            grad_force_i = torch.autograd.grad(
+                forces_flat[i],
+                pos,
+                retain_graph=retain,
+                create_graph=False
+            )[0]  # [N_atoms, 3]
+            
+            # Fill Hessian column
+            hessian[:, i] = grad_force_i.view(-1)
+        
+        return hessian
+    
+    def compute_phonon_spectrum(self, hessian, masses, output_prefix='phonon'):
+        """
+        Compute phonon frequencies from Hessian matrix.
+        
+        Args:
+            hessian: Hessian matrix [N_atoms * 3, N_atoms * 3] in eV/Å²
+            masses: Atomic masses [N_atoms] in amu
+            output_prefix: Prefix for output files
+            
+        Returns:
+            frequencies: Phonon frequencies in cm⁻¹
+        """
+        import numpy as np
+        try:
+            from scipy.linalg import eigh
+        except ImportError:
+            raise ImportError("scipy is required for phonon calculation. Install it with: pip install scipy")
+        
+        hessian_np = hessian.detach().cpu().numpy()
+        masses_np = masses.numpy() if isinstance(masses, torch.Tensor) else np.array(masses)
+        
+        n_atoms = len(masses_np)
+        
+        # Convert units: eV/Å² to J/m², then to dynamical matrix
+        # 1 eV = 1.602176634e-19 J
+        # 1 Å = 1e-10 m
+        # So 1 eV/Å² = 1.602176634e-19 / (1e-10)² = 1.602176634e1 J/m²
+        ev_to_j_per_m2 = 1.602176634e1
+        
+        # Mass in kg: 1 amu = 1.66053906660e-27 kg
+        amu_to_kg = 1.66053906660e-27
+        
+        # Build mass matrix
+        mass_matrix = np.zeros((n_atoms * 3, n_atoms * 3))
+        for i in range(n_atoms):
+            mass_val = masses_np[i] * amu_to_kg
+            mass_matrix[3*i:3*i+3, 3*i:3*i+3] = np.eye(3) * mass_val
+        
+        # Compute dynamical matrix: D = M^(-1/2) * H * M^(-1/2)
+        mass_inv_sqrt = np.linalg.inv(np.sqrt(mass_matrix))
+        dynamical_matrix = mass_inv_sqrt @ (hessian_np * ev_to_j_per_m2) @ mass_inv_sqrt
+        
+        # Diagonalize dynamical matrix
+        eigenvalues, eigenvectors = eigh(dynamical_matrix)
+        
+        # Convert eigenvalues to frequencies
+        # ω² = λ, so ω = sqrt(λ)
+        # Frequency in Hz: ω = sqrt(λ) rad/s
+        # Frequency in cm⁻¹: ν = ω / (2π * c) where c = 2.99792458e10 cm/s
+        c_cm_per_s = 2.99792458e10  # Speed of light in cm/s
+        
+        # Handle negative eigenvalues (unstable modes)
+        frequencies_cm1 = np.zeros_like(eigenvalues)
+        for i, eigval in enumerate(eigenvalues):
+            if eigval >= 0:
+                omega_rad_per_s = np.sqrt(eigval)
+                frequencies_cm1[i] = omega_rad_per_s / (2 * np.pi * c_cm_per_s)
+            else:
+                # Imaginary frequency (unstable mode)
+                omega_rad_per_s = np.sqrt(-eigval)
+                frequencies_cm1[i] = -omega_rad_per_s / (2 * np.pi * c_cm_per_s)
+        
+        # Sort frequencies
+        sorted_indices = np.argsort(frequencies_cm1)
+        frequencies_sorted = frequencies_cm1[sorted_indices]
+        
+        # Save results
+        np.save(f"{output_prefix}_hessian.npy", hessian_np)
+        
+        with open(f"{output_prefix}_frequencies.txt", 'w') as f:
+            f.write("# Phonon frequencies (cm⁻¹)\n")
+            f.write("# Negative values indicate imaginary frequencies (unstable modes)\n")
+            f.write("# Index    Frequency (cm⁻¹)\n")
+            for idx, freq in enumerate(frequencies_sorted):
+                f.write(f"{idx:6d}    {freq:12.6f}\n")
+        
+        logging.info(f"Phonon calculation completed!")
+        logging.info(f"  Total modes: {len(frequencies_sorted)}")
+        logging.info(f"  Real modes: {np.sum(frequencies_sorted >= 0)}")
+        logging.info(f"  Imaginary modes: {np.sum(frequencies_sorted < 0)}")
+        logging.info(f"  Frequency range: {frequencies_sorted[frequencies_sorted >= 0].min():.2f} to {frequencies_sorted[frequencies_sorted >= 0].max():.2f} cm⁻¹")
+        logging.info(f"  Saved Hessian to: {output_prefix}_hessian.npy")
+        logging.info(f"  Saved frequencies to: {output_prefix}_frequencies.txt")
+        
+        return frequencies_sorted

@@ -97,8 +97,12 @@ class Trainer:
         rank=0,
         world_size=1,
         train_sampler=None,
+        val_sampler=None,
         save_val_csv=False,
         use_checkpoint_loss_weights=True,
+        train_eval_sample_ratio=0.2,
+        log_val_batch_energy_to_console=False,
+        tensor_product_mode='spherical',
     ):
         """
         Initialize trainer.
@@ -148,12 +152,28 @@ class Trainer:
                 (default: True). If False, only metrics are logged but CSV files are not saved.
             use_checkpoint_loss_weights: Whether to use loss weights (a, b) from checkpoint when loading.
                 If True (default), use checkpoint values. If False, use the values passed to __init__.
+            tensor_product_mode: Tensor product mode used (default: 'spherical').
+                Options: 'spherical', 'partial-cartesian', 'partial-cartesian-loose',
+                'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-ictd'
         """
         self.distributed = distributed
         self.rank = rank
         self.world_size = world_size
         self.train_sampler = train_sampler
+        self.val_sampler = val_sampler
         self.is_main_process = (rank == 0)
+        self.tensor_product_mode = tensor_product_mode
+        
+        # Convert tensor_product_mode to suffix format (e.g., 'pure-cartesian' -> '_pure_cartesian')
+        mode_suffix_map = {
+            'spherical': '_spherical',
+            'partial-cartesian': '_partial_cartesian',
+            'partial-cartesian-loose': '_partial_cartesian_loose',
+            'pure-cartesian': '_pure_cartesian',
+            'pure-cartesian-sparse': '_pure_cartesian_sparse',
+            'pure-cartesian-ictd': '_pure_cartesian_ictd',
+        }
+        self.tensor_product_suffix = mode_suffix_map.get(tensor_product_mode, '_spherical')
         
         self.model = model
         self.e3trans = e3trans
@@ -197,9 +217,31 @@ class Trainer:
         self.save_ema_model = save_ema_model
         self.ema_enabled = False
         self.e3trans_ema = None  # will be initialized when EMA starts
-        self.checkpoint_path = checkpoint_path
+        # Create checkpoint directory if it doesn't exist
+        self.checkpoint_dir = 'checkpoint'
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        
+        # Create validation results directory if save_val_csv is enabled
         self.save_val_csv = save_val_csv  # Control whether to save val_energy.csv and val_force.csv
+        if self.save_val_csv:
+            self.val_results_dir = 'validation'
+            os.makedirs(self.val_results_dir, exist_ok=True)
+        else:
+            self.val_results_dir = None
+        
+        # Store original checkpoint path for loading, but save new checkpoints to checkpoint directory
+        self.checkpoint_path = checkpoint_path
+        # If checkpoint_path is a filename (not a full path), save it in checkpoint directory
+        if os.path.dirname(checkpoint_path) == '':
+            base_name = os.path.splitext(os.path.basename(checkpoint_path))[0]
+            self.checkpoint_save_path = os.path.join(self.checkpoint_dir, f'{base_name}{self.tensor_product_suffix}.pth')
+        else:
+            # If it's a full path, extract filename and save to checkpoint directory
+            base_name = os.path.splitext(os.path.basename(checkpoint_path))[0]
+            self.checkpoint_save_path = os.path.join(self.checkpoint_dir, f'{base_name}{self.tensor_product_suffix}.pth')
         self.use_checkpoint_loss_weights = use_checkpoint_loss_weights  # Whether to use checkpoint a/b
+        self.train_eval_sample_ratio = train_eval_sample_ratio  # Ratio of training set to evaluate (0.0-1.0)
+        self.log_val_batch_energy_to_console = log_val_batch_energy_to_console  # Whether to log validation batch energy to console (default: False, only to file)
         
         # Initialize loss tracking for CSV
         self.loss_csv_path = 'loss.csv'
@@ -211,6 +253,7 @@ class Trainer:
         self.best_val_loss = float('inf')
         self.patience_counter = 0
         self.resumed_from_checkpoint = False
+        self.best_checkpoint_path = None  # Path to the best checkpoint file
         
         if atomic_energy_keys is None:
             self.keys = torch.tensor([1, 6, 7, 8]).to(device)
@@ -297,6 +340,10 @@ class Trainer:
                 if self.save_ema_model:
                     logging.info("    Will save EMA model in checkpoint")
             logging.info(f"  Validation Frequency: every {self.dump_frequency} batches")
+            if self.train_eval_sample_ratio < 1.0:
+                logging.info(f"  Train Evaluation: {self.train_eval_sample_ratio*100:.1f}% sampling (faster validation)")
+            else:
+                logging.info(f"  Train Evaluation: Full dataset (100%)")
             logging.info(f"  Energy Log Frequency: every {self.energy_log_frequency} batches")
             logging.info(f"  Early Stopping Patience: {self.patience} epochs")
             if self.distributed:
@@ -304,8 +351,18 @@ class Trainer:
             logging.info("=" * 60)
         
         # Load checkpoint if exists
+        # Try original path first, then try checkpoint directory
+        checkpoint_to_load = None
         if os.path.exists(checkpoint_path):
-            self.load_checkpoint(checkpoint_path)
+            checkpoint_to_load = checkpoint_path
+        else:
+            # Try in checkpoint directory
+            checkpoint_in_dir = os.path.join(self.checkpoint_dir, os.path.basename(checkpoint_path))
+            if os.path.exists(checkpoint_in_dir):
+                checkpoint_to_load = checkpoint_in_dir
+        
+        if checkpoint_to_load:
+            self.load_checkpoint(checkpoint_to_load)
     
     def load_checkpoint(self, checkpoint_path):
         """Load checkpoint and restore training state."""
@@ -425,6 +482,13 @@ class Trainer:
                 for p in self.e3trans_ema.parameters():
                     p.requires_grad_(False)
                 self.ema_enabled = True
+                
+                # Sync EMA enabled state across all processes
+                if self.distributed:
+                    ema_enabled_tensor = torch.tensor([1 if self.ema_enabled else 0], dtype=torch.int, device=self.device)
+                    dist.broadcast(ema_enabled_tensor, src=0)
+                    self.ema_enabled = bool(ema_enabled_tensor.item())
+                
                 if self.is_main_process:
                     logging.info(f"EMA initialized at epoch {epoch} with decay={self.ema_decay}")
             
@@ -435,11 +499,23 @@ class Trainer:
                 self.b = self.swa_b
                 self.swa_applied = True
 
-                # IMPORTANT: early-stopping metric is a*val_energy_loss + b*val_force_loss.
+                # IMPORTANT: early-stopping metric is energy_loss + force_loss (unweighted).
                 # When we switch (a, b), the metric scale/priority changes, so we should
                 # reset early-stopping state to avoid premature stopping.
                 self.patience_counter = 0
                 self.best_val_loss = float('inf')
+                self.best_checkpoint_path = None  # Reset best checkpoint path when SWA is applied
+
+                # Sync SWA state across all processes
+                if self.distributed:
+                    swa_applied_tensor = torch.tensor([1 if self.swa_applied else 0], dtype=torch.int, device=self.device)
+                    dist.broadcast(swa_applied_tensor, src=0)
+                    self.swa_applied = bool(swa_applied_tensor.item())
+                    # Sync a and b values
+                    ab_tensor = torch.tensor([self.a, self.b], dtype=torch.float64, device=self.device)
+                    dist.broadcast(ab_tensor, src=0)
+                    self.a = ab_tensor[0].item()
+                    self.b = ab_tensor[1].item()
 
                 if self.is_main_process:
                     logging.info(
@@ -448,7 +524,9 @@ class Trainer:
                     )
             elif self.swa_start_epoch is None or epoch < self.swa_start_epoch:
                 # Continuous growth/decay (only if SWA not applied yet)
-                if self.batch_count % self.update_param == 0:
+                # Update weights on rank 0, then broadcast to all processes
+                weights_updated = False
+                if self.is_main_process and self.batch_count % self.update_param == 0:
                     self.a *= self.weight_a_growth
                     self.b *= self.weight_b_decay
                     # Optional clamps (enabled only if user provides bounds)
@@ -460,6 +538,14 @@ class Trainer:
                         self.b = max(self.b, self.b_min)
                     if self.b_max is not None:
                         self.b = min(self.b, self.b_max)
+                    weights_updated = True
+                
+                # Sync loss weights (a, b) across all processes after update
+                if self.distributed:
+                    ab_tensor = torch.tensor([self.a, self.b], dtype=torch.float64, device=self.device)
+                    dist.broadcast(ab_tensor, src=0)
+                    self.a = ab_tensor[0].item()
+                    self.b = ab_tensor[1].item()
             
             self.optimizer.zero_grad()
             
@@ -600,20 +686,8 @@ class Trainer:
                     )
             
             if self.batch_count % self.dump_frequency == 0:
-                # Calculate average training loss up to this point for logging
-                current_train_energy_loss = np.mean(total_batch_energy_loss) if total_batch_energy_loss else 0
-                current_train_force_loss = np.mean(total_batch_force_loss) if total_batch_force_loss else 0
-                current_train_total_loss = np.mean(total_batch_loss) if total_batch_loss else 0
-                current_train_energy_rmse = np.mean(total_batch_energy_rmse) if total_batch_energy_rmse else 0
-                current_train_force_rmse = np.mean(total_batch_force_rmse) if total_batch_force_rmse else 0
-                
-                self.validate(epoch, {
-                    'train_total_loss': current_train_total_loss,
-                    'train_energy_loss': current_train_energy_loss,
-                    'train_force_loss': current_train_force_loss,
-                    'train_energy_rmse': current_train_energy_rmse,
-                    'train_force_rmse': current_train_force_rmse,
-                })
+                full_train_metrics = self.compute_full_train_metrics(epoch)
+                self.validate(epoch, full_train_metrics)
         
         # Log epoch summary
         epoch_end_time = time.time()
@@ -687,6 +761,10 @@ class Trainer:
             epoch: Current epoch number
             train_metrics: Dictionary containing training metrics at this batch count
         """
+        # Set epoch for distributed sampler to ensure consistent data sharding
+        if self.distributed and self.val_sampler is not None:
+            self.val_sampler.set_epoch(epoch)
+        
         self.model.eval()
         self.e3trans.eval()  # DDP model's eval() will call internal module's eval()
         
@@ -770,7 +848,10 @@ class Trainer:
                 if self.is_main_process:
                     restored_pred = self.val_dataset.restore_energy(E_mean_val[0].item())
                     restored_target = self.val_dataset.restore_energy(target_energies[0].item())
-                    logging.info(f"Batch {batch_idx_loader + 1}/{total_batches} Sample -> Pred: {restored_pred:.4f} , True: {restored_target:.4f}")
+                    # Use debug level if console output is disabled (will only go to file)
+                    # Use info level if console output is enabled
+                    log_level = logging.info if self.log_val_batch_energy_to_console else logging.debug
+                    log_level(f"Batch {batch_idx_loader + 1}/{total_batches} Sample -> Pred: {restored_pred:.4f} , True: {restored_target:.4f}")
         
         # Check if we have any validation data on this process
         local_has_data = len(val_E_preds) > 0
@@ -830,34 +911,41 @@ class Trainer:
         
         # Calculate all metrics (restore units consistent with original train-val.py)
         val_energy_rmse = torch.sqrt(F.mse_loss(all_E_preds, all_E_targets)).item()
-        val_energy_rmse = self.val_dataset.restore_force(val_energy_rmse)  # Restore units
+        val_energy_rmse = self.val_dataset.restore_energy(val_energy_rmse)  # Restore units
         
         val_energy_mae = F.l1_loss(all_E_preds, all_E_targets).item()
-        val_energy_mae = self.val_dataset.restore_force(val_energy_mae)  # Restore units
+        val_energy_mae = self.val_dataset.restore_energy(val_energy_mae)  # Restore units
         
         val_energy_rmse_avg = torch.sqrt(F.mse_loss(all_E_avg_preds, all_E_avg_targets)).item()
-        val_energy_rmse_avg = self.val_dataset.restore_force(val_energy_rmse_avg)  # Restore units
+        val_energy_rmse_avg = self.val_dataset.restore_energy(val_energy_rmse_avg)  # Restore units
         
         val_energy_mae_avg = F.l1_loss(all_E_avg_preds, all_E_avg_targets).item()
-        val_energy_mae_avg = self.val_dataset.restore_force(val_energy_mae_avg)  # Restore units
+        val_energy_mae_avg = self.val_dataset.restore_energy(val_energy_mae_avg)  # Restore units
         
         val_energy_loss = F.mse_loss(all_E_avg_preds, all_E_avg_targets).item()  # For logging
         
-        # Force metrics (already restored in loop)
+        # Force metrics (already restored in loop, but restore again for consistency)
         val_force_rmse = torch.sqrt(F.mse_loss(all_F_preds.view(-1), all_F_targets.view(-1))).item()
+        val_force_rmse = self.val_dataset.restore_force(val_force_rmse)  # Restore units for consistency
         val_force_mae = F.l1_loss(all_F_preds.view(-1), all_F_targets.view(-1)).item()
+        val_force_mae = self.val_dataset.restore_force(val_force_mae)  # Restore units for consistency
         val_force_loss = F.mse_loss(all_F_preds.view(-1), all_F_targets.view(-1)).item()  # For early stopping
         
-        # Log validation results (consistent with original train-val.py format)
-        # Only log on main process
+        # Calculate current validation loss for early stopping: energy_loss + force_loss (unweighted)
+        current_val_loss = val_energy_loss + val_force_loss
+
+        # Log validation results (only on main process)
         if self.is_main_process:
             logging.info(f"""
-                                "Energy Loss Val (MSE)": {val_energy_loss},
-                                "Energy RMSE Val": {val_energy_rmse},
-                                "Energy RMSE avg Val": {val_energy_rmse_avg},
-                                "Energy MAE avg Val": {val_energy_mae_avg},
-                                "Force MAE Val": {val_force_mae},
-                                "Force RMSE Val":  {val_force_rmse},
+                                "Val Loss (MSE)": {val_energy_loss},
+                                "Val Force Loss (MSE)": {val_force_loss},
+                                "Val Total Loss (E+F, unweighted)": {current_val_loss},
+                                "Val Energy RMSE": {val_energy_rmse},
+                                "Val Energy MAE": {val_energy_mae},
+                                "Val Energy RMSE/atom": {val_energy_rmse_avg},
+                                "Val Energy MAE/atom": {val_energy_mae_avg},
+                                "Val Force RMSE":  {val_force_rmse},
+                                "Val Force MAE": {val_force_mae},
                                 "Current learning rate": {self.optimizer.param_groups[0]['lr']},
                                 "a (energy weight)": {self.a},
                                 "b (force weight)": {self.b}
@@ -872,7 +960,8 @@ class Trainer:
                     "Predicted_Energy": all_E_preds.numpy(),
                     "Delta": (all_E_preds - all_E_targets).numpy()
                 })
-                energy_save_path = f"val_energy_epoch{epoch}_batch{self.batch_count}.csv"
+                energy_filename = f"val_energy_epoch{epoch}_batch{self.batch_count}.csv"
+                energy_save_path = os.path.join(self.val_results_dir, energy_filename)
                 df_energy_val.to_csv(energy_save_path, index=False)
                 
                 f_pred_np = all_F_preds.numpy()
@@ -882,13 +971,11 @@ class Trainer:
                     "Fx_True": f_true_np[:, 0], "Fy_True": f_true_np[:, 1], "Fz_True": f_true_np[:, 2],
                     "Fx_Pred": f_pred_np[:, 0], "Fy_Pred": f_pred_np[:, 1], "Fz_Pred": f_pred_np[:, 2]
                 })
-                force_save_path = f"val_force_epoch{epoch}_batch{self.batch_count}.csv"
+                force_filename = f"val_force_epoch{epoch}_batch{self.batch_count}.csv"
+                force_save_path = os.path.join(self.val_results_dir, force_filename)
                 df_force_val.to_csv(force_save_path, index=False)
         
-        # Early stopping - use weighted combination of energy and force loss
-        # Calculate current validation loss as: a * energy_loss + b * force_loss
-        current_val_loss = self.a * val_energy_loss + self.b * val_force_loss
-        
+        # Early stopping - use unweighted sum of energy and force loss (energy_loss + force_loss)
         if self.distributed:
             # Broadcast current_val_loss from rank 0 to ensure consistency
             val_loss_tensor = torch.tensor([current_val_loss], device=self.device)
@@ -900,6 +987,34 @@ class Trainer:
         if current_val_loss_synced < self.best_val_loss:
             self.best_val_loss = current_val_loss_synced
             self.patience_counter = 0
+            
+            # Save best checkpoint when validation loss improves
+            if self.is_main_process:
+                # Extract state_dict from DDP model if needed
+                if self.distributed:
+                    e3trans_state_dict = self.e3trans.module.state_dict()
+                else:
+                    e3trans_state_dict = self.e3trans.state_dict()
+                
+                best_checkpoint_dict = {
+                    'e3trans_state_dict': e3trans_state_dict,
+                    'a': self.a,
+                    'b': self.b,
+                    'batch_count': self.batch_count,
+                    'epoch': epoch,
+                    'best_val_loss': self.best_val_loss,
+                    'patience_counter': self.patience_counter,
+                    'swa_applied': self.swa_applied,
+                    'ema_enabled': self.ema_enabled,
+                }
+                
+                if self.save_ema_model and self.ema_enabled and self.e3trans_ema is not None:
+                    best_checkpoint_dict['e3trans_ema_state_dict'] = self.e3trans_ema.state_dict()
+                
+                # Save best checkpoint to a temporary file
+                self.best_checkpoint_path = os.path.join(self.checkpoint_dir, 'best_model_temp.pth')
+                torch.save(best_checkpoint_dict, self.best_checkpoint_path)
+                logging.info(f"New best validation loss: {self.best_val_loss:.6f} - Best checkpoint saved")
         else:
             self.patience_counter += 1
         
@@ -913,18 +1028,27 @@ class Trainer:
         record = {
             'epoch': epoch,
             'batch_count': self.batch_count,
+            'learning_rate': self.optimizer.param_groups[0]['lr'],
+            'a': self.a,
+            'b': self.b,
+            'train_total_loss': 0,
+            'train_energy_loss': 0,
+            'train_force_loss': 0,
+            'train_energy_rmse': 0,
+            'train_energy_mae': 0,
+            'train_energy_rmse_avg': 0,
+            'train_energy_mae_avg': 0,
+            'train_force_rmse': 0,
+            'train_force_mae': 0,
             'val_total_loss': current_val_loss_synced if self.distributed else current_val_loss,
             'val_energy_loss': val_energy_loss,
             'val_force_loss': val_force_loss,
             'val_energy_rmse': val_energy_rmse,
-            'val_energy_rmse_avg': val_energy_rmse_avg,
             'val_energy_mae': val_energy_mae,
+            'val_energy_rmse_avg': val_energy_rmse_avg,
             'val_energy_mae_avg': val_energy_mae_avg,
             'val_force_rmse': val_force_rmse,
             'val_force_mae': val_force_mae,
-            'learning_rate': self.optimizer.param_groups[0]['lr'],
-            'a': self.a,
-            'b': self.b,
         }
         
         # Add training metrics if provided
@@ -934,15 +1058,11 @@ class Trainer:
                 'train_energy_loss': train_metrics.get('train_energy_loss', 0),
                 'train_force_loss': train_metrics.get('train_force_loss', 0),
                 'train_energy_rmse': train_metrics.get('train_energy_rmse', 0),
+                'train_energy_mae': train_metrics.get('train_energy_mae', 0),
+                'train_energy_rmse_avg': train_metrics.get('train_energy_rmse_avg', 0),
+                'train_energy_mae_avg': train_metrics.get('train_energy_mae_avg', 0),
                 'train_force_rmse': train_metrics.get('train_force_rmse', 0),
-            })
-        else:
-            record.update({
-                'train_total_loss': 0,
-                'train_energy_loss': 0,
-                'train_force_loss': 0,
-                'train_energy_rmse': 0,
-                'train_force_rmse': 0,
+                'train_force_mae': train_metrics.get('train_force_mae', 0),
             })
         
         # Only save on main process
@@ -975,10 +1095,200 @@ class Trainer:
             if self.save_ema_model and self.ema_enabled and self.e3trans_ema is not None:
                 checkpoint_dict['e3trans_ema_state_dict'] = self.e3trans_ema.state_dict()
 
-            torch.save(checkpoint_dict, f'combined_model_epoch{epoch}_batch_count{self.batch_count}.pth')
+            # Add tensor product mode suffix to checkpoint filename
+            base_filename = f'combined_model_epoch{epoch}_batch_count{self.batch_count}'
+            checkpoint_filename = f'{base_filename}{self.tensor_product_suffix}.pth'
+            checkpoint_filepath = os.path.join(self.checkpoint_dir, checkpoint_filename)
+            torch.save(checkpoint_dict, checkpoint_filepath)
         
         self.model.train()
         self.e3trans.train()
+
+    def compute_full_train_metrics(self, epoch):
+        """Run a full pass (or sampled pass) over the training set to compute accurate train loss."""
+        # Switch to eval mode to disable dropout / norm updates
+        self.model.eval()
+        self.e3trans.eval()
+
+        eval_model = self.e3trans.module if self.distributed else self.e3trans
+
+        energy_loss_sum = 0.0
+        force_loss_sum = 0.0
+        energy_count = 0
+        force_count = 0
+
+        energy_mse_sum = 0.0
+        energy_mse_avg_sum = 0.0
+        force_mse_sum = 0.0
+        energy_mae_sum = 0.0
+        energy_mae_avg_sum = 0.0
+        force_mae_sum = 0.0
+
+        # Determine if we should use sampling
+        use_sampling = self.train_eval_sample_ratio < 1.0
+        if use_sampling:
+            # Get total number of batches for this process
+            total_batches = len(self.train_loader)
+            num_batches_to_eval = max(1, int(total_batches * self.train_eval_sample_ratio))
+            
+            # Generate random indices for sampling
+            # Sync batch_count across all processes to ensure same random seed
+            import random
+            if self.distributed:
+                # Broadcast batch_count from rank 0 to ensure all processes use the same seed
+                batch_count_tensor = torch.tensor([self.batch_count], dtype=torch.long, device=self.device)
+                dist.broadcast(batch_count_tensor, src=0)
+                sync_batch_count = batch_count_tensor.item()
+            else:
+                sync_batch_count = self.batch_count
+            # Use epoch and synced batch_count as seed for reproducibility (same seed across all processes)
+            random.seed(epoch * 10000 + sync_batch_count)
+            
+            # Sample batch indices (each process samples from its own data subset)
+            all_indices = list(range(total_batches))
+            sampled_indices = set(random.sample(all_indices, num_batches_to_eval))
+            
+            if self.is_main_process:
+                logging.info("=" * 80)
+                logging.info(f"Train Evaluation Started (Sampled {self.train_eval_sample_ratio*100:.1f}%) - Epoch {epoch} | Batch {self.batch_count}")
+                logging.info(f"  Evaluating {num_batches_to_eval}/{total_batches} batches per process")
+                logging.info("=" * 80)
+        else:
+            sampled_indices = None
+            if self.is_main_process:
+                logging.info("=" * 80)
+                logging.info(f"Full Train Evaluation Started - Epoch {epoch} | Batch {self.batch_count}")
+                logging.info("=" * 80)
+
+        batch_idx_loader = 0
+        for batch in self.train_loader:
+            # Skip batches if using sampling
+            if use_sampling and batch_idx_loader not in sampled_indices:
+                batch_idx_loader += 1
+                continue
+            
+            batch_idx_loader += 1
+            if batch is None:
+                continue
+
+            (pos, A, batch_idx, force_ref, target_energies,
+             edge_src, edge_dst, edge_shifts, cell) = batch
+
+            pos = pos.to(self.device)
+            A = A.to(self.device)
+            batch_idx = batch_idx.to(self.device)
+            force_ref = force_ref.to(self.device)
+            target_energies = target_energies.to(self.device)
+            edge_src = edge_src.to(self.device)
+            edge_dst = edge_dst.to(self.device)
+            edge_shifts = edge_shifts.to(self.device)
+            cell = cell.to(self.device)
+
+            pos.requires_grad_(True)
+
+            mapped_A = map_tensor_values(A, self.keys, self.values).to(self.device)
+            E_offset_mol = scatter(mapped_A, batch_idx, dim=0, reduce='sum')
+
+            E_per_atom = eval_model(pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
+            E_conv_mol = scatter(E_per_atom, batch_idx, dim=0, reduce='sum').squeeze(-1)
+            E_mean = E_conv_mol + E_offset_mol
+
+            grads = torch.autograd.grad(
+                E_mean.sum(),
+                pos,
+                create_graph=False,
+                retain_graph=False
+            )[0]
+
+            fx_pred = self.train_dataset.restore_force(-grads[:, 0])
+            fy_pred = self.train_dataset.restore_force(-grads[:, 1])
+            fz_pred = self.train_dataset.restore_force(-grads[:, 2])
+            f_pred = torch.stack([fx_pred, fy_pred, fz_pred], dim=1)
+
+            force_ref_scaled = force_ref * self.force_shift_value
+            force_loss = self.criterion(f_pred.view(-1), force_ref_scaled.view(-1))
+
+            num_atoms_per_mol = scatter(torch.ones_like(batch_idx), batch_idx, dim=0, reduce='sum')
+            E_avg_pred = E_mean / num_atoms_per_mol
+            target_energy_avg = target_energies / num_atoms_per_mol
+            energy_loss = self.criterion(E_avg_pred, target_energy_avg)
+
+            # Accumulate sums for weighted averages
+            num_molecules = int(E_avg_pred.numel())
+            num_force_elements = int(force_ref_scaled.numel())
+
+            energy_loss_sum += energy_loss.item() * num_molecules
+            force_loss_sum += force_loss.item() * num_force_elements
+            energy_count += num_molecules
+            force_count += num_force_elements
+
+            energy_mse_sum += F.mse_loss(E_mean, target_energies, reduction='sum').item()
+            energy_mse_avg_sum += F.mse_loss(E_avg_pred, target_energy_avg, reduction='sum').item()
+            force_mse_sum += F.mse_loss(f_pred.view(-1), force_ref_scaled.view(-1), reduction='sum').item()
+            energy_mae_sum += F.l1_loss(E_mean, target_energies, reduction='sum').item()
+            energy_mae_avg_sum += F.l1_loss(E_avg_pred, target_energy_avg, reduction='sum').item()
+            force_mae_sum += F.l1_loss(f_pred.view(-1), force_ref_scaled.view(-1), reduction='sum').item()
+
+        # Sync metrics across processes
+        if self.distributed:
+            stats = torch.tensor([
+                energy_loss_sum, force_loss_sum, energy_count, force_count,
+                energy_mse_sum, energy_mse_avg_sum, force_mse_sum,
+                energy_mae_sum, energy_mae_avg_sum, force_mae_sum
+            ], dtype=torch.float64, device=self.device)
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+            (
+                energy_loss_sum, force_loss_sum, energy_count, force_count,
+                energy_mse_sum, energy_mse_avg_sum, force_mse_sum,
+                energy_mae_sum, energy_mae_avg_sum, force_mae_sum
+            ) = stats.tolist()
+
+        energy_loss_avg = energy_loss_sum / max(1, energy_count)
+        force_loss_avg = force_loss_sum / max(1, force_count)
+
+        energy_rmse = np.sqrt(energy_mse_sum / max(1, energy_count))
+        energy_rmse_avg = np.sqrt(energy_mse_avg_sum / max(1, energy_count))
+        force_rmse = np.sqrt(force_mse_sum / max(1, force_count))
+        energy_mae = energy_mae_sum / max(1, energy_count)
+        energy_mae_avg = energy_mae_avg_sum / max(1, energy_count)
+        force_mae = force_mae_sum / max(1, force_count)
+
+        energy_rmse = self.train_dataset.restore_energy(energy_rmse)
+        energy_rmse_avg = self.train_dataset.restore_energy(energy_rmse_avg)
+        energy_mae = self.train_dataset.restore_energy(energy_mae)
+        energy_mae_avg = self.train_dataset.restore_energy(energy_mae_avg)
+        
+        # Restore force units for consistency (even though force was already restored in loop)
+        force_rmse = self.train_dataset.restore_force(force_rmse)
+        force_mae = self.train_dataset.restore_force(force_mae)
+
+        train_total_loss = self.a * energy_loss_avg + self.b * force_loss_avg
+
+        if self.is_main_process:
+            eval_type = "Sampled" if use_sampling else "Full"
+            sample_info = f" ({self.train_eval_sample_ratio*100:.1f}% sampled)" if use_sampling else ""
+            logging.info(
+                f"{eval_type} Train Evaluation Done{sample_info} - "
+                f"Train Loss (a*E+b*F): {train_total_loss:.6f} | "
+                f"Train Energy Loss: {energy_loss_avg:.6f} | "
+                f"Train Force Loss: {force_loss_avg:.6f}"
+            )
+
+        # Restore training mode
+        self.model.train()
+        self.e3trans.train()
+
+        return {
+            'train_total_loss': train_total_loss,
+            'train_energy_loss': energy_loss_avg,
+            'train_force_loss': force_loss_avg,
+            'train_energy_rmse': energy_rmse,
+            'train_energy_rmse_avg': energy_rmse_avg,
+            'train_energy_mae': energy_mae,
+            'train_energy_mae_avg': energy_mae_avg,
+            'train_force_rmse': force_rmse,
+            'train_force_mae': force_mae,
+        }
     
     def run_training(self):
         """Main training loop."""
@@ -987,7 +1297,8 @@ class Trainer:
                 logging.info(f"Resuming training from epoch {self.start_epoch}/{self.epoch_numbers}")
             else:
                 logging.info(f"Training started - Total epochs: {self.epoch_numbers}")
-            logging.info(f"Checkpoint will be saved to: {self.checkpoint_path}")
+            logging.info(f"Checkpoint directory: {self.checkpoint_dir}")
+            logging.info(f"Final checkpoint will be saved to: {self.checkpoint_save_path}")
         
         # Check if training is already complete
         if self.start_epoch > self.epoch_numbers:
@@ -1020,27 +1331,49 @@ class Trainer:
                 break
         
         # Save final checkpoint (only save e3trans as MainNet is not used in inference)
+        # Save the best checkpoint (with best validation loss) as the final checkpoint
         if self.is_main_process:
-            logging.info(f"Saving final checkpoint to {self.checkpoint_path}...")
-            # Extract state_dict from DDP model if needed
-            if self.distributed:
-                e3trans_state_dict = self.e3trans.module.state_dict()
+            if self.best_checkpoint_path and os.path.exists(self.best_checkpoint_path):
+                # Load best checkpoint and save as final checkpoint
+                logging.info(f"Loading best checkpoint from {self.best_checkpoint_path}...")
+                best_checkpoint = torch.load(self.best_checkpoint_path, map_location=self.device)
+                
+                best_epoch = best_checkpoint.get('epoch', 'unknown')
+                best_batch_count = best_checkpoint.get('batch_count', 'unknown')
+                
+                # Update epoch to last_epoch for final checkpoint
+                best_checkpoint['epoch'] = last_epoch
+                
+                logging.info(f"Saving final checkpoint (best model) to {self.checkpoint_save_path}...")
+                logging.info(f"  Best validation loss: {self.best_val_loss:.6f}")
+                logging.info(f"  Best model from epoch: {best_epoch}, batch_count: {best_batch_count}")
+                
+                torch.save(best_checkpoint, self.checkpoint_save_path)
+                
+                # Clean up temporary best checkpoint file
+                os.remove(self.best_checkpoint_path)
+                logging.info(f"Training completed! Best model saved to {self.checkpoint_save_path}")
             else:
-                e3trans_state_dict = self.e3trans.state_dict()
-            
-            checkpoint_dict = {
-                'epoch': last_epoch,
-                'e3trans_state_dict': e3trans_state_dict,
-                'a': self.a,
-                'b': self.b,
-                'batch_count': self.batch_count,
-                'best_val_loss': self.best_val_loss,
-                'patience_counter': self.patience_counter,
-                'swa_applied': self.swa_applied,
-                'ema_enabled': self.ema_enabled,
-            }
-            if self.save_ema_model and self.ema_enabled and self.e3trans_ema is not None:
-                checkpoint_dict['e3trans_ema_state_dict'] = self.e3trans_ema.state_dict()
+                # Fallback: if no best checkpoint exists, save current model
+                logging.warning("No best checkpoint found, saving current model as final checkpoint...")
+                if self.distributed:
+                    e3trans_state_dict = self.e3trans.module.state_dict()
+                else:
+                    e3trans_state_dict = self.e3trans.state_dict()
+                
+                checkpoint_dict = {
+                    'epoch': last_epoch,
+                    'e3trans_state_dict': e3trans_state_dict,
+                    'a': self.a,
+                    'b': self.b,
+                    'batch_count': self.batch_count,
+                    'best_val_loss': self.best_val_loss,
+                    'patience_counter': self.patience_counter,
+                    'swa_applied': self.swa_applied,
+                    'ema_enabled': self.ema_enabled,
+                }
+                if self.save_ema_model and self.ema_enabled and self.e3trans_ema is not None:
+                    checkpoint_dict['e3trans_ema_state_dict'] = self.e3trans_ema.state_dict()
 
-            torch.save(checkpoint_dict, self.checkpoint_path)
-            logging.info(f"Training completed! Final model saved to {self.checkpoint_path}")
+                torch.save(checkpoint_dict, self.checkpoint_save_path)
+                logging.info(f"Training completed! Final model saved to {self.checkpoint_save_path}")
