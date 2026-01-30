@@ -98,7 +98,7 @@ mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-pr
 mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode pure-cartesian-ictd
 ```
 
-Optional: clamp dynamic loss weights `a/b` (they change during training):
+By default, dynamic loss weights `a/b` are clamped to `[1, 1000]` (they change during training). You can override the range:
 
 ```bash
 mff-train --data-dir data --a 10.0 --b 100.0 --update-param 750 --weight-a-growth 1.05 --weight-b-decay 0.98 --a-max 1000 --b-min 1 --b-max 1000 

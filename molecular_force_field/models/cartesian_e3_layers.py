@@ -225,6 +225,35 @@ def get_irreps_str(channels: int, lmax: int) -> str:
     return " + ".join(parts)
 
 
+def reorder_concatenated_irreps_multi(features, channels: int, lmax: int) -> torch.Tensor:
+    """
+    Reorder concatenated irreps features (multi-input) to match e3nn's expected format.
+
+    Args:
+        features: List of irreps features, each shape (..., channels * sum(2*l+1))
+        channels: Number of channels per angular momentum
+        lmax: Maximum angular momentum
+
+    Returns:
+        Reordered concatenated features, shape (..., n*channels * sum(2*l+1))
+    """
+    if len(features) == 1:
+        return features[0]
+    dims = [2 * l + 1 for l in range(lmax + 1)]
+    idxs = [0 for _ in features]
+    parts = []
+    for l in range(lmax + 1):
+        dim_l = dims[l]
+        size_l = channels * dim_l
+        l_parts = []
+        for i, f in enumerate(features):
+            f_l = f[..., idxs[i]:idxs[i] + size_l]
+            idxs[i] += size_l
+            l_parts.append(f_l)
+        parts.append(torch.cat(l_parts, dim=-1))
+    return torch.cat(parts, dim=-1)
+
+
 def reorder_concatenated_irreps(f1: torch.Tensor, f2: torch.Tensor, channels: int, lmax: int) -> torch.Tensor:
     """
     Reorder concatenated irreps features to match e3nn's expected format.
@@ -255,29 +284,7 @@ def reorder_concatenated_irreps(f1: torch.Tensor, f2: torch.Tensor, channels: in
         - Reordered: [f1的64个0e, f2的64个0e, f1的192个1o, f2的192个1o, f1的320个2e, f2的320个2e]
         - Actually, the reordered version groups by l: [所有128个0e, 所有128个1o, 所有128个2e]
     """
-    batch_shape = f1.shape[:-1]
-    dims = [2 * l + 1 for l in range(lmax + 1)]  # [1, 3, 5] for lmax=2
-    
-    # Split f1 and f2 by angular momentum
-    parts = []
-    idx1 = 0
-    idx2 = 0
-    
-    for l in range(lmax + 1):
-        dim_l = dims[l]
-        # Extract l-th part from f1 and f2
-        size_l = channels * dim_l
-        f1_l = f1[..., idx1:idx1 + size_l]  # (..., channels * dim_l)
-        f2_l = f2[..., idx2:idx2 + size_l]  # (..., channels * dim_l)
-        
-        # Concatenate: [f1的l部分, f2的l部分]
-        parts.append(torch.cat([f1_l, f2_l], dim=-1))
-        
-        idx1 += size_l
-        idx2 += size_l
-    
-    # Concatenate all parts in order of l
-    return torch.cat(parts, dim=-1)
+    return reorder_concatenated_irreps_multi([f1, f2], channels, lmax)
 
 
 # ============================================================================
@@ -2547,7 +2554,7 @@ class CartesianTransformerLayer(nn.Module):
     def __init__(self, max_embed_radius, main_max_radius, main_number_of_basis,
                  hidden_dim_conv, hidden_dim_sh, hidden_dim, channel_in2=32, embedding_dim=16,
                  max_atomvalue=10, output_size=8, embed_size=None, main_hidden_sizes3=None,
-                 num_layers=1, device=None, function_type_main='gaussian', lmax=2):
+                 num_layers=1, device=None, function_type_main='gaussian', lmax=2, num_interaction=2):
         super().__init__()
         
         if embed_size is None:
@@ -2567,40 +2574,50 @@ class CartesianTransformerLayer(nn.Module):
         self.channels = hidden_dim_conv  # This should be 64, not 576
         self.hidden_dim_conv = self.channels * self.total_sh_dim  # 64 * 9 = 576
         
+        self.num_interaction = int(num_interaction)
+        if self.num_interaction < 2:
+            raise ValueError(f"num_interaction must be >= 2, got {self.num_interaction}")
+
         # Convolution layers with sparse tensor products
-        self.e3_conv_emb = CartesianE3ConvSparse(
-            max_radius=max_embed_radius,
-            number_of_basis=main_number_of_basis,
-            channels_out=self.channels,
-            embedding_dim=embedding_dim,
-            max_atomvalue=max_atomvalue,
-            output_size=output_size,
-            lmax=lmax,
-            function_type=function_type_main
+        self.e3_conv_layers = nn.ModuleList()
+        self.e3_conv_layers.append(
+            CartesianE3ConvSparse(
+                max_radius=max_embed_radius,
+                number_of_basis=main_number_of_basis,
+                channels_out=self.channels,
+                embedding_dim=embedding_dim,
+                max_atomvalue=max_atomvalue,
+                output_size=output_size,
+                lmax=lmax,
+                function_type=function_type_main
+            )
         )
-        
-        self.e3_conv_emb2 = CartesianE3Conv2Sparse(
-            max_radius=max_embed_radius,
-            number_of_basis=main_number_of_basis,
-            channels_in=self.channels,
-            channels_out=self.channels,
-            embedding_dim=embedding_dim,
-            max_atomvalue=max_atomvalue,
-            lmax=lmax,
-            function_type=function_type_main
-        )
+        for _ in range(1, self.num_interaction):
+            self.e3_conv_layers.append(
+                CartesianE3Conv2Sparse(
+                    max_radius=max_embed_radius,
+                    number_of_basis=main_number_of_basis,
+                    channels_in=self.channels,
+                    channels_out=self.channels,
+                    embedding_dim=embedding_dim,
+                    max_atomvalue=max_atomvalue,
+                    lmax=lmax,
+                    function_type=function_type_main
+                )
+            )
         
         # Product layers matching e3nn structure:
         # product_3: FullyConnectedTensorProduct(irreps_input*2, irreps_input*2, "32x0e")
         # product_5: ElementwiseTensorProduct(T, T, ["0e"])
-        combined_channels = self.channels * 2
+        combined_channels = self.channels * self.num_interaction
         irreps_combined = get_irreps_str(combined_channels, lmax)
+        scalar_channels = (self.num_interaction - 1) * 32
         
         # product_3: 高阶 ⊗ 高阶 → 标量 (32x0e) - 使用严格等变的 EquivariantTensorProduct
         self.product_3 = EquivariantTensorProduct(
             irreps_in1=irreps_combined,
             irreps_in2=irreps_combined,
-            irreps_out="32x0e",
+            irreps_out=f"{scalar_channels}x0e",
             shared_weights=True,
             internal_weights=True
         )
@@ -2609,10 +2626,10 @@ class CartesianTransformerLayer(nn.Module):
         # For ElementwiseTP, we need T to have proper irreps structure
         # T irreps = combined_channels x (0e+1o+2e) + 32 x 0e
         T_channels = combined_channels  # For the high-order part
-        T_scalar_channels = 32  # From product_3
+        T_scalar_channels = scalar_channels  # From product_3
         
         # Build T irreps string
-        irreps_T = get_irreps_str(T_channels, lmax) + " + " + "32x0e"
+        irreps_T = get_irreps_str(T_channels, lmax) + " + " + f"{scalar_channels}x0e"
         
         # product_5: ElementwiseTensorProduct(T, T, ["0e"]) - 已经是严格等变的
         self.product_5 = CartesianElementwiseTensorProduct(
@@ -2635,18 +2652,20 @@ class CartesianTransformerLayer(nn.Module):
         edge_dst = edge_dst[sort_idx]
         edge_shifts = edge_shifts[sort_idx]
         
-        # First convolution
-        f1 = self.e3_conv_emb(pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
-        
-        # Second convolution
-        f2 = self.e3_conv_emb2(f1, pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
+        # Convolutions
+        features = []
+        f_prev = self.e3_conv_layers[0](pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
+        features.append(f_prev)
+        for conv in self.e3_conv_layers[1:]:
+            f_prev = conv(f_prev, pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
+            features.append(f_prev)
         
         # Combine features: reorder to match e3nn's expected irreps format
         # This ensures that f_combine has the correct structure for EquivariantTensorProduct
         # Without reordering, the concatenation [f1, f2] produces:
         #   [f1的l=0部分, f2的l=0部分, f1的l=1部分, f2的l=1部分, ...]
         # But e3nn expects: [所有l=0部分, 所有l=1部分, ...]
-        f_combine = reorder_concatenated_irreps(f1, f2, self.channels, self.lmax)
+        f_combine = reorder_concatenated_irreps_multi(features, self.channels, self.lmax)
         
         # product_3: 高阶 ⊗ 高阶 → 32x0e (标量)
         f_prod3 = self.product_3(f_combine, f_combine)  # (N, 32)
@@ -2954,7 +2973,7 @@ class CartesianTransformerLayerStrict(nn.Module):
     def __init__(self, max_embed_radius, main_max_radius, main_number_of_basis,
                  hidden_dim_conv, hidden_dim_sh, hidden_dim, channel_in2=32, embedding_dim=16,
                  max_atomvalue=10, output_size=8, embed_size=None, main_hidden_sizes3=None,
-                 num_layers=1, device=None, function_type_main='gaussian', lmax=2):
+                 num_layers=1, device=None, function_type_main='gaussian', lmax=2, num_interaction=2):
         super().__init__()
         
         if embed_size is None:
@@ -2972,36 +2991,46 @@ class CartesianTransformerLayerStrict(nn.Module):
         
         self.channels = hidden_dim_conv
         self.hidden_dim_conv = self.channels * self.total_sh_dim
+
+        self.num_interaction = int(num_interaction)
+        if self.num_interaction < 2:
+            raise ValueError(f"num_interaction must be >= 2, got {self.num_interaction}")
         
         # Strict parity convolution layers
-        self.e3_conv_emb = CartesianE3ConvStrict(
-            max_radius=max_embed_radius,
-            number_of_basis=main_number_of_basis,
-            channels_out=self.channels,
-            embedding_dim=embedding_dim,
-            max_atomvalue=max_atomvalue,
-            output_size=output_size,
-            lmax=lmax,
-            function_type=function_type_main
+        self.e3_conv_layers = nn.ModuleList()
+        self.e3_conv_layers.append(
+            CartesianE3ConvStrict(
+                max_radius=max_embed_radius,
+                number_of_basis=main_number_of_basis,
+                channels_out=self.channels,
+                embedding_dim=embedding_dim,
+                max_atomvalue=max_atomvalue,
+                output_size=output_size,
+                lmax=lmax,
+                function_type=function_type_main
+            )
         )
-        
-        self.e3_conv_emb2 = CartesianE3Conv2Strict(
-            max_radius=max_embed_radius,
-            number_of_basis=main_number_of_basis,
-            channels_in=self.channels,
-            channels_out=self.channels,
-            embedding_dim=embedding_dim,
-            max_atomvalue=max_atomvalue,
-            lmax=lmax,
-            function_type=function_type_main
-        )
+        for _ in range(1, self.num_interaction):
+            self.e3_conv_layers.append(
+                CartesianE3Conv2Strict(
+                    max_radius=max_embed_radius,
+                    number_of_basis=main_number_of_basis,
+                    channels_in=self.channels,
+                    channels_out=self.channels,
+                    embedding_dim=embedding_dim,
+                    max_atomvalue=max_atomvalue,
+                    lmax=lmax,
+                    function_type=function_type_main
+                )
+            )
         
         # Strict parity product layers
-        combined_channels = self.channels * 2  # 64 for channels=32
-        self.product_3 = CartesianProductStrict(combined_channels, 32, lmax=lmax)
+        combined_channels = self.channels * self.num_interaction  # 64 for channels=32, n=2
+        scalar_channels = (self.num_interaction - 1) * 32
+        self.product_3 = CartesianProductStrict(combined_channels, scalar_channels, lmax=lmax)
         
         # Second product: input is f_combine (64ch) + f_prod3 (32ch) = 96ch
-        self.product_5 = CartesianProductStrict(combined_channels + 32, 64, lmax=lmax)
+        self.product_5 = CartesianProductStrict(combined_channels + scalar_channels, 64, lmax=lmax)
         
         # Readout from product_5 output (64ch * total_sh_dim)
         readout_input_dim = 64 * self.total_sh_dim
@@ -3019,16 +3048,16 @@ class CartesianTransformerLayerStrict(nn.Module):
         edge_dst = edge_dst[sort_idx]
         edge_shifts = edge_shifts[sort_idx]
         
-        # First convolution (strict parity)
-        f1 = self.e3_conv_emb(pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
-        # f1: (N, channels * total_sh_dim)
+        # Convolutions (strict parity)
+        features = []
+        f_prev = self.e3_conv_layers[0](pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
+        features.append(f_prev)
+        for conv in self.e3_conv_layers[1:]:
+            f_prev = conv(f_prev, pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
+            features.append(f_prev)
         
-        # Second convolution (strict parity)
-        f2 = self.e3_conv_emb2(f1, pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
-        # f2: (N, channels * total_sh_dim)
-        
-        # Combine features: (N, 2*channels * total_sh_dim)
-        f_combine = torch.cat([f1, f2], dim=-1)
+        # Combine features: (N, n*channels * total_sh_dim)
+        f_combine = torch.cat(features, dim=-1)
         
         # First product layer (strict parity)
         # Input: 64ch * 9 = 576, Output: 32ch * 9 = 288
@@ -3494,7 +3523,7 @@ class CartesianTransformerLayerLoose(nn.Module):
     def __init__(self, max_embed_radius, main_max_radius, main_number_of_basis,
                  hidden_dim_conv, hidden_dim_sh, hidden_dim, channel_in2=32, embedding_dim=16,
                  max_atomvalue=10, output_size=8, embed_size=None, main_hidden_sizes3=None,
-                 num_layers=1, device=None, function_type_main='gaussian', lmax=2):
+                 num_layers=1, device=None, function_type_main='gaussian', lmax=2, num_interaction=2):
         super().__init__()
         
         if embed_size is None:
@@ -3513,49 +3542,59 @@ class CartesianTransformerLayerLoose(nn.Module):
         # Use channel count, not full dimension
         self.channels = hidden_dim_conv  # This should be 64, not 576
         self.hidden_dim_conv = self.channels * self.total_sh_dim  # 64 * 9 = 576
+
+        self.num_interaction = int(num_interaction)
+        if self.num_interaction < 2:
+            raise ValueError(f"num_interaction must be >= 2, got {self.num_interaction}")
         
         # Convolution layers with optimized CartesianFullyConnectedTensorProduct
-        self.e3_conv_emb = CartesianE3ConvSparseLoose(
-            max_radius=max_embed_radius,
-            number_of_basis=main_number_of_basis,
-            channels_out=self.channels,
-            embedding_dim=embedding_dim,
-            max_atomvalue=max_atomvalue,
-            output_size=output_size,
-            lmax=lmax,
-            function_type=function_type_main
+        self.e3_conv_layers = nn.ModuleList()
+        self.e3_conv_layers.append(
+            CartesianE3ConvSparseLoose(
+                max_radius=max_embed_radius,
+                number_of_basis=main_number_of_basis,
+                channels_out=self.channels,
+                embedding_dim=embedding_dim,
+                max_atomvalue=max_atomvalue,
+                output_size=output_size,
+                lmax=lmax,
+                function_type=function_type_main
+            )
         )
-        
-        self.e3_conv_emb2 = CartesianE3Conv2SparseLoose(
-            max_radius=max_embed_radius,
-            number_of_basis=main_number_of_basis,
-            channels_in=self.channels,
-            channels_out=self.channels,
-            embedding_dim=embedding_dim,
-            max_atomvalue=max_atomvalue,
-            lmax=lmax,
-            function_type=function_type_main
-        )
+        for _ in range(1, self.num_interaction):
+            self.e3_conv_layers.append(
+                CartesianE3Conv2SparseLoose(
+                    max_radius=max_embed_radius,
+                    number_of_basis=main_number_of_basis,
+                    channels_in=self.channels,
+                    channels_out=self.channels,
+                    embedding_dim=embedding_dim,
+                    max_atomvalue=max_atomvalue,
+                    lmax=lmax,
+                    function_type=function_type_main
+                )
+            )
         
         # Product layers using optimized CartesianFullyConnectedTensorProduct
-        combined_channels = self.channels * 2
+        combined_channels = self.channels * self.num_interaction
         irreps_combined = get_irreps_str(combined_channels, lmax)
+        scalar_channels = (self.num_interaction - 1) * 32
         
         # product_3: 高阶 ⊗ 高阶 → 标量 (32x0e) - 使用优化后的 CartesianFullyConnectedTensorProduct
         self.product_3 = CartesianFullyConnectedTensorProduct(
             irreps_in1=irreps_combined,
             irreps_in2=irreps_combined,
-            irreps_out="32x0e",
+            irreps_out=f"{scalar_channels}x0e",
             shared_weights=True,
             internal_weights=True
         )
         
         # T = [f_combine, f_prod3] = (combined_channels * total_sh_dim + 32) features
         T_channels = combined_channels  # For the high-order part
-        T_scalar_channels = 32  # From product_3
+        T_scalar_channels = scalar_channels  # From product_3
         
         # Build T irreps string
-        irreps_T = get_irreps_str(T_channels, lmax) + " + " + "32x0e"
+        irreps_T = get_irreps_str(T_channels, lmax) + " + " + f"{scalar_channels}x0e"
         
         # product_5: ElementwiseTensorProduct(T, T, ["0e"]) - 严格等变
         self.product_5 = CartesianElementwiseTensorProduct(
@@ -3578,16 +3617,18 @@ class CartesianTransformerLayerLoose(nn.Module):
         edge_dst = edge_dst[sort_idx]
         edge_shifts = edge_shifts[sort_idx]
         
-        # First convolution
-        f1 = self.e3_conv_emb(pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
-        
-        # Second convolution
-        f2 = self.e3_conv_emb2(f1, pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
+        # Convolutions
+        features = []
+        f_prev = self.e3_conv_layers[0](pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
+        features.append(f_prev)
+        for conv in self.e3_conv_layers[1:]:
+            f_prev = conv(f_prev, pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
+            features.append(f_prev)
         
         # Combine features: reorder to match e3nn's expected irreps format
         # This ensures consistency with CartesianTransformerLayer, even though
         # CartesianFullyConnectedTensorProduct uses norm product (rotation-invariant)
-        f_combine = reorder_concatenated_irreps(f1, f2, self.channels, self.lmax)
+        f_combine = reorder_concatenated_irreps_multi(features, self.channels, self.lmax)
         
         # product_3: 高阶 ⊗ 高阶 → 32x0e (标量)
         f_prod3 = self.product_3(f_combine, f_combine)  # (N, 32)

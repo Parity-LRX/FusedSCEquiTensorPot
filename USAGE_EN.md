@@ -85,8 +85,8 @@ mff-train \
     -a 1.0 \
     -b 10.0 \
     --update-param 1000 \
-    --weight-a-growth 1.01 \
-    --weight-b-decay 0.99 \
+    --weight-a-growth 1.05 \
+    --weight-b-decay 0.98 \
     --force-shift-value 1.0 \
     --patience 20 \
     --vhat-clamp-interval 2000 \
@@ -162,93 +162,134 @@ mff-train \
 **Parameter Description:**
 
 **Data Parameters:**
-- `--data-dir`: Data directory containing preprocessed files (default 'data')
-- `--input-file`: Path to input XYZ file for auto preprocessing (optional)
-- `--train-prefix`: Training data file prefix (default 'train')
-- `--val-prefix`: Validation data file prefix (default 'val')
+- `--data-dir`: Data directory containing preprocessed files (default 'data'). All preprocessed data files (e.g., processed_train.h5, processed_val.h5) should be in this directory
+- `--input-file`: Path to input XYZ file for auto preprocessing (optional). If specified and no preprocessed files exist in the data directory, it will automatically preprocess from the XYZ file
+- `--train-prefix`: Training data file prefix (default 'train'). Used to locate files like `processed_{train-prefix}.h5`
+- `--val-prefix`: Validation data file prefix (default 'val'). Used to locate files like `processed_{val-prefix}.h5`
+- `--max-radius`: Maximum radius for neighbor search (default 5.0 Å). Atoms beyond this distance will not be considered as neighbors. This parameter is required for both preprocessing and training
 
-**Basic Parameters:**
-- `--epochs`: Number of training epochs (default 1000)
-- `--batch-size`: Batch size (default 8). If GPU memory is insufficient, you can reduce this value (e.g., 4 or 2)
-- `--checkpoint`: Model save path (default 'combined_model.pth'). The final model will be saved after training, and models will also be saved periodically during training
-- `--device`: Device ('cuda' or 'cpu', default auto-detect). If GPU is available, strongly recommend using 'cuda'
-- `--dump-frequency`: Frequency of validation and model saving (every N batches, default 250). Validation and model checkpoint saving will occur every N batches
+**Basic Training Parameters:**
+- `--epochs`: Number of training epochs (default 1000). Training will run for the specified number of epochs unless early stopping is triggered
+- `--batch-size`: Batch size (default 8). If GPU memory is insufficient, you can reduce this value (e.g., 4 or 2). Note: validation batch-size is fixed at 1
+- `--checkpoint`: Model save path (default 'combined_model.pth'). After training, the final model (best validation performance model) will be saved to the `checkpoint/` directory, with filename including tensor product mode suffix (e.g., `combined_model_pure_cartesian.pth`). Intermediate checkpoints are also saved periodically to the `checkpoint/` directory during training
+- `--reset-loss-weights`: When resuming from checkpoint, ignore saved loss weights (a, b) and use values from command line arguments (default False, i.e., use checkpoint weights)
+- `--device`: Device ('cuda' or 'cpu', default auto-detect). If GPU is available, strongly recommend using 'cuda'. In distributed training, each process is automatically assigned to the corresponding GPU
+- `--dtype`: Tensor data type ('float32' or 'float64', default 'float64'). Options: 'float32'/'float' (32-bit float, faster but slightly lower precision) or 'float64'/'double' (64-bit float, higher precision but slower)
+- `--seed`: Random seed (default 42). Used to ensure experiment reproducibility. Affects random operations like data shuffle, train/val split, etc.
+
+**Validation and Logging Parameters:**
+- `--dump-frequency`: Frequency of validation and model saving (every N batches, default 250). Validation and model checkpoint saving will occur every N batches. Note: validation is triggered based on batch_count, not fixed at the end of each epoch
+- `--train-eval-sample-ratio`: Ratio of training set to sample during validation (0.0-1.0, default 0.2). Set to 1.0 to evaluate the entire training set, or lower (e.g., 0.2 for 20%) for faster validation. Recommended for large datasets
 - `--energy-log-frequency`: Frequency of energy prediction logging (every N batches, default 10). These logs are only written to files, not output to console
-- `--dtype`: Tensor data type ('float32' or 'float64', default 'float64'). float64 has higher precision but is slower, float32 is faster but has slightly lower precision
-- `--patience`: Early stopping patience value (default 20). If the **weighted validation loss** (`a × energy loss + b × force loss`) does not improve for N consecutive epochs, training will automatically stop
+- `--log-val-batch-energy`: Output validation batch energy predictions to console (default False). If False, validation batch energy information is only logged to file, not output to console; if True, it will be output to both console and log file
+- `--save-val-csv`: Save validation energy and force predictions to CSV files (default False). If enabled, validation results will be saved to the `validation/` directory with filenames `val_energy_epoch{epoch}_batch{batch_count}.csv` and `val_force_epoch{epoch}_batch{batch_count}.csv`
+- `--no-save-val-csv`: Disable saving validation CSV files (mutually exclusive with `--save-val-csv`). Used to reduce I/O overhead
+
+**Early Stopping Parameters:**
+- `--patience`: Early stopping patience value (default 20, unit: epochs). If validation loss (energy loss + force loss, unweighted) does not improve for N consecutive epochs, training will automatically stop. Note: early stopping uses unweighted validation loss, not weighted loss (`a × energy loss + b × force loss`)
 
 **Learning Rate Parameters:**
-- `--learning-rate`: Target learning rate (default 2e-4). This is the learning rate after warmup
-- `--min-learning-rate`: Minimum learning rate (default 1e-5). Learning rate will not go below this value
+- `--learning-rate`: Target learning rate (default 1e-3). This is the learning rate after warmup and the main learning rate during training
+- `--min-learning-rate`: Minimum learning rate (default 2e-5). Learning rate will not go below this value, even after multiple decays
 - `--warmup-batches`: Number of batches for learning rate warmup (default 1000). For the first N batches, learning rate linearly increases from `learning_rate × warmup_start_ratio` to `learning_rate`
-- `--warmup-start-ratio`: Starting ratio of learning rate during warmup (default 0.1). For example, if `--learning-rate 2e-4` and `--warmup-start-ratio 0.1`, learning rate will linearly increase from `2e-5` to `2e-4`
+- `--warmup-start-ratio`: Starting ratio of learning rate during warmup (default 0.1). For example, if `--learning-rate 1e-3` and `--warmup-start-ratio 0.1`, learning rate will linearly increase from `1e-4` to `1e-3`
 - `--lr-decay-patience`: Interval in batches for learning rate decay (default 1000). Every N batches, if validation metrics do not improve, learning rate will be multiplied by `--lr-decay-factor`
-- `--lr-decay-factor`: Learning rate decay factor (default 0.98). Learning rate is multiplied by this value each time it decays (0.98 means 2% reduction)
+- `--lr-decay-factor`: Learning rate decay factor (default 0.98). Learning rate is multiplied by this value each time it decays (0.98 means 2% reduction). Learning rate scheduling: if validation loss does not improve within `lr-decay-patience` batches, learning rate is multiplied by this factor
 
 **Loss Weight Parameters:**
-- `--energy-weight` (or `-a`): Initial weight for energy loss (default 1.0). Total loss = `a × energy loss + b × force loss`
-- `--force-weight` (or `-b`): Initial weight for force loss (default 10.0). Force loss typically needs larger weight because there are far more forces than energies
-- `--update-param`: Frequency of automatic adjustment of weights `a` and `b` (every N batches, default 1000). Every N batches, weights will be adjusted according to `--weight-a-growth` and `--weight-b-decay`
-- `--weight-a-growth`: Growth rate of energy weight `a` (default 1.01, i.e., 1% increase each time). Recommended values: 1.005 (slow, suitable for very long training), 1.01 (medium, recommended), 1.02 (fast, suitable for short training)
-- `--weight-b-decay`: Decay rate of force weight `b` (default 0.99, i.e., 1% decrease each time). Recommended values: 0.995 (slow), 0.99 (medium, recommended), 0.98 (fast)
-- `--force-shift-value`: Scaling factor for force labels (default 1.0). Adjust this value if force units need conversion
+- `--energy-weight` (or `-a`): Initial weight for energy loss (default 1.0). Total loss = `a × energy loss + b × force loss`. During training, `a` will automatically increase according to `--weight-a-growth`
+- `--force-weight` (or `-b`): Initial weight for force loss (default 10.0). Force loss typically needs larger weight because there are far more forces than energies (each atom has 3 force components). During training, `b` will automatically decay according to `--weight-b-decay`
+- `--update-param`: Frequency of automatic adjustment of weights `a` and `b` (every N batches, default 1000). Every N batches, weights will be adjusted according to `--weight-a-growth` and `--weight-b-decay`. Adjustment formula: `a = a × weight_a_growth`, `b = b × weight_b_decay`
+- `--weight-a-growth`: Growth rate of energy weight `a` (default 1.05, i.e., 5% increase each time). Recommended values: 1.005 (slow, suitable for very long training), 1.01 (medium, more stable), 1.02 (fast), 1.05 (very fast)
+- `--weight-b-decay`: Decay rate of force weight `b` (default 0.98, i.e., 2% decrease each time). Recommended values: 0.995 (slow), 0.99 (medium, more stable), 0.98 (fast)
+- `--a-min`: Minimum value for energy weight `a` (default 1.0). `a` will not go below this value during growth
+- `--a-max`: Maximum value for energy weight `a` (default 1000.0). `a` will not exceed this value during growth
+- `--b-min`: Minimum value for force weight `b` (default 1.0). `b` will not go below this value during decay
+- `--b-max`: Maximum value for force weight `b` (default 1000.0). `b` will not exceed this value during decay
+- `--force-shift-value`: Scaling factor for force labels (default 1.0). Adjust this value if force units need conversion. Note: This parameter is currently not used in the code, reserved for future extensions
 
 **Optimizer Parameters:**
-- `--vhat-clamp-interval`: Frequency of optimizer `v_hat` clamping (every N batches, default 2000). Used to prevent Adam optimizer's second moment estimate from becoming too large
-- `--max-vhat-growth`: Maximum growth factor for `v_hat` (default 5.0). Limits `v_hat` to not exceed N times the historical maximum value
-- `--max-grad-norm`: Gradient clipping threshold (default 0.5). If gradient norm exceeds this value, it will be clipped to this value to prevent gradient explosion
-- `--grad-log-interval`: Frequency of gradient statistics logging (every N batches, default 500). Used to monitor training stability
+- `--vhat-clamp-interval`: Frequency of optimizer `v_hat` clamping (every N batches, default 2000). Used to prevent Adam optimizer's second moment estimate (`v_hat`) from becoming too large. Every N batches, `v_hat` growth is checked and limited
+- `--max-vhat-growth`: Maximum growth factor for `v_hat` (default 5.0). Limits `v_hat` to not exceed N times the historical maximum value, preventing optimizer instability
+- `--max-grad-norm`: Gradient clipping threshold (default 0.5). If gradient norm exceeds this value, it will be clipped to this value to prevent gradient explosion. Implemented using `torch.nn.utils.clip_grad_norm_`
+- `--grad-log-interval`: Frequency of gradient statistics logging (every N batches, default 500). Used to monitor training stability. Gradient statistics (norm, max, min, mean) are logged to the log file
 
 **Data Processing Parameters:**
-- `--num-workers`: Number of parallel processes for data processing (default 8). Uses all during preprocessing, DataLoader automatically allocates during training (half for training, quarter for validation)
-- `--max-radius`: Maximum radius for neighbor search (default 5.0 Å). Atoms beyond this distance will not be considered as neighbors
+- `--num-workers`: Number of parallel processes for data processing (default 8). Uses all processes during preprocessing. During training, DataLoader automatically allocates: training DataLoader uses `max(1, num_workers // 2)`, validation DataLoader uses `max(1, num_workers // 4)`
 
 **Model Architecture Hyperparameters:**
-- `--max-atomvalue`: Maximum atomic number for atom embedding (default 10). If dataset contains elements with atomic number > 10, need to increase this value
-- `--embedding-dim`: Atom embedding dimension (default 16). Increasing this value can enhance model expressiveness but will increase computation
-- `--lmax`: Maximum order of spherical harmonics (default 2). Controls the highest order of irreducible representations
-- `--irreps-output-conv-channels`: Number of channels for irreps_output_conv (default 64). Together with `--lmax` determines the irreps form. For example:
+- `--max-atomvalue`: Maximum atomic number for atom embedding (default 10). If dataset contains elements with atomic number > 10, need to increase this value. For example, if dataset contains Cl (atomic number 17), need to set `--max-atomvalue 17`
+- `--embedding-dim`: Atom embedding dimension (default 16). Increasing this value can enhance model expressiveness but will increase computation and memory usage
+- `--embed-size`: Hidden layer sizes for readout MLP (default [128, 128, 128]). Can specify multiple values, e.g., `--embed-size 128 256 128` means three hidden layers with sizes 128, 256, 128
+- `--output-size`: Output size for atom readout MLP (default 8). This is the feature dimension for each atom, used for subsequent energy and force prediction
+- `--lmax`: Maximum order of spherical harmonics (default 2). Controls the highest order of irreducible representations. Increasing `lmax` can capture higher-order geometric information but will significantly increase computation. Common values: 1 (fast, suitable for simple systems), 2 (recommended, balanced performance and accuracy), 3 (high accuracy, but computationally expensive)
+- `--irreps-output-conv-channels`: Number of channels for irreps_output_conv (optional, default None, will use channel_in from config, typically 64). Together with `--lmax` determines the irreps form. For example:
   - `lmax=2, channels=64` → "64x0e + 64x1o + 64x2e"
   - `lmax=1, channels=64` → "64x0e + 64x1o"
   - `lmax=3, channels=64` → "64x0e + 64x1o + 64x2e + 64x3o"
   - Increasing channel number can improve model capacity but will significantly increase memory and computation
 - `--function-type`: Radial basis function type (default 'gaussian'). Options:
-  - `gaussian`: Gaussian basis functions (default, smooth and easy to optimize)
+  - `gaussian`: Gaussian basis functions (default, smooth and easy to optimize, recommended for most scenarios)
   - `bessel`: Bessel basis functions (suitable for periodic systems)
   - `fourier`: Fourier basis functions (suitable for periodic boundary conditions)
   - `cosine`: Cosine basis functions
   - `smooth_finite`: Smooth finite support basis functions
 - `--tensor-product-mode`: Equivariant tensor product implementation mode (default 'spherical'). **This framework supports six equivariant tensor product modes**, options:
-  - `spherical`: Use e3nn spherical harmonics tensor product (default, high precision, standard implementation)
+  - `spherical`: Use e3nn spherical harmonics tensor product (default, high precision, standard implementation, recommended for most scenarios)
   - `partial-cartesian`: Cartesian coordinates + e3nn CG coefficients (strictly equivariant, partially uses e3nn's `wigner_3j` and `Irreps`, 17.4% parameter reduction)
-  - `partial-cartesian-loose`: Approximate equivariant tensor product (uses norm product approximation, partially uses e3nn's `Irreps` framework, faster, 17.3% parameter reduction)
-  - `pure-cartesian`: Pure Cartesian tensor product (\(3^L\) representation, δ/ε contractions, strictly equivariant, very slow, large parameters, fails at lmax≥4)
-  - `pure-cartesian-sparse`: Sparse pure Cartesian tensor product (strictly equivariant, 29.6% parameter reduction, stable speed)
-  - `pure-cartesian-ictd`: ICTD irreps internal representation (strictly equivariant, 72.1% parameter reduction, fastest, CPU: up to 4.12x, GPU: up to 2.10x)
+  - `partial-cartesian-loose`: Approximate equivariant tensor product (uses norm product approximation, partially uses e3nn's `Irreps` framework, faster, 17.3% parameter reduction, but not strictly equivariant)
+  - `pure-cartesian`: Pure Cartesian tensor product (\(3^L\) representation, δ/ε contractions, strictly equivariant, very slow, large parameters, fails at lmax≥4, mainly for research)
+  - `pure-cartesian-sparse`: Sparse pure Cartesian tensor product (strictly equivariant, 29.6% parameter reduction, stable speed, requires `--max-rank-other` and `--k-policy`)
+  - `pure-cartesian-ictd`: ICTD irreps internal representation (strictly equivariant, 72.1% parameter reduction, fastest, CPU: up to 4.12x, GPU: up to 2.10x, recommended for large-scale training)
   
   For detailed performance comparison and recommended scenarios, see the [Tensor Product Mode Comparison](#tensor-product-mode-comparison) section.
 
+**Tensor Product Mode Specific Parameters (only for pure-cartesian-sparse and pure-cartesian-ictd):**
+- `--max-rank-other`: Maximum rank for sparse tensor product (only for `pure-cartesian-sparse` mode, default 1). Only interactions where `min(L1, L2) <= max_rank_other` are allowed. Increasing this value allows more interactions but increases parameters and computation
+- `--k-policy`: K policy for sparse tensor product (only for `pure-cartesian-sparse` mode, default 'k0'). Options:
+  - `k0`: Only keep k=0 (promotes higher rank, recommended)
+  - `k1`: Only keep k=1 (contracts to lower rank)
+  - `both`: Keep both k=0 and k=1 (more interactions, but more computation)
+- `--ictd-tp-path-policy`: Path policy for ICTD tensor products (only for `pure-cartesian-ictd` mode, default 'full'). Options:
+  - `full`: Keep all CG-allowed (l1,l2->l3) paths (recommended, best performance)
+  - `max_rank_other`: Only keep paths where `min(l1,l2) <= --ictd-tp-max-rank-other` (reduces parameters)
+- `--ictd-tp-max-rank-other`: Maximum rank for ICTD path pruning (only for `pure-cartesian-ictd` mode, when `--ictd-tp-path-policy=max_rank_other`, default None). For example, setting to 1 only keeps scalar/vector couplings
+
 **SWA and EMA Parameters:**
-- `--swa-start-epoch`: Epoch to start SWA (Stochastic Weight Averaging). After enabling, `a` and `b` will directly switch to `--swa-a` and `--swa-b` values at this epoch, and reset the early stopping counter
-- `--swa-a`: Energy weight `a` for SWA phase (must be used with `--swa-start-epoch`)
-- `--swa-b`: Force weight `b` for SWA phase (must be used with `--swa-start-epoch`)
-- `--ema-start-epoch`: Epoch to start EMA (Exponential Moving Average). EMA model is the exponential moving average of main model parameters, typically enabled in later training stages
-- `--ema-decay`: EMA decay coefficient (default 0.999). Larger values are smoother but respond slower
-- `--use-ema-for-validation`: Use EMA model for validation (instead of main model)
-- `--save-ema-model`: Save EMA model weights in checkpoint
+- `--swa-start-epoch`: Epoch to start SWA (Stochastic Weight Averaging) (optional, default None). After enabling, `a` and `b` will directly switch to `--swa-a` and `--swa-b` values at this epoch, and reset early stopping counter (`best_val_loss` reset to inf, `patience_counter` reset to 0). If not set, continuous linear growth/decay strategy is used
+- `--swa-a`: Energy weight `a` for SWA phase (must be used with `--swa-start-epoch`). When reaching `swa-start-epoch`, `a` will directly switch to this value and stop growing
+- `--swa-b`: Force weight `b` for SWA phase (must be used with `--swa-start-epoch`). When reaching `swa-start-epoch`, `b` will directly switch to this value and stop decaying
+- `--ema-start-epoch`: Epoch to start EMA (Exponential Moving Average) (optional, default None). EMA model is the exponential moving average of main model parameters, typically enabled in later training stages (recommended to start at ~60%-80% of total epochs). If not set, EMA functionality is disabled
+- `--ema-decay`: EMA decay coefficient (default 0.999, range 0-1). Larger values are smoother but respond slower. Typical values: 0.999 (very smooth, recommended), 0.99 (faster response)
+- `--use-ema-for-validation`: Use EMA model for validation (instead of main model). If enabled, validation will use EMA weights for forward propagation, typically resulting in more stable validation results
+- `--save-ema-model`: Save EMA model weights in checkpoint. If enabled, checkpoint will contain `e3trans_ema_state_dict`, allowing EMA model recovery from checkpoint
 
 **Distributed Training Parameters:**
-- `--distributed`: Enable distributed training (DDP mode). Requires `torchrun` or `torch.distributed.launch`
-- `--local-rank`: Local process rank (usually automatically set by `torchrun`, no need to specify manually)
-- `--backend`: Distributed backend (default 'nccl' for GPU, 'gloo' for CPU)
+- `--distributed`: Enable distributed training (DDP mode). Requires `torchrun` or `torch.distributed.launch`. When enabled, training will automatically use multi-GPU parallelization
+- `--local-rank`: Local process rank (default -1, usually automatically set by `torchrun`, no need to specify manually). If not set, will read from environment variable `LOCAL_RANK`
+- `--backend`: Distributed backend (default 'nccl', options: 'nccl' or 'gloo'). 'nccl' for GPU training (recommended), 'gloo' for CPU training
+- `--init-method`: Distributed initialization method (default 'env://'). Usually uses environment variable initialization, no need to modify
+
+**Atomic Reference Energy (E0) Parameters:**
+- `--atomic-energy-file`: Path to CSV file containing atomic reference energies (optional, default None). CSV file should contain `Atom` and `E0` columns. If not set, will use `{data-dir}/fitted_E0.csv` (fitted from training set using least squares)
+- `--atomic-energy-keys`: List of atomic numbers (optional, must be used together with `--atomic-energy-values`). For example: `--atomic-energy-keys 1 6 7 8` represents H, C, N, O
+- `--atomic-energy-values`: Corresponding atomic reference energy values (eV, optional, must be used together with `--atomic-energy-keys`). For example: `--atomic-energy-values -430.53 -821.03 -1488.19 -2044.35`
 
 **Training Output:**
-- `combined_model.pth` - Model checkpoint
-- `combined_model_epoch{epoch}_batch_count{batch_count}.pth` - Periodically saved models (frequency controlled by `--dump-frequency`, default every 250 batches)
-- `training_YYYYMMDD_HHMMSS.log` - Training log (contains detailed batch-level information)
-- `training_YYYYMMDD_HH_loss.csv` - Loss records
-- `val_energy_epoch{epoch}_batch{batch_count}.csv` - Validation set energy predictions (frequency matches model saving)
-- `val_force_epoch{epoch}_batch{batch_count}.csv` - Validation set force predictions (frequency matches model saving)
+
+All output files are saved in the current working directory:
+
+**Model Checkpoints (saved in `checkpoint/` directory):**
+- `checkpoint/combined_model_{tensor_product_mode}.pth` - Final model (best validation performance model, filename includes tensor product mode suffix, e.g., `_spherical`, `_pure_cartesian`, etc.)
+- `checkpoint/combined_model_epoch{epoch}_batch_count{batch_count}_{tensor_product_mode}.pth` - Periodically saved intermediate models (frequency controlled by `--dump-frequency`, default every 250 batches)
+
+**Validation Results (saved in `validation/` directory, only when `--save-val-csv` is enabled):**
+- `validation/val_energy_epoch{epoch}_batch{batch_count}.csv` - Validation set energy predictions (contains Target_Energy, Predicted_Energy, Delta columns)
+- `validation/val_force_epoch{epoch}_batch{batch_count}.csv` - Validation set force predictions (contains Fx_True, Fy_True, Fz_True, Fx_Pred, Fy_Pred, Fz_Pred columns)
+
+**Log and Record Files (saved in current directory):**
+- `training_YYYYMMDD_HHMMSS.log` - Training log (contains detailed batch-level information, uses RotatingFileHandler, max 1GB per file, keeps 5 backups)
+- `loss.csv` - Loss records (contains training and validation metrics for each validation point, such as loss, RMSE, MAE, etc.)
 
 ### Step 3: Evaluate Model
 
@@ -595,6 +636,178 @@ nebtools.plot_band()
 7. **Interpolation Method**: Uses improved tangent method for path interpolation
 8. **Optimizer**: Uses FIRE optimizer, which is particularly effective for NEB optimization
 
+#### 3.4 Phonon Spectrum Calculation
+
+Calculate phonon spectrum (Hessian matrix, vibrational frequencies). Supports both non-periodic and periodic systems, uses ASE on-the-fly neighbor building by default.
+
+**Basic Usage:**
+```bash
+mff-evaluate \
+    --checkpoint combined_model.pth \
+    --phonon \
+    --phonon-input structure.xyz \
+    --device cuda
+```
+
+**Complete Parameter Example:**
+```bash
+mff-evaluate \
+    --checkpoint combined_model.pth \
+    --phonon \
+    --phonon-input structure.xyz \
+    --phonon-relax-fmax 0.01 \
+    --phonon-output my_phonon \
+    --max-radius 5.0 \
+    --atomic-energy-file fitted_E0.csv \
+    --device cuda
+```
+
+**Phonon Spectrum Parameter Description:**
+
+| Parameter | Default Value | Description |
+|-----------|---------------|-------------|
+| `--phonon` | False | Enable phonon spectrum calculation (required flag) |
+| `--phonon-input` | `structure.xyz` | Input structure file (XYZ format) |
+| `--phonon-relax-fmax` | 0.01 | Structure optimization force convergence threshold (eV/Å) |
+| `--phonon-output` | `phonon` | Output file prefix (generates `{prefix}_hessian.npy` and `{prefix}_frequencies.txt`) |
+| `--phonon-no-relax` | False | Skip structure optimization (if structure is already optimized) |
+| `--max-radius` | 5.0 | Maximum radius for neighbor search (Å) |
+| `--atomic-energy-file` | `fitted_E0.csv` | Atomic reference energy file (CSV format, contains Atom and E0 columns) |
+
+**Phonon Spectrum Workflow:**
+1. Load input structure (`--phonon-input`)
+2. Optional: Use BFGS optimizer for structure optimization (unless `--phonon-no-relax` is used)
+3. Use ASE on-the-fly neighbor list to build graph structure (automatically handles periodic boundary conditions)
+4. Compute Hessian matrix (second derivative of energy with respect to positions, shape: `[N_atoms * 3, N_atoms * 3]`)
+5. Calculate phonon frequencies from Hessian matrix (via dynamical matrix diagonalization)
+6. Save results to files
+
+**Output Files:**
+- `{prefix}_hessian.npy` - Hessian matrix (NumPy format, units: eV/Å²)
+- `{prefix}_frequencies.txt` - Phonon frequency list (units: cm⁻¹, negative values indicate imaginary frequencies/unstable modes)
+
+**Output File Format:**
+
+`{prefix}_frequencies.txt` format example:
+```
+# Phonon frequencies (cm⁻¹)
+# Negative values indicate imaginary frequencies (unstable modes)
+# Index    Frequency (cm⁻¹)
+     0       1234.567890
+     1        987.654321
+     2        456.789012
+   ...
+```
+
+**Example 1: Non-Periodic System (Molecule)**
+```bash
+mff-evaluate \
+    --checkpoint best_model.pth \
+    --phonon \
+    --phonon-input water.xyz \
+    --phonon-relax-fmax 0.01 \
+    --phonon-output water_phonon \
+    --device cuda
+```
+
+**Example 2: Periodic System (Crystal)**
+```bash
+mff-evaluate \
+    --checkpoint best_model.pth \
+    --phonon \
+    --phonon-input crystal.xyz \
+    --phonon-relax-fmax 0.01 \
+    --phonon-output crystal_phonon \
+    --max-radius 5.0 \
+    --device cuda
+```
+
+**Example 3: Skip Structure Optimization (Already Optimized Structure)**
+```bash
+mff-evaluate \
+    --checkpoint best_model.pth \
+    --phonon \
+    --phonon-input pre_relaxed.xyz \
+    --phonon-no-relax \
+    --phonon-output phonon \
+    --device cuda
+```
+
+**Example 4: High Precision Calculation (Stricter Optimization)**
+```bash
+mff-evaluate \
+    --checkpoint best_model.pth \
+    --phonon \
+    --phonon-input structure.xyz \
+    --phonon-relax-fmax 0.005 \
+    --phonon-output phonon_high_precision \
+    --dtype float64 \
+    --device cuda
+```
+
+**View and Analyze Results:**
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Read Hessian matrix
+hessian = np.load('phonon_hessian.npy')
+print(f"Hessian shape: {hessian.shape}")
+print(f"Hessian range: [{hessian.min():.6f}, {hessian.max():.6f}] eV/Å²")
+
+# Check symmetry
+is_symmetric = np.allclose(hessian, hessian.T, atol=1e-4)
+print(f"Hessian symmetric: {is_symmetric}")
+
+# Read frequencies
+frequencies = []
+with open('phonon_frequencies.txt', 'r') as f:
+    for line in f:
+        if line.strip() and not line.startswith('#'):
+            parts = line.split()
+            if len(parts) >= 2:
+                freq = float(parts[1])
+                frequencies.append(freq)
+
+frequencies = np.array(frequencies)
+print(f"\nTotal modes: {len(frequencies)}")
+print(f"Real modes (≥0): {np.sum(frequencies >= 0)}")
+print(f"Imaginary modes (<0): {np.sum(frequencies < 0)}")
+print(f"Frequency range: [{frequencies.min():.2f}, {frequencies.max():.2f}] cm⁻¹")
+
+# Plot frequency distribution
+plt.figure(figsize=(10, 6))
+plt.hist(frequencies[frequencies >= 0], bins=50, alpha=0.7, label='Real frequencies')
+if np.any(frequencies < 0):
+    plt.hist(frequencies[frequencies < 0], bins=20, alpha=0.7, label='Imaginary frequencies', color='red')
+plt.xlabel('Frequency (cm⁻¹)', fontsize=12)
+plt.ylabel('Count', fontsize=12)
+plt.title('Phonon Frequency Distribution', fontsize=14)
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.savefig('phonon_frequencies.png', dpi=300)
+plt.close()
+```
+
+**Notes:**
+1. **Structure Optimization**: Recommend optimizing structure to energy minimum before calculation (enabled by default). If structure is not optimized, imaginary frequencies (negative frequencies) may appear
+2. **Periodic Boundary Conditions**: If input structure contains cell information (`Lattice` attribute), PBC and on-the-fly neighbor building will be automatically used
+3. **Neighbor Building**: Uses ASE on-the-fly neighbor list by default, automatically handles non-periodic and periodic systems
+4. **Large Systems**: For systems with >100 atoms, Hessian calculation may be slow (O(N²) complexity)
+5. **Atomic Energies**: Need to provide correct atomic reference energies (via `--atomic-energy-file` or `fitted_E0.csv` generated during training)
+6. **Imaginary Frequencies**: If imaginary frequencies (negative values) appear, it indicates the structure is unstable, need further optimization or check the structure
+7. **Hessian Symmetry**: Theoretically Hessian matrix should be symmetric, numerical error is usually < 1e-4
+8. **Units**:
+   - Hessian matrix: eV/Å²
+   - Frequency: cm⁻¹
+   - Real frequency: positive values (stable modes)
+   - Imaginary frequency: negative values (unstable modes)
+
+**Dependency Requirements:**
+```bash
+pip install scipy  # Required for phonon spectrum calculation (for matrix diagonalization)
+pip install ase    # Structure processing and neighbor lists (usually already installed)
+```
 
 ## Python API Usage
 
@@ -668,6 +881,14 @@ val_loader = DataLoader(
 # Model configuration
 config = ModelConfig()
 
+# num_interaction notes:
+# - Meaning: number of interaction (convolution) layers in E3_TransformerLayer_multi and cartesian variants
+# - Range: minimum 2, default 2; n layers will chain n convolutions
+# - Effect: concatenates f1..fn and expands f_combine_product to (n-1)*32x0e
+#
+# Example: set to 3 interactions
+#   num_interaction=3
+
 # Initialize model
 model = MainNet(
     input_size=config.input_dim_weight,
@@ -694,6 +915,7 @@ e3trans = E3_TransformerLayer_multi(
     embed_size=config.embed_size,
     main_hidden_sizes3=config.main_hidden_sizes3,
     num_layers=config.num_layers,
+    num_interaction=2,
     device=device
 ).to(device)
 
@@ -807,6 +1029,7 @@ e3trans = E3_TransformerLayer_multi(
     embed_size=config.embed_size,
     main_hidden_sizes3=config.main_hidden_sizes3,
     num_layers=config.num_layers,
+    num_interaction=2,
     function_type_main=config.function_type,
     device=device
 ).to(device)
@@ -968,7 +1191,124 @@ print(f"  Reaction energy:   {e_final - e_initial:.4f} eV")
 print("=" * 60)
 ```
 
+### Example 6: Phonon Spectrum Calculation (Hessian and Frequencies)
 
+```python
+from ase.io import read
+from ase.optimize import BFGS
+from ase.data import atomic_masses, atomic_numbers
+from ase.neighborlist import neighbor_list
+from molecular_force_field.evaluation.calculator import MyE3NNCalculator
+from molecular_force_field.evaluation.evaluator import Evaluator
+from molecular_force_field.models import E3_TransformerLayer_multi
+from molecular_force_field.utils.config import ModelConfig
+import torch
+import numpy as np
+
+# Load model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+checkpoint = torch.load('combined_model.pth', map_location=device)
+
+config = ModelConfig()
+config.load_atomic_energies_from_file('fitted_E0.csv')
+
+e3trans = E3_TransformerLayer_multi(...).to(device)
+e3trans.load_state_dict(checkpoint['e3trans_state_dict'])
+e3trans.eval()
+
+# Create calculator and evaluator
+ref_energies_dict = {
+    k.item(): v.item()
+    for k, v in zip(config.atomic_energy_keys, config.atomic_energy_values)
+}
+calc = MyE3NNCalculator(e3trans, ref_energies_dict, device, max_radius=5.0)
+
+class SimpleDataset:
+    def restore_force(self, x):
+        return x
+    def restore_energy(self, x):
+        return x
+
+dataset = SimpleDataset()
+evaluator = Evaluator(
+    model=e3trans,
+    dataset=dataset,
+    device=device,
+    atomic_energy_keys=config.atomic_energy_keys,
+    atomic_energy_values=config.atomic_energy_values,
+)
+
+# Read structure
+atoms = read('structure.xyz')
+atoms.calc = calc
+
+# Optional: Optimize structure
+print("Relaxing structure...")
+optimizer = BFGS(atoms, logfile=None)
+optimizer.run(fmax=0.01)
+print(f"Relaxation completed. Final forces: max={atoms.get_forces().max():.6f} eV/Å")
+
+# Prepare data
+pos = torch.tensor(atoms.get_positions(), dtype=torch.get_default_dtype(), device=device)
+A = torch.tensor([atomic_numbers[symbol] for symbol in atoms.get_chemical_symbols()], 
+                 dtype=torch.long, device=device)
+batch_idx = torch.zeros(len(atoms), dtype=torch.long, device=device)
+
+# Build graph (using ASE on-the-fly neighbor list)
+cell_array = atoms.cell.array
+pbc_flags = atoms.pbc
+if cell_array is None or np.abs(cell_array).sum() <= 1e-9:
+    cell_array = np.eye(3) * 100.0
+    pbc_flags = [False, False, False]
+
+atoms_nl = atoms.copy()
+atoms_nl.cell = cell_array
+atoms_nl.pbc = pbc_flags
+
+edge_src_np, edge_dst_np, edge_shifts_np = neighbor_list('ijS', atoms_nl, max_radius=5.0)
+edge_src = torch.tensor(edge_src_np, dtype=torch.long, device=device)
+edge_dst = torch.tensor(edge_dst_np, dtype=torch.long, device=device)
+edge_shifts = torch.tensor(edge_shifts_np, dtype=torch.float64, device=device)
+cell = torch.tensor(cell_array, dtype=torch.get_default_dtype(), device=device).unsqueeze(0)
+
+# Compute Hessian matrix
+print("Computing Hessian matrix...")
+hessian = evaluator.compute_hessian(
+    pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell
+)
+
+print(f"Hessian shape: {hessian.shape}")
+print(f"Hessian range: [{hessian.min():.6f}, {hessian.max():.6f}] eV/Å²")
+
+# Check symmetry
+is_symmetric = torch.allclose(hessian, hessian.T, atol=1e-4)
+print(f"Hessian symmetric: {is_symmetric}")
+
+# Get atomic masses
+masses = torch.tensor([atomic_masses[atomic_numbers[symbol]] 
+                      for symbol in atoms.get_chemical_symbols()],
+                     dtype=torch.get_default_dtype())
+
+# Compute phonon spectrum
+print("Computing phonon spectrum...")
+frequencies = evaluator.compute_phonon_spectrum(
+    hessian, masses, output_prefix='phonon'
+)
+
+print(f"\nPhonon calculation completed!")
+print(f"Total modes: {len(frequencies)}")
+print(f"Real modes: {np.sum(frequencies >= 0)}")
+print(f"Imaginary modes: {np.sum(frequencies < 0)}")
+print(f"Frequency range: [{frequencies.min():.2f}, {frequencies.max():.2f}] cm⁻¹")
+
+# Analyze results
+if np.any(frequencies < 0):
+    print(f"\n⚠️  Warning: {np.sum(frequencies < 0)} imaginary frequencies detected!")
+    print("   This indicates the structure may not be at a local minimum.")
+    print("   Consider further optimization or checking the structure.")
+else:
+    print("\n✅ All frequencies are real (structure is stable).")
+```
 
 ## Frequently Asked Questions
 
@@ -1216,14 +1556,17 @@ mff-train -a 1.0 -b 10.0 --update-param 2000
 # Slow adjustment (suitable for very long training, 200k+ batches)
 mff-train -a 1.0 -b 10.0 --weight-a-growth 1.005 --weight-b-decay 0.995
 
-# Medium adjustment (recommended, suitable for most cases)
+# Medium adjustment (more stable, suitable for most cases)
 mff-train -a 1.0 -b 10.0 --weight-a-growth 1.01 --weight-b-decay 0.99
 
 # Fast adjustment (suitable for short training, <50k batches)
 mff-train -a 1.0 -b 10.0 --weight-a-growth 1.02 --weight-b-decay 0.98
+
+# Very fast adjustment (default)
+mff-train -a 1.0 -b 10.0 --weight-a-growth 1.05 --weight-b-decay 0.98
 ```
 
-Automatic adjustment rule: Every `--update-param` batches, `a` is multiplied by `--weight-a-growth` (increase), `b` is multiplied by `--weight-b-decay` (decrease), to gradually balance the importance of energy and forces. **Note: `a` and `b` have no range limits and will continue to adjust according to the above rules.**
+Automatic adjustment rule: Every `--update-param` batches, `a` is multiplied by `--weight-a-growth` (increase), `b` is multiplied by `--weight-b-decay` (decrease), to gradually balance the importance of energy and forces. **Note: `a` and `b` are clamped to [1, 1000] by default to prevent excessive drift in long training.**
 
 **Optional: Set ranges for a / b (Clamp)** (suitable for long training to prevent excessive weight drift):
 ```bash
@@ -1236,8 +1579,9 @@ mff-train \
 
 **Rate selection recommendations:**
 - **Slow (1.005/0.995)**: Suitable for very long training (>200k batches), weight changes are gradual, training is more stable
-- **Medium (1.01/0.99)**: **Recommended default**, suitable for most training scenarios (50k-200k batches), balances stability and adjustment speed
+- **Medium (1.01/0.99)**: Suitable for most training scenarios (50k-200k batches), balances stability and adjustment speed
 - **Fast (1.02/0.98)**: Suitable for short training (<50k batches), fast weight adjustment, but may cause instability in later training stages
+- **Default (1.05/0.98)**: More aggressive; can converge faster but may be less stable—switch to medium/slow if oscillating
 
 ### Q: How to adjust optimizer parameters?
 
@@ -1647,7 +1991,7 @@ mff-train \
 
 6. **Early Stopping**: If **weighted validation loss** (`a × energy loss + b × force loss`) does not improve for `--patience` consecutive epochs, training will automatically stop. This can prevent overfitting and save time. Early stopping criterion is consistent with total loss during training.
 
-7. **Automatic Weight Adjustment**: `a` and `b` will automatically adjust during training (every `--update-param` batches). `a` is multiplied by `--weight-a-growth` (default 1.01, i.e., 1% increase), `b` is multiplied by `--weight-b-decay` (default 0.99, i.e., 1% decrease), to balance the importance of energy and forces. If training is unstable, you can:
+7. **Automatic Weight Adjustment**: `a` and `b` will automatically adjust during training (every `--update-param` batches). `a` is multiplied by `--weight-a-growth` (default 1.05, i.e., 5% increase), `b` is multiplied by `--weight-b-decay` (default 0.98, i.e., 2% decrease), to balance the importance of energy and forces. If training is unstable, you can:
    - Increase `--update-param` (reduce adjustment frequency)
    - Use slower adjustment rate (`--weight-a-growth 1.005 --weight-b-decay 0.995`)
    - Fix weights (set `--update-param` to a very large value, e.g., 1000000)

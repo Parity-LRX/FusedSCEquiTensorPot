@@ -77,12 +77,12 @@ class Trainer:
         force_shift_value=1,
         a=1,
         b=10,
-        weight_a_growth=1.01,
-        weight_b_decay=0.99,
-        a_min=None,
-        a_max=None,
-        b_min=None,
-        b_max=None,
+        weight_a_growth=1.05,
+        weight_b_decay=0.98,
+        a_min=1.0,
+        a_max=1000.0,
+        b_min=1.0,
+        b_max=1000.0,
         swa_start_epoch=None,
         swa_a=None,
         swa_b=None,
@@ -250,10 +250,17 @@ class Trainer:
         # Initialize training state (will be updated if loading from checkpoint)
         self.start_epoch = 1
         self.batch_count = 0
+        # Best validation metric used for early stopping / best checkpoint.
+        # NOTE: This tracks a composite metric:
+        #   metric = val_energy_rmse + (b / a) * val_force_rmse
+        # where val_*_rmse are restored to original units.
         self.best_val_loss = float('inf')
         self.patience_counter = 0
         self.resumed_from_checkpoint = False
         self.best_checkpoint_path = None  # Path to the best checkpoint file
+
+        # Clamp initial weights (and any user-provided weights) to bounds
+        self._clamp_loss_weights()
         
         if atomic_energy_keys is None:
             self.keys = torch.tensor([1, 6, 7, 8]).to(device)
@@ -364,6 +371,17 @@ class Trainer:
         if checkpoint_to_load:
             self.load_checkpoint(checkpoint_to_load)
     
+    def _clamp_loss_weights(self):
+        """Clamp loss weights a/b to configured bounds."""
+        if self.a_min is not None:
+            self.a = max(self.a, self.a_min)
+        if self.a_max is not None:
+            self.a = min(self.a, self.a_max)
+        if self.b_min is not None:
+            self.b = max(self.b, self.b_min)
+        if self.b_max is not None:
+            self.b = min(self.b, self.b_max)
+
     def load_checkpoint(self, checkpoint_path):
         """Load checkpoint and restore training state."""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -380,9 +398,11 @@ class Trainer:
                 self.a = checkpoint['a']
             if 'b' in checkpoint:
                 self.b = checkpoint['b']
+            self._clamp_loss_weights()
             if self.is_main_process:
                 logging.info(f"  Using loss weights from checkpoint: a={self.a:.4f}, b={self.b:.4f}")
         else:
+            self._clamp_loss_weights()
             if self.is_main_process:
                 logging.info(f"  Using new loss weights (ignoring checkpoint): a={self.a:.4f}, b={self.b:.4f}")
         if 'swa_applied' in checkpoint:
@@ -418,7 +438,7 @@ class Trainer:
                 logging.info(f"  Loss weights (from checkpoint): a={self.a:.4f}, b={self.b:.4f}")
             else:
                 logging.info(f"  Loss weights (new, ignoring checkpoint): a={self.a:.4f}, b={self.b:.4f}")
-            logging.info(f"  Best validation loss: {self.best_val_loss:.6f}")
+            logging.info(f"  Best validation metric (E_RMSE + b/a * F_RMSE): {self.best_val_loss:.6f}")
             logging.info(f"  Early stopping patience counter: {self.patience_counter}/{self.patience}")
             logging.info("=" * 80)
     
@@ -497,6 +517,7 @@ class Trainer:
                 # Apply SWA: directly set a and b to SWA values
                 self.a = self.swa_a
                 self.b = self.swa_b
+                self._clamp_loss_weights()
                 self.swa_applied = True
 
                 # IMPORTANT: early-stopping metric is energy_loss + force_loss (unweighted).
@@ -529,7 +550,7 @@ class Trainer:
                 if self.is_main_process and self.batch_count % self.update_param == 0:
                     self.a *= self.weight_a_growth
                     self.b *= self.weight_b_decay
-                    # Optional clamps (enabled only if user provides bounds)
+                    # Clamp weights to configured bounds
                     if self.a_min is not None:
                         self.a = max(self.a, self.a_min)
                     if self.a_max is not None:
@@ -929,23 +950,27 @@ class Trainer:
         val_force_rmse = self.val_dataset.restore_force(val_force_rmse)  # Restore units for consistency
         val_force_mae = F.l1_loss(all_F_preds.view(-1), all_F_targets.view(-1)).item()
         val_force_mae = self.val_dataset.restore_force(val_force_mae)  # Restore units for consistency
-        val_force_loss = F.mse_loss(all_F_preds.view(-1), all_F_targets.view(-1)).item()  # For early stopping
+        val_force_loss = F.mse_loss(all_F_preds.view(-1), all_F_targets.view(-1)).item()  # For logging
         
-        # Calculate current validation loss for early stopping: energy_loss + force_loss (unweighted)
-        current_val_loss = val_energy_loss + val_force_loss
+        # Keep total loss for logging, but use a composite metric for best/early-stop:
+        # metric = val_energy_rmse + (b/a) * val_force_rmse
+        current_val_loss = self.a * val_energy_loss + self.b * val_force_loss
+        ab_ratio = (self.b / self.a) if self.a != 0 else 0.0
+        current_val_metric = val_energy_rmse + ab_ratio * val_force_rmse
 
         # Log validation results (only on main process)
         if self.is_main_process:
             logging.info(f"""
                                 "Val Loss (MSE)": {val_energy_loss},
                                 "Val Force Loss (MSE)": {val_force_loss},
-                                "Val Total Loss (E+F, unweighted)": {current_val_loss},
+                                "Val Total Loss (E+F, weighted)": {current_val_loss},
                                 "Val Energy RMSE": {val_energy_rmse},
                                 "Val Energy MAE": {val_energy_mae},
                                 "Val Energy RMSE/atom": {val_energy_rmse_avg},
                                 "Val Energy MAE/atom": {val_energy_mae_avg},
                                 "Val Force RMSE":  {val_force_rmse},
                                 "Val Force MAE": {val_force_mae},
+                                "Val Metric (E_RMSE + b/a * F_RMSE)": {current_val_metric},
                                 "Current learning rate": {self.optimizer.param_groups[0]['lr']},
                                 "a (energy weight)": {self.a},
                                 "b (force weight)": {self.b}
@@ -975,20 +1000,20 @@ class Trainer:
                 force_save_path = os.path.join(self.val_results_dir, force_filename)
                 df_force_val.to_csv(force_save_path, index=False)
         
-        # Early stopping - use unweighted sum of energy and force loss (energy_loss + force_loss)
+        # Early stopping / best checkpoint - use composite metric only
         if self.distributed:
-            # Broadcast current_val_loss from rank 0 to ensure consistency
-            val_loss_tensor = torch.tensor([current_val_loss], device=self.device)
-            dist.broadcast(val_loss_tensor, src=0)
-            current_val_loss_synced = val_loss_tensor.item()
+            # Broadcast current_val_metric from rank 0 to ensure consistency
+            val_metric_tensor = torch.tensor([current_val_metric], device=self.device)
+            dist.broadcast(val_metric_tensor, src=0)
+            current_val_metric_synced = val_metric_tensor.item()
         else:
-            current_val_loss_synced = current_val_loss
+            current_val_metric_synced = current_val_metric
         
-        if current_val_loss_synced < self.best_val_loss:
-            self.best_val_loss = current_val_loss_synced
+        if current_val_metric_synced < self.best_val_loss:
+            self.best_val_loss = current_val_metric_synced
             self.patience_counter = 0
             
-            # Save best checkpoint when validation loss improves
+            # Save best checkpoint when validation metric improves
             if self.is_main_process:
                 # Extract state_dict from DDP model if needed
                 if self.distributed:
@@ -1014,7 +1039,7 @@ class Trainer:
                 # Save best checkpoint to a temporary file
                 self.best_checkpoint_path = os.path.join(self.checkpoint_dir, 'best_model_temp.pth')
                 torch.save(best_checkpoint_dict, self.best_checkpoint_path)
-                logging.info(f"New best validation loss: {self.best_val_loss:.6f} - Best checkpoint saved")
+                logging.info(f"New best validation metric: {self.best_val_loss:.6f} - Best checkpoint saved")
         else:
             self.patience_counter += 1
         
@@ -1040,7 +1065,8 @@ class Trainer:
             'train_energy_mae_avg': 0,
             'train_force_rmse': 0,
             'train_force_mae': 0,
-            'val_total_loss': current_val_loss_synced if self.distributed else current_val_loss,
+            # Keep total loss for analysis (not used for early stopping / best checkpoint)
+            'val_total_loss': current_val_loss,
             'val_energy_loss': val_energy_loss,
             'val_force_loss': val_force_loss,
             'val_energy_rmse': val_energy_rmse,
@@ -1331,7 +1357,7 @@ class Trainer:
                 break
         
         # Save final checkpoint (only save e3trans as MainNet is not used in inference)
-        # Save the best checkpoint (with best validation loss) as the final checkpoint
+        # Save the best checkpoint (with best validation metric) as the final checkpoint
         if self.is_main_process:
             if self.best_checkpoint_path and os.path.exists(self.best_checkpoint_path):
                 # Load best checkpoint and save as final checkpoint
@@ -1345,7 +1371,7 @@ class Trainer:
                 best_checkpoint['epoch'] = last_epoch
                 
                 logging.info(f"Saving final checkpoint (best model) to {self.checkpoint_save_path}...")
-                logging.info(f"  Best validation loss: {self.best_val_loss:.6f}")
+                logging.info(f"  Best validation metric (E_RMSE + b/a * F_RMSE): {self.best_val_loss:.6f}")
                 logging.info(f"  Best model from epoch: {best_epoch}, batch_count: {best_batch_count}")
                 
                 torch.save(best_checkpoint, self.checkpoint_save_path)

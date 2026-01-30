@@ -306,7 +306,7 @@ class E3_TransformerLayer_multi(nn.Module):
                  irreps_input, irreps_query, irreps_key, irreps_value, irreps_output,
                  irreps_sh, hidden_dim_sh, hidden_dim, channel_in2=32, embedding_dim=16,
                  max_atomvalue=10, output_size=8, embed_size=None, main_hidden_sizes3=None,
-                 num_layers=1, device=None, function_type_main='gaussian'):
+                 num_layers=1, device=None, function_type_main='gaussian', num_interaction=2):
         super(E3_TransformerLayer_multi, self).__init__()
         
         # Default values
@@ -344,36 +344,43 @@ class E3_TransformerLayer_multi(nn.Module):
         self.number_of_basis = main_number_of_basis
         
         
-        # E3 convolution layers
-        # Original code: E3Conv(number_of_basis, max_embed_radius, irreps_input_conv, irreps_output_conv)
-        # But E3Conv signature is: E3Conv(max_radius, number_of_basis, irreps_input_conv, irreps_output, ...)
-        # So we match the signature, not the original call order
-        self.e3_conv_emb = E3Conv(
-            max_radius=max_embed_radius,
-            number_of_basis=main_number_of_basis,
-            irreps_output=irreps_input,
-            embedding_dim=embedding_dim,
-            max_atomvalue=max_atomvalue,
-            output_size=output_size,
-            main_hidden_sizes3=main_hidden_sizes3,
-            embed_size=embed_size,
-            emb_number=emb_number,
-            atomic_energy_keys=torch.tensor([1, 6, 7, 8], device=self.device),
+        self.num_interaction = int(num_interaction)
+        if self.num_interaction < 2:
+            raise ValueError(f"num_interaction must be >= 2, got {self.num_interaction}")
+
+        # E3 convolution layers (one module per interaction)
+        # First layer uses E3Conv; subsequent layers use E3Conv2
+        self.e3_conv_layers = nn.ModuleList()
+        self.e3_conv_layers.append(
+            E3Conv(
+                max_radius=max_embed_radius,
+                number_of_basis=main_number_of_basis,
+                irreps_output=irreps_input,
+                embedding_dim=embedding_dim,
+                max_atomvalue=max_atomvalue,
+                output_size=output_size,
+                main_hidden_sizes3=main_hidden_sizes3,
+                embed_size=embed_size,
+                emb_number=emb_number,
+                atomic_energy_keys=torch.tensor([1, 6, 7, 8], device=self.device),
+            )
         )
-        # Original code: E3Conv2(number_of_basis, max_embed_radius, irreps_output_conv, irreps_output_conv)
-        self.e3_conv_emb2 = E3Conv2(
-            max_radius=max_embed_radius,
-            number_of_basis=main_number_of_basis,
-            irreps_input_conv=irreps_input,
-            irreps_output=irreps_input,
-            embedding_dim=embedding_dim,
-            max_atomvalue=max_atomvalue,
-            output_size=output_size,
-            main_hidden_sizes3=main_hidden_sizes3,
-            embed_size=embed_size,
-            emb_number=emb_number,
-            atomic_energy_keys=torch.tensor([1, 6, 7, 8], device=self.device),
-        )
+        for _ in range(1, self.num_interaction):
+            self.e3_conv_layers.append(
+                E3Conv2(
+                    max_radius=max_embed_radius,
+                    number_of_basis=main_number_of_basis,
+                    irreps_input_conv=irreps_input,
+                    irreps_output=irreps_input,
+                    embedding_dim=embedding_dim,
+                    max_atomvalue=max_atomvalue,
+                    output_size=output_size,
+                    main_hidden_sizes3=main_hidden_sizes3,
+                    embed_size=embed_size,
+                    emb_number=emb_number,
+                    atomic_energy_keys=torch.tensor([1, 6, 7, 8], device=self.device),
+                )
+            )
         self.f2_proj = o3.Linear(self.irreps_output_conv, self.irreps_output_conv)
 
         # Product layers
@@ -386,10 +393,12 @@ class E3_TransformerLayer_multi(nn.Module):
             normalization='component'
         )
         
+        irreps_input_multi = o3.Irreps(irreps_input) * self.num_interaction
+        scalar_channels = (self.num_interaction - 1) * 32
         self.product_3 = o3.FullyConnectedTensorProduct(
-            irreps_input * 2,
-            irreps_input * 2,
-            "32x0e",
+            irreps_input_multi,
+            irreps_input_multi,
+            f"{scalar_channels}x0e",
             shared_weights=True,
             internal_weights=True,
             normalization='component'
@@ -404,9 +413,10 @@ class E3_TransformerLayer_multi(nn.Module):
             normalization='component'
         )
 
+        irreps_product_5 = irreps_input_multi + self.product_3.irreps_out
         self.product_5 = o3.ElementwiseTensorProduct(
-            irreps_input+ irreps_input + self.product_3.irreps_out,
-            irreps_input+ irreps_input + self.product_3.irreps_out,
+            irreps_product_5,
+            irreps_product_5,
             ["0e"],
             normalization='component'
         )
@@ -440,9 +450,13 @@ class E3_TransformerLayer_multi(nn.Module):
             for _ in range(num_layers)
         ])
 
-        self.linear_layer_2 = o3.Linear(self.irreps_input, hidden_dim_sh)
+        if isinstance(hidden_dim_sh, int):
+            hidden_dim_sh_irreps = f"{hidden_dim_sh}x0e"
+        else:
+            hidden_dim_sh_irreps = hidden_dim_sh
+        self.linear_layer_2 = o3.Linear(self.irreps_input, hidden_dim_sh_irreps)
         self.non_linearity = nn.SiLU()
-        self.linear_layer_3 = o3.Linear(hidden_dim_sh, "1x0e")
+        self.linear_layer_3 = o3.Linear(hidden_dim_sh_irreps, "1x0e")
         
         self.tp_featrue = o3.FullyConnectedTensorProduct(
             irreps_in1="16x0e",
@@ -504,8 +518,12 @@ class E3_TransformerLayer_multi(nn.Module):
         edge_dst = edge_dst[sort_idx]
         edge_shifts = edge_shifts[sort_idx]  # PBC offset also needs sorting
         
-        f1 = self.e3_conv_emb(pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
-        f2 = self.e3_conv_emb2(f1, pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
+        features = []
+        f_prev = self.e3_conv_layers[0](pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
+        features.append(f_prev)
+        for conv in self.e3_conv_layers[1:]:
+            f_prev = conv(f_prev, pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
+            features.append(f_prev)
 
         edge_batch_idx = batch[edge_src]  # (Total_Edges,)
         edge_cells = cell[edge_batch_idx]  # (Total_Edges, 3, 3)
@@ -517,10 +535,10 @@ class E3_TransformerLayer_multi(nn.Module):
         edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
         edge_length = edge_vec.norm(dim=1)
         
-        f_combine = torch.cat([f1] + [f2], dim=-1)
+        f_combine = torch.cat(features, dim=-1)
         f_combine_product = self.product_3(f_combine, f_combine)
         
-        T = torch.cat([f1] + [f2] + [f_combine_product], dim=-1)
+        T = torch.cat(features + [f_combine_product], dim=-1)
         f2_product_5 = self.product_5(T, T)
 
         product_proj = self.proj_total(f2_product_5)

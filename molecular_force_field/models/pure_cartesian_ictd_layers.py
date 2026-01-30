@@ -236,6 +236,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         embed_size=None,
         main_hidden_sizes3=None,
         num_layers: int = 1,
+        num_interaction: int = 2,
         device=None,
         function_type_main: str = "gaussian",
         lmax: int = 2,
@@ -265,6 +266,10 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         self.channels = int(hidden_dim_conv)
         self.irreps_dim = _irreps_total_dim(self.channels, self.lmax)
 
+        self.num_interaction = int(num_interaction)
+        if self.num_interaction < 2:
+            raise ValueError(f"num_interaction must be >= 2, got {self.num_interaction}")
+
         self.max_radius = float(max_embed_radius)
         self.number_of_basis = int(main_number_of_basis)
         self.function_type = str(function_type_main)
@@ -284,40 +289,47 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             internal_compute_dtype=internal_compute_dtype,
         )
 
-        # conv2: node irreps (mul=C) x edge Y_l (mul=1) -> node irreps (mul=C), per-edge weights
-        self.tp2 = HarmonicFullyConnectedTensorProduct(
-            mul_in1=self.channels,
-            mul_in2=1,
-            mul_out=self.channels,
-            lmax=self.lmax,
-            internal_weights=True,
-            path_policy=ictd_tp_path_policy,
-            max_rank_other=ictd_tp_max_rank_other,
-            internal_compute_dtype=internal_compute_dtype,
-        )
-        self.fc2 = nn.Sequential(
-            nn.Linear(main_number_of_basis, 64),
-            nn.SiLU(),
-            nn.Linear(64, 64),
-            nn.SiLU(),
-            nn.Linear(64, self.tp2.num_paths),
-        )
+        # conv2..convN: node irreps (mul=C) x edge Y_l (mul=1) -> node irreps (mul=C), per-edge weights
+        self.tp2_layers = nn.ModuleList()
+        self.fc2_layers = nn.ModuleList()
+        for _ in range(self.num_interaction - 1):
+            tp2 = HarmonicFullyConnectedTensorProduct(
+                mul_in1=self.channels,
+                mul_in2=1,
+                mul_out=self.channels,
+                lmax=self.lmax,
+                internal_weights=True,
+                path_policy=ictd_tp_path_policy,
+                max_rank_other=ictd_tp_max_rank_other,
+                internal_compute_dtype=internal_compute_dtype,
+            )
+            fc2 = nn.Sequential(
+                nn.Linear(main_number_of_basis, 64),
+                nn.SiLU(),
+                nn.Linear(64, 64),
+                nn.SiLU(),
+                nn.Linear(64, tp2.num_paths),
+            )
+            self.tp2_layers.append(tp2)
+            self.fc2_layers.append(fc2)
 
         # Readout invariants:
         #  - scalars: per-l channel Gram -> 32
         #  - norms: per-l per-channel L2 over m
+        combined_channels = self.channels * self.num_interaction
+        scalar_channels = (self.num_interaction - 1) * 32
         self.W_read = nn.ParameterList([
-            nn.Parameter(torch.randn(32, self.channels * 2, self.channels * 2) * 0.02)
+            nn.Parameter(torch.randn(scalar_channels, combined_channels, combined_channels) * 0.02)
             for _ in range(self.lmax + 1)
         ])
         self.readout_linear = nn.Sequential(
-            nn.Linear(32 + (self.lmax + 1) * (self.channels * 2), embed_size[0]),
+            nn.Linear(scalar_channels + (self.lmax + 1) * combined_channels, embed_size[0]),
             nn.SiLU(),
             nn.Linear(embed_size[0], 17),
         )
         self.weighted_sum = RobustScalarWeightedSum(17, init_weights="zero")
         # Match e3nn-style product_5:
-        # T = cat([f1, f2, scalars]); ElementwiseTensorProduct(T,T)->0e
+        # T = cat([f1..fn, scalars]); ElementwiseTensorProduct(T,T)->0e
         if product5_muls_by_l is None:
             self.product5_muls_by_l = {l: self.channels for l in range(self.lmax + 1)}
         else:
@@ -329,21 +341,21 @@ class PureCartesianICTDTransformerLayer(nn.Module):
                 if self.product5_muls_by_l[l] <= 0:
                     raise ValueError(f"product5_muls_by_l[{l}] must be positive, got {self.product5_muls_by_l[l]}")
 
-        # Optional per-l channel adapters for f1 and f2 to match desired muls_by_l.
+        # Optional per-l channel adapters for f1..fn to match desired muls_by_l.
         # Default is identity (mul_l == channels).
-        self._p5_adapt_f1 = nn.ModuleDict()
-        self._p5_adapt_f2 = nn.ModuleDict()
-        for l in range(self.lmax + 1):
-            out_ch = self.product5_muls_by_l[l]
-            if out_ch == self.channels:
-                self._p5_adapt_f1[str(l)] = nn.Identity()
-                self._p5_adapt_f2[str(l)] = nn.Identity()
-            else:
-                self._p5_adapt_f1[str(l)] = nn.Linear(self.channels, out_ch, bias=False)
-                self._p5_adapt_f2[str(l)] = nn.Linear(self.channels, out_ch, bias=False)
+        self._p5_adapt = nn.ModuleList()
+        for _ in range(self.num_interaction):
+            layer_adapt = nn.ModuleDict()
+            for l in range(self.lmax + 1):
+                out_ch = self.product5_muls_by_l[l]
+                if out_ch == self.channels:
+                    layer_adapt[str(l)] = nn.Identity()
+                else:
+                    layer_adapt[str(l)] = nn.Linear(self.channels, out_ch, bias=False)
+            self._p5_adapt.append(layer_adapt)
 
         sum_mul = sum(self.product5_muls_by_l[l] for l in range(self.lmax + 1))
-        self.proj_total = MainNet(2 * sum_mul + 32, embed_size, 17)
+        self.proj_total = MainNet(self.num_interaction * sum_mul + scalar_channels, embed_size, 17)
 
     def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell):
         dtype = next(self.parameters()).dtype
@@ -373,30 +385,41 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             precomputed_edge_length=edge_length,
             precomputed_Y_list=Y_list,
         )  # (N, C*(lmax+1)^2)
+        features = [f1]
 
-        # conv2: node irreps x edge Y_l -> node irreps
-        n = n.to(dtype=f1.dtype)
-        edge_length = edge_length.to(dtype=f1.dtype)
-        # reuse Y_list (computed above) and only reshape
-        Y = {l: Y_list[l].to(dtype=f1.dtype).unsqueeze(-2) for l in range(self.lmax + 1)}  # (E,1,2l+1)
-        emb = soft_one_hot_linspace(edge_length, 0.0, self.max_radius, self.number_of_basis, basis=self.function_type, cutoff=True)
-        emb = emb.mul(self.number_of_basis ** 0.5).to(dtype=f1.dtype)
-        gates = self.fc2(emb)
-
-        x1 = _split_irreps(f1, self.channels, self.lmax)
-        x1e = {l: x1[l][edge_src] for l in range(self.lmax + 1)}
-        edge_blocks = self.tp2(x1e, Y, gates)  # dict l -> (E, C, 2l+1)
-        edge_flat = _merge_irreps(edge_blocks, self.channels, self.lmax)
+        # conv2..convN: node irreps x edge Y_l -> node irreps
         num_nodes = pos.size(0)
-        neighbor_count = scatter(torch.ones_like(edge_dst), edge_dst, dim=0, dim_size=num_nodes).clamp(min=1).to(edge_flat.dtype)
-        f2 = scatter(edge_flat, edge_dst, dim=0, dim_size=num_nodes).div(neighbor_count.unsqueeze(-1))
+        neighbor_count = scatter(torch.ones_like(edge_dst), edge_dst, dim=0, dim_size=num_nodes).clamp(min=1)
+        emb_base = soft_one_hot_linspace(
+            edge_length,
+            0.0,
+            self.max_radius,
+            self.number_of_basis,
+            basis=self.function_type,
+            cutoff=True,
+        ).mul(self.number_of_basis ** 0.5)
+        for tp2, fc2 in zip(self.tp2_layers, self.fc2_layers):
+            f_prev = features[-1]
+            n = n.to(dtype=f_prev.dtype)
+            edge_length = edge_length.to(dtype=f_prev.dtype)
+            Y = {l: Y_list[l].to(dtype=f_prev.dtype).unsqueeze(-2) for l in range(self.lmax + 1)}  # (E,1,2l+1)
+            emb = emb_base.to(dtype=f_prev.dtype)
+            gates = fc2(emb)
 
-        f_combine = torch.cat([f1, f2], dim=-1)  # (N, 2C*(lmax+1)^2)
+            x1 = _split_irreps(f_prev, self.channels, self.lmax)
+            x1e = {l: x1[l][edge_src] for l in range(self.lmax + 1)}
+            edge_blocks = tp2(x1e, Y, gates)  # dict l -> (E, C, 2l+1)
+            edge_flat = _merge_irreps(edge_blocks, self.channels, self.lmax)
+            neighbor_count = neighbor_count.to(edge_flat.dtype)
+            f_next = scatter(edge_flat, edge_dst, dim=0, dim_size=num_nodes).div(neighbor_count.unsqueeze(-1))
+            features.append(f_next)
 
-        xb = _split_irreps(f_combine, self.channels * 2, self.lmax)
-        scalars = torch.zeros(f_combine.shape[0], 32, device=f_combine.device, dtype=f_combine.dtype)
+        f_combine = torch.cat(features, dim=-1)  # (N, nC*(lmax+1)^2)
+
+        xb = _split_irreps(f_combine, self.channels * self.num_interaction, self.lmax)
+        scalars = torch.zeros(f_combine.shape[0], (self.num_interaction - 1) * 32, device=f_combine.device, dtype=f_combine.dtype)
         for l in range(self.lmax + 1):
-            t = xb[l]  # (N,2C,2l+1)
+            t = xb[l]  # (N,nC,2l+1)
             # e3nn-style component normalization: divide by sqrt(2l+1)
             gram = torch.einsum("ncm,ndm->ncd", t, t) / ((2 * l + 1) ** 0.5)  # (N,2C,2C)
             scalars = scalars + torch.einsum("ocd,ncd->no", self.W_read[l], gram)
@@ -405,27 +428,27 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         # allow per-l multiplicities via optional adapters.
         # Fast path: if all adapters are Identity (default config), reuse old function directly.
         all_identity = all(
-            isinstance(self._p5_adapt_f1[str(l)], nn.Identity) and isinstance(self._p5_adapt_f2[str(l)], nn.Identity)
+            isinstance(self._p5_adapt[i][str(l)], nn.Identity)
+            for i in range(self.num_interaction)
             for l in range(self.lmax + 1)
         )
         if all_identity:
             # Fast path: no adapters needed, use old optimized function
-            inv1 = _irreps_elementwise_tensor_product_0e(f1, f1, self.channels, self.lmax)
-            inv2 = _irreps_elementwise_tensor_product_0e(f2, f2, self.channels, self.lmax)
+            invs = [
+                _irreps_elementwise_tensor_product_0e(f, f, self.channels, self.lmax)
+                for f in features
+            ]
         else:
             # Slow path: per-l adapters needed
-            b1 = _split_irreps(f1, self.channels, self.lmax)
-            b2 = _split_irreps(f2, self.channels, self.lmax)
-            b1a: dict[int, torch.Tensor] = {}
-            b2a: dict[int, torch.Tensor] = {}
-            for l in range(self.lmax + 1):
-                b1a[l] = _apply_channel_adapter_per_l(b1[l], self._p5_adapt_f1[str(l)])
-                b2a[l] = _apply_channel_adapter_per_l(b2[l], self._p5_adapt_f2[str(l)])
-
-            inv1 = _elementwise_tensor_product_0e_blocks(b1a, b1a, self.product5_muls_by_l, self.lmax)
-            inv2 = _elementwise_tensor_product_0e_blocks(b2a, b2a, self.product5_muls_by_l, self.lmax)
+            invs = []
+            for i, f in enumerate(features):
+                b = _split_irreps(f, self.channels, self.lmax)
+                ba: dict[int, torch.Tensor] = {}
+                for l in range(self.lmax + 1):
+                    ba[l] = _apply_channel_adapter_per_l(b[l], self._p5_adapt[i][str(l)])
+                invs.append(_elementwise_tensor_product_0e_blocks(ba, ba, self.product5_muls_by_l, self.lmax))
         inv3 = scalars * scalars
-        f_prod5 = torch.cat([inv1, inv2, inv3], dim=-1)
+        f_prod5 = torch.cat(invs + [inv3], dim=-1)
 
         product_proj = self.proj_total(f_prod5)
         e_out = self.weighted_sum(product_proj)

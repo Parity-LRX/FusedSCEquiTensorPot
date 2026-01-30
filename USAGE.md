@@ -85,8 +85,8 @@ mff-train \
     -a 1.0 \
     -b 10.0 \
     --update-param 1000 \
-    --weight-a-growth 1.01 \
-    --weight-b-decay 0.99 \
+    --weight-a-growth 1.05 \
+    --weight-b-decay 0.98 \
     --force-shift-value 1.0 \
     --patience 20 \
     --vhat-clamp-interval 2000 \
@@ -200,12 +200,12 @@ mff-train \
 - `--energy-weight` (或 `-a`): 能量损失的初始权重（默认1.0）。总损失 = `a × 能量损失 + b × 受力损失`。训练过程中，`a`会根据`--weight-a-growth`自动增长
 - `--force-weight` (或 `-b`): 受力损失的初始权重（默认10.0）。通常受力损失需要更大的权重，因为力的数量远多于能量（每个原子有3个力分量）。训练过程中，`b`会根据`--weight-b-decay`自动衰减
 - `--update-param`: 自动调整权重 `a` 和 `b` 的频率（每N个batch，默认1000）。每N个batch会根据 `--weight-a-growth` 和 `--weight-b-decay` 调整权重。调整公式：`a = a × weight_a_growth`，`b = b × weight_b_decay`
-- `--weight-a-growth`: 能量权重 `a` 的增长率（默认1.01，即每次增长1%）。建议值：1.005（慢速，适合超长时间训练）、1.01（中速，推荐）、1.02（快速，适合短期训练）
-- `--weight-b-decay`: 受力权重 `b` 的衰减率（默认0.99，即每次减少1%）。建议值：0.995（慢速）、0.99（中速，推荐）、0.98（快速）
-- `--a-min`: 能量权重 `a` 的最小值（可选，默认无限制）。如果设置了此值，`a`在增长时不会低于此值
-- `--a-max`: 能量权重 `a` 的最大值（可选，默认无限制）。如果设置了此值，`a`在增长时不会超过此值
-- `--b-min`: 受力权重 `b` 的最小值（可选，默认无限制）。如果设置了此值，`b`在衰减时不会低于此值
-- `--b-max`: 受力权重 `b` 的最大值（可选，默认无限制）。如果设置了此值，`b`在衰减时不会超过此值
+- `--weight-a-growth`: 能量权重 `a` 的增长率（默认1.05，即每次增长5%）。建议值：1.005（慢速，适合超长时间训练）、1.01（中速，更稳定）、1.02（快速）、1.05（超快速）
+- `--weight-b-decay`: 受力权重 `b` 的衰减率（默认0.98，即每次减少2%）。建议值：0.995（慢速）、0.99（中速，更稳定）、0.98（快速）
+- `--a-min`: 能量权重 `a` 的最小值（默认1.0）。`a`在增长时不会低于此值
+- `--a-max`: 能量权重 `a` 的最大值（默认1000.0）。`a`在增长时不会超过此值
+- `--b-min`: 受力权重 `b` 的最小值（默认1.0）。`b`在衰减时不会低于此值
+- `--b-max`: 受力权重 `b` 的最大值（默认1000.0）。`b`在衰减时不会超过此值
 - `--force-shift-value`: 受力标签的缩放系数（默认1.0）。如果力的单位需要转换，可以调整此值。注意：此参数目前未在代码中使用，保留用于未来扩展
 
 **优化器参数：**
@@ -880,6 +880,14 @@ val_loader = DataLoader(
 # 模型配置
 config = ModelConfig()
 
+# num_interaction 说明：
+# - 含义：控制 E3_TransformerLayer_multi 以及各 cartesian/pure-cartesian 变体中的交互(卷积)层数
+# - 取值：最小 2，默认 2；n 层时会串联 n 次卷积
+# - 影响：n 层会拼接 f1..fn，并将 f_combine_product 输出通道扩展为 (n-1)*32x0e
+#
+# 用法示例：将交互层数设为 3
+#   num_interaction=3
+
 # 初始化模型
 model = MainNet(
     input_size=config.input_dim_weight,
@@ -906,6 +914,7 @@ e3trans = E3_TransformerLayer_multi(
     embed_size=config.embed_size,
     main_hidden_sizes3=config.main_hidden_sizes3,
     num_layers=config.num_layers,
+    num_interaction=2,
     device=device
 ).to(device)
 
@@ -1018,6 +1027,7 @@ e3trans = E3_TransformerLayer_multi(
     embed_size=config.embed_size,
     main_hidden_sizes3=config.main_hidden_sizes3,
     num_layers=config.num_layers,
+    num_interaction=2,
     function_type_main=config.function_type,
     device=device
 ).to(device)
@@ -1542,14 +1552,17 @@ mff-train -a 1.0 -b 10.0 --update-param 2000
 # 慢速调整（适合超长时间训练，200k+ batches）
 mff-train -a 1.0 -b 10.0 --weight-a-growth 1.005 --weight-b-decay 0.995
 
-# 中速调整（推荐，适合大多数情况）
+# 中速调整（更稳定，适合大多数情况）
 mff-train -a 1.0 -b 10.0 --weight-a-growth 1.01 --weight-b-decay 0.99
 
 # 快速调整（适合短期训练，<50k batches）
 mff-train -a 1.0 -b 10.0 --weight-a-growth 1.02 --weight-b-decay 0.98
+
+# 超快速调整（默认）
+mff-train -a 1.0 -b 10.0 --weight-a-growth 1.05 --weight-b-decay 0.98
 ```
 
-自动调整规则：每`--update-param`个batch，`a`会乘以`--weight-a-growth`（增加），`b`会乘以`--weight-b-decay`（减少），以逐渐平衡能量和受力的重要性。**注意：`a` 和 `b` 没有范围限制，会按照上述规则持续调整。**
+自动调整规则：每`--update-param`个batch，`a`会乘以`--weight-a-growth`（增加），`b`会乘以`--weight-b-decay`（减少），以逐渐平衡能量和受力的重要性。**注意：`a` 和 `b` 默认会被限制在 [1, 1000]，以防训练过长导致权重漂移过大。**
 
 **可选：为 a / b 设置范围（Clamp）**（适合长训练防止权重漂移过大）：
 ```bash
@@ -1562,8 +1575,9 @@ mff-train \
 
 **速率选择建议：**
 - **慢速 (1.005/0.995)**: 适合超长时间训练（>200k batches），权重变化平缓，训练更稳定
-- **中速 (1.01/0.99)**: **推荐默认值**，适合大多数训练场景（50k-200k batches），平衡稳定性和调整速度
+- **中速 (1.01/0.99)**: 适合大多数训练场景（50k-200k batches），平衡稳定性和调整速度
 - **快速 (1.02/0.98)**: 适合短期训练（<50k batches），快速调整权重，但可能导致训练后期不稳定
+- **默认 (1.05/0.98)**: 调整更激进，收敛更快但更容易不稳定；如果出现震荡，建议改用中速或慢速
 
 ### Q: 如何调整优化器参数？
 
@@ -2015,7 +2029,7 @@ mff-train \
 
 6. **早停**: 如果**加权验证损失**（`a × 能量损失 + b × 受力损失`）连续`--patience`个epoch没有改善，训练会自动停止。这可以防止过拟合并节省时间。早停依据与训练时的总损失保持一致。
 
-7. **权重自动调整**: `a`和`b`会在训练过程中自动调整（每`--update-param`个batch）。`a`会乘以`--weight-a-growth`（默认1.01，即增长1%），`b`会乘以`--weight-b-decay`（默认0.99，即减少1%），以平衡能量和受力的重要性。如果训练不稳定，可以：
+7. **权重自动调整**: `a`和`b`会在训练过程中自动调整（每`--update-param`个batch）。`a`会乘以`--weight-a-growth`（默认1.05，即增长5%），`b`会乘以`--weight-b-decay`（默认0.98，即减少2%），以平衡能量和受力的重要性。如果训练不稳定，可以：
    - 增大`--update-param`（减少调整频率）
    - 使用更慢的调整速率（`--weight-a-growth 1.005 --weight-b-decay 0.995`）
    - 固定权重（设置`--update-param`为一个很大的值，如1000000）

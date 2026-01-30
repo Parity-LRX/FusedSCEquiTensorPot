@@ -237,20 +237,20 @@ def main():
                         help='Initial weight for force loss (default: 10.0)')
     parser.add_argument('--update-param', type=int, default=1000,
                         help='Interval (in batches) to update loss weights a and b (default: 1000)')
-    parser.add_argument('--weight-a-growth', type=float, default=1.01,
-                        help='Growth factor for energy weight a at each update (default: 1.01, meaning 1%% growth). '
-                             'Recommended: 1.005 (slow), 1.01 (medium), 1.02 (fast)')
-    parser.add_argument('--weight-b-decay', type=float, default=0.99,
-                        help='Decay factor for force weight b at each update (default: 0.99, meaning 1%% decay). '
+    parser.add_argument('--weight-a-growth', type=float, default=1.05,
+                        help='Growth factor for energy weight a at each update (default: 1.05, meaning 5%% growth). '
+                             'Recommended: 1.005 (slow), 1.01 (medium), 1.02 (fast), 1.05 (very fast)')
+    parser.add_argument('--weight-b-decay', type=float, default=0.98,
+                        help='Decay factor for force weight b at each update (default: 0.98, meaning 2%% decay). '
                              'Recommended: 0.995 (slow), 0.99 (medium), 0.98 (fast)')
-    parser.add_argument('--a-min', type=float, default=None,
-                        help='Optional minimum clamp for dynamic energy weight a (default: no clamp).')
-    parser.add_argument('--a-max', type=float, default=None,
-                        help='Optional maximum clamp for dynamic energy weight a (default: no clamp).')
-    parser.add_argument('--b-min', type=float, default=None,
-                        help='Optional minimum clamp for dynamic force weight b (default: no clamp).')
-    parser.add_argument('--b-max', type=float, default=None,
-                        help='Optional maximum clamp for dynamic force weight b (default: no clamp).')
+    parser.add_argument('--a-min', type=float, default=1.0,
+                        help='Minimum clamp for dynamic energy weight a (default: 1.0).')
+    parser.add_argument('--a-max', type=float, default=1000.0,
+                        help='Maximum clamp for dynamic energy weight a (default: 1000.0).')
+    parser.add_argument('--b-min', type=float, default=1.0,
+                        help='Minimum clamp for dynamic force weight b (default: 1.0).')
+    parser.add_argument('--b-max', type=float, default=1000.0,
+                        help='Maximum clamp for dynamic force weight b (default: 1000.0).')
     parser.add_argument('--swa-start-epoch', type=int, default=None,
                         help='Epoch to start SWA (Stochastic Weight Averaging) for loss weights. '
                              'After this epoch, a and b will be set to --swa-a and --swa-b values directly. '
