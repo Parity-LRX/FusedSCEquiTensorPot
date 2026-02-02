@@ -243,8 +243,8 @@ class Trainer:
         self.train_eval_sample_ratio = train_eval_sample_ratio  # Ratio of training set to evaluate (0.0-1.0)
         self.log_val_batch_energy_to_console = log_val_batch_energy_to_console  # Whether to log validation batch energy to console (default: False, only to file)
         
-        # Initialize loss tracking for CSV
-        self.loss_csv_path = 'loss.csv'
+        # Initialize loss tracking for CSV (under checkpoint_dir so resume appends to same file)
+        self.loss_csv_path = os.path.join(self.checkpoint_dir, 'loss.csv')
         self.loss_records = []
         
         # Initialize training state (will be updated if loading from checkpoint)
@@ -391,6 +391,31 @@ class Trainer:
             self.e3trans.module.load_state_dict(checkpoint['e3trans_state_dict'])
         else:
             self.e3trans.load_state_dict(checkpoint['e3trans_state_dict'])
+
+        # Restore scheduler state when available.
+        # This avoids needing to "fast-forward" with scheduler.step(epoch), which triggers
+        # PyTorch's epoch-argument deprecation warning.
+        if 'scheduler_state_dict' in checkpoint:
+            try:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            except Exception as e:
+                if self.is_main_process:
+                    logging.warning(f"Failed to load scheduler state_dict from checkpoint: {e}")
+        else:
+            if self.is_main_process:
+                logging.info("Checkpoint has no scheduler_state_dict; LR scheduler will restart fresh.")
+
+        # Restore LR values without saving optimizer state (keeps checkpoints small).
+        # If missing, we accept that the first resumed batch will use the freshly-initialized LR.
+        if 'optimizer_lrs' in checkpoint:
+            try:
+                lrs = checkpoint['optimizer_lrs']
+                if isinstance(lrs, (list, tuple)) and len(lrs) == len(self.optimizer.param_groups):
+                    for pg, lr in zip(self.optimizer.param_groups, lrs):
+                        pg['lr'] = float(lr)
+            except Exception as e:
+                if self.is_main_process:
+                    logging.warning(f"Failed to restore LR values from checkpoint: {e}")
         
         # Load loss weights (only if use_checkpoint_loss_weights is True)
         if self.use_checkpoint_loss_weights:
@@ -428,6 +453,14 @@ class Trainer:
             self.patience_counter = checkpoint['patience_counter']
         
         self.resumed_from_checkpoint = True
+        
+        # Load existing loss CSV so resumed training appends instead of overwriting
+        if self.is_main_process and os.path.exists(self.loss_csv_path):
+            try:
+                self.loss_records = pd.read_csv(self.loss_csv_path).to_dict('records')
+                logging.info(f"  Loaded {len(self.loss_records)} existing loss records from {self.loss_csv_path}")
+            except Exception as e:
+                logging.warning(f"  Failed to load existing loss CSV, will start fresh: {e}")
         
         if self.is_main_process:
             logging.info("=" * 80)
@@ -1095,7 +1128,7 @@ class Trainer:
         if self.is_main_process:
             self.loss_records.append(record)
             
-            # Save to CSV (append mode, create header if file doesn't exist)
+            # Save to CSV (full history so resume continues recording without overwriting)
             df = pd.DataFrame(self.loss_records)
             df.to_csv(self.loss_csv_path, index=False)
             
@@ -1108,6 +1141,8 @@ class Trainer:
             
             checkpoint_dict = {
                 'e3trans_state_dict': e3trans_state_dict,
+                'scheduler_state_dict': self.scheduler.state_dict(),
+                'optimizer_lrs': [pg.get('lr', None) for pg in self.optimizer.param_groups],
                 'a': self.a,
                 'b': self.b,
                 'batch_count': self.batch_count,

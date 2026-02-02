@@ -29,43 +29,90 @@ from molecular_force_field.data.preprocessing import save_to_h5_parallel
 from molecular_force_field.utils.config import ModelConfig
 
 
-def check_and_preprocess_data(data_dir, train_prefix, val_prefix, max_radius, num_workers, input_file=None, seed=42):
+def check_and_preprocess_data(data_dir, train_prefix, val_prefix, max_radius, num_workers,
+                              input_file=None, train_input_file=None, valid_input_file=None, seed=42):
     """
-    Check if preprocessed data exists, and run preprocessing if needed.
-    
+    Ensure train/val data exist: use existing H5, run H5-only preprocessing, or full pipeline from XYZ.
+
+    Data resolution order:
+        1. If processed_<prefix>.h5 exist in data_dir -> use as-is.
+        2. If read_<prefix>.h5 exist -> run H5 preprocessing only.
+        3. If train_input_file and valid_input_file are both given -> use as train/val, no split; run full preprocessing.
+        4. If input_file is given -> split 90/10 train/val, then run full preprocessing.
+        5. Otherwise -> return False and log error.
+
     Args:
-        data_dir: Directory containing data files
-        train_prefix: Prefix for training data
-        val_prefix: Prefix for validation data
-        max_radius: Maximum radius for neighbor search
-        num_workers: Number of workers for preprocessing
-        input_file: Input XYZ file for preprocessing (optional)
-        seed: Random seed for train/val split (default: 42)
-    
+        data_dir: Directory for data files (and fitted_E0.csv).
+        train_prefix: Filename prefix for training set (e.g. 'train' -> processed_train.h5).
+        val_prefix: Filename prefix for validation set (e.g. 'val' -> processed_val.h5).
+        max_radius: Max radius for neighbor search in H5 preprocessing.
+        num_workers: Number of workers for H5 preprocessing.
+        input_file: Optional single XYZ path; triggers 90/10 train/val split then preprocessing.
+        train_input_file: Optional training XYZ path; must be used together with valid_input_file (no split).
+        valid_input_file: Optional validation XYZ path; must be used together with train_input_file.
+        seed: Random seed for train/val split when input_file is used (default: 42).
+
     Returns:
-        True if data is ready, False otherwise
+        True if train/val data are ready, False otherwise.
     """
     train_processed = os.path.join(data_dir, f'processed_{train_prefix}.h5')
     val_processed = os.path.join(data_dir, f'processed_{val_prefix}.h5')
     train_raw = os.path.join(data_dir, f'read_{train_prefix}.h5')
     val_raw = os.path.join(data_dir, f'read_{val_prefix}.h5')
-    
-    # Case 1: Preprocessed files exist
+
+    # Case 1: Preprocessed train/val H5 already exist in data_dir
     if os.path.exists(train_processed) and os.path.exists(val_processed):
         logging.info(f"Found preprocessed data in {data_dir}/")
         return True
-    
-    # Case 2: Raw files exist but not preprocessed
+
+    # Case 2: Raw read_* H5 exist; run H5 preprocessing only (no XYZ extraction)
     if os.path.exists(train_raw) and os.path.exists(val_raw):
         logging.info(f"Found raw data in {data_dir}/, running H5 preprocessing...")
         save_to_h5_parallel(train_prefix, max_radius, num_workers, data_dir=data_dir)
         save_to_h5_parallel(val_prefix, max_radius, num_workers, data_dir=data_dir)
         return True
-    
-    # Case 3: No data files, need to run full preprocessing
+
+    # Case 3a: Two XYZ files given (train + valid); use as-is, no split; run full preprocessing
+    if train_input_file and valid_input_file and os.path.exists(train_input_file) and os.path.exists(valid_input_file):
+        logging.info(f"Using specified train/valid files (no auto split): train={train_input_file}, valid={valid_input_file}")
+        from molecular_force_field.data.preprocessing import (
+            extract_data_blocks,
+            fit_baseline_energies,
+            compute_correction,
+            save_set
+        )
+        import pandas as pd
+        import numpy as np
+        os.makedirs(data_dir, exist_ok=True)
+        train_blocks, train_energy, train_raw_energy, train_cells, train_pbcs = extract_data_blocks(train_input_file)
+        val_blocks, val_energy, val_raw_energy, val_cells, val_pbcs = extract_data_blocks(valid_input_file)
+        logging.info(f"Train frames: {len(train_blocks)}, Valid frames: {len(val_blocks)}")
+        train_atoms = []
+        for block in train_blocks:
+            train_atoms.extend([int(row[3]) for row in block])
+        uniq = sorted({a for a in train_atoms if a > 0})
+        if not uniq:
+            raise ValueError("No valid atomic numbers found in training blocks; cannot fit baseline energies.")
+        keys = np.asarray(uniq, dtype=np.int64)
+        initial_values = np.array([-0.01] * len(keys), dtype=np.float64)
+        fitted_values = fit_baseline_energies(train_blocks, train_raw_energy, keys, initial_values)
+        fitted_e0_path = os.path.join(data_dir, 'fitted_E0.csv')
+        pd.DataFrame({'Atom': keys, 'E0': fitted_values}).to_csv(fitted_e0_path, index=False)
+        logging.info(f"Saved {fitted_e0_path}")
+        train_correction = compute_correction(train_blocks, train_raw_energy, keys, fitted_values)
+        val_correction = compute_correction(val_blocks, val_raw_energy, keys, fitted_values)
+        save_set(train_prefix, np.arange(len(train_blocks)), train_blocks, train_raw_energy,
+                 train_correction, train_cells, pbc_list=train_pbcs, output_dir=data_dir)
+        save_set(val_prefix, np.arange(len(val_blocks)), val_blocks, val_raw_energy,
+                 val_correction, val_cells, pbc_list=val_pbcs, output_dir=data_dir)
+        save_to_h5_parallel(train_prefix, max_radius, num_workers, data_dir=data_dir)
+        save_to_h5_parallel(val_prefix, max_radius, num_workers, data_dir=data_dir)
+        logging.info(f"Preprocessing completed! Data saved to {data_dir}/")
+        return True
+
+    # Case 3b: Single XYZ file given; 90/10 train/val split then full preprocessing
     if input_file and os.path.exists(input_file):
-        logging.info(f"No preprocessed data found. Running preprocessing on {input_file}...")
-        # Import here to avoid circular import
+        logging.info(f"No preprocessed data found. Running preprocessing on {input_file} (auto 90/10 split)...")
         from molecular_force_field.data.preprocessing import (
             extract_data_blocks,
             fit_baseline_energies,
@@ -74,67 +121,52 @@ def check_and_preprocess_data(data_dir, train_prefix, val_prefix, max_radius, nu
         )
         import numpy as np
         import pandas as pd
-        
-        # Create output directory
+
         os.makedirs(data_dir, exist_ok=True)
-        
-        # Extract data
         all_blocks, all_energy, all_raw_energy, all_cells, all_pbcs = extract_data_blocks(input_file)
         logging.info(f"Total frames: {len(all_blocks)}")
-        
-        # Split train/val (95/5)
+
+        # 90/10 train/val split (fixed ratio)
         data_size = len(all_blocks)
         indices = np.arange(data_size)
         np.random.seed(seed)
-        train_size = int(0.95 * data_size)
+        train_size = int(0.90 * data_size)
         val_size = data_size - train_size
         val_indices = np.random.choice(indices, size=val_size, replace=False)
         train_mask = ~np.isin(indices, val_indices)
         train_indices = indices[train_mask]
-        
         logging.info(f"Split: {len(train_indices)} Train, {len(val_indices)} Val")
-        
+
         train_blocks = [all_blocks[i] for i in train_indices]
         train_raw_E = [all_raw_energy[i] for i in train_indices]
         val_blocks = [all_blocks[i] for i in val_indices]
         val_raw_E = [all_raw_energy[i] for i in val_indices]
-        
-        # Fit baseline energies (E0) on TRAIN only.
-        # IMPORTANT: do NOT hardcode element keys here; derive them from the training set
-        # to support the full periodic table / arbitrary compositions.
+
+        # Fit E0 on train set only; keys derived from train atoms (no hardcoding)
         train_atoms = []
         for block in train_blocks:
-            # block rows: [x, y, z, A, fx, fy, fz]
-            train_atoms.extend([int(row[3]) for row in block])
+            train_atoms.extend([int(row[3]) for row in block])  # row[3] = atomic number
         uniq = sorted({a for a in train_atoms if a > 0})
         if not uniq:
             raise ValueError("No valid atomic numbers found in training blocks; cannot fit baseline energies.")
-
         keys = np.asarray(uniq, dtype=np.int64)
         initial_values = np.array([-0.01] * len(keys), dtype=np.float64)
         fitted_values = fit_baseline_energies(train_blocks, train_raw_E, keys, initial_values)
-        
-        # Save fitted energies
+
         fitted_e0_path = os.path.join(data_dir, 'fitted_E0.csv')
         pd.DataFrame({'Atom': keys, 'E0': fitted_values}).to_csv(fitted_e0_path, index=False)
         logging.info(f"Saved {fitted_e0_path}")
-        
-        # Compute corrections
+
         train_correction = compute_correction(train_blocks, train_raw_E, keys, fitted_values)
         val_correction = compute_correction(val_blocks, val_raw_E, keys, fitted_values)
-        
-        # Save sets
         save_set('train', train_indices, train_blocks, train_raw_E, train_correction, all_cells, pbc_list=all_pbcs, output_dir=data_dir)
         save_set('val', val_indices, val_blocks, val_raw_E, val_correction, all_cells, pbc_list=all_pbcs, output_dir=data_dir)
-        
-        # Preprocess H5
         save_to_h5_parallel('train', max_radius, num_workers, data_dir=data_dir)
         save_to_h5_parallel('val', max_radius, num_workers, data_dir=data_dir)
-        
         logging.info(f"Preprocessing completed! Data saved to {data_dir}/")
         return True
-    
-    # Case 4: No data at all
+
+    # Case 4: No data and no input file; cannot proceed
     logging.error(
         f"No data files found in {data_dir}/ and no input file specified.\n"
         f"Please either:\n"
@@ -145,23 +177,18 @@ def check_and_preprocess_data(data_dir, train_prefix, val_prefix, max_radius, nu
 
 
 def setup_logging():
-    """Setup logging configuration."""
+    """Configure logging: console (filtered) and rotating file (full)."""
     log_format = "%(asctime)s - %(levelname)s - %(message)s"
     formatter = logging.Formatter(log_format)
-    
-    # Custom filter to suppress epoch training logs on console but keep validation logs
+
     class ConsoleFilter(logging.Filter):
+        """Suppress per-epoch training logs on console; keep validation and lifecycle messages."""
         def filter(self, record):
             msg = record.getMessage()
-            # Suppress epoch training logs, but allow validation and important messages
             if 'Epoch' in msg and 'Validation' not in msg and 'Training started' not in msg and 'Training completed' not in msg and 'Early stopping' not in msg:
                 return False
-            # Note: Validation batch energy logs are controlled by log level:
-            # - logging.debug: only goes to file (console shows INFO+)
-            # - logging.info: goes to both file and console (if --log-val-batch-energy is set)
             return True
-    
-    # Console handler - only show validation and important messages
+
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     console_handler.setLevel(logging.INFO)
@@ -170,14 +197,12 @@ def setup_logging():
     log_filename = f"training_{time.strftime('%Y%m%d_%H%M%S')}.log"
     file_handler = RotatingFileHandler(
         filename=log_filename,
-        maxBytes=1000 * 1024 * 1024,  # 1GB per file
+        maxBytes=1000 * 1024 * 1024,
         backupCount=5,
         encoding='utf-8'
     )
     file_handler.setFormatter(formatter)
     file_handler.setLevel(logging.DEBUG)
-    
-    # Root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
     root_logger.handlers = []  # Clear existing handlers
@@ -302,7 +327,17 @@ def main():
     parser.add_argument('--data-dir', type=str, default='data',
                         help='Directory containing preprocessed data files (default: data)')
     parser.add_argument('--input-file', type=str, default=None,
-                        help='Input XYZ file for automatic preprocessing (optional)')
+                        help='Single XYZ file for automatic preprocessing; program will split 90/10 train/val (optional)')
+    parser.add_argument('--train-input-file', type=str, default=None,
+                        help='Training set XYZ file. If both --train-input-file and --valid-input-file are set, '
+                             'use them as train/valid directly (no auto split).')
+    parser.add_argument('--valid-input-file', type=str, default=None,
+                        help='Validation set XYZ file. Use together with --train-input-file to specify train/valid datasets.')
+    parser.add_argument('--train-data', type=str, default=None,
+                        help='Path to preprocessed training H5 file (e.g. processed_train.h5). '
+                             'If both --train-data and --valid-data are set, use these files and skip preprocessing.')
+    parser.add_argument('--valid-data', type=str, default=None,
+                        help='Path to preprocessed validation H5 file. Use together with --train-data.')
     parser.add_argument('--distributed', action='store_true',
                         help='Enable distributed training (DDP)')
     parser.add_argument('--local-rank', type=int, default=-1,
@@ -360,19 +395,24 @@ def main():
     
     args = parser.parse_args()
 
-    # Initialize rank and world_size early (before validation that uses rank)
-    # These will be updated later if distributed training is enabled
+    # --- Dataset option validation (pairs must be both set or both unset) ---
+    if (args.train_data is None) != (args.valid_data is None):
+        raise ValueError("Must specify both --train-data and --valid-data together, or neither.")
+    if (args.train_input_file is None) != (args.valid_input_file is None):
+        raise ValueError("Must specify both --train-input-file and --valid-input-file together, or neither.")
+
+    # --- Rank / world size (updated later if --distributed) ---
     rank = 0
     world_size = 1
     local_rank = 0
 
-    # Validate a/b clamp ranges
+    # --- Loss weight bounds ---
     if args.a_min is not None and args.a_max is not None and args.a_min > args.a_max:
         raise ValueError("--a-min must be <= --a-max")
     if args.b_min is not None and args.b_max is not None and args.b_min > args.b_max:
         raise ValueError("--b-min must be <= --b-max")
     
-    # Validate SWA parameters
+    # --- SWA (Stochastic Weight Averaging) ---
     if args.swa_start_epoch is not None:
         if args.swa_a is None or args.swa_b is None:
             raise ValueError("--swa-a and --swa-b must be set when --swa-start-epoch is set")
@@ -381,7 +421,7 @@ def main():
         if rank == 0:
             logging.info(f"SWA enabled: Will switch to a={args.swa_a}, b={args.swa_b} at epoch {args.swa_start_epoch}")
 
-    # Validate EMA parameters
+    # --- EMA (Exponential Moving Average) ---
     if args.ema_start_epoch is not None:
         if args.ema_start_epoch < 1:
             raise ValueError("--ema-start-epoch must be >= 1")
@@ -394,20 +434,18 @@ def main():
             if args.save_ema_model:
                 logging.info("  Will save EMA model in checkpoint")
     
-    # Set random seed for reproducibility
+    # --- Random seed ---
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
     
-    # For reproducibility with CUDA
     if torch.cuda.is_available():
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
     
-    # Initialize distributed training if enabled
+    # --- Distributed training (DDP) ---
     if args.distributed:
-        # Get local_rank from environment if not provided
         if args.local_rank == -1:
             args.local_rank = int(os.environ.get('LOCAL_RANK', -1))
         
@@ -415,8 +453,6 @@ def main():
             raise ValueError("--local-rank must be set when --distributed is enabled. "
                            "Use 'torchrun' or set LOCAL_RANK environment variable.")
         
-        # Initialize process group with extended timeout for preprocessing
-        # Default NCCL timeout is 30 minutes, extend to 2 hours for large datasets
         dist.init_process_group(
             backend=args.backend,
             init_method=args.init_method,
@@ -427,27 +463,23 @@ def main():
         rank = dist.get_rank()
         local_rank = args.local_rank
         
-        # Set device for this process
         if torch.cuda.is_available():
             device = torch.device(f'cuda:{local_rank}')
             torch.cuda.set_device(device)
         else:
             device = torch.device('cpu')
         
-        # Only setup logging on rank 0
         if rank == 0:
             setup_logging()
             logging.info(f"Distributed training enabled: {world_size} GPUs")
             logging.info(f"Using device: {device} (rank {rank}, local_rank {local_rank})")
             logging.info(f"Data directory: {args.data_dir}")
         else:
-            # Minimal logging setup for non-rank-0 processes
             logging.basicConfig(level=logging.WARNING)
     else:
         setup_logging()
-        # rank, world_size, local_rank already initialized above
-    
-    # Set default dtype before creating any tensors
+
+    # --- Default dtype ---
     if args.dtype == 'float64' or args.dtype == 'double':
         torch.set_default_dtype(torch.float64)
         if rank == 0:
@@ -457,7 +489,7 @@ def main():
         if rank == 0:
             logging.info("Using dtype: float32")
     
-    # Device setup (for non-distributed case)
+    # --- Device (non-distributed) ---
     if not args.distributed:
         if args.device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -467,10 +499,20 @@ def main():
         logging.info(f"Using device: {device}")
         logging.info(f"Data directory: {args.data_dir}")
     
-    # Check and preprocess data if needed
-    if args.distributed:
-        # In distributed mode, only check if data exists (no preprocessing)
-        # All ranks check independently to avoid synchronization issues
+    # --- Data: resolve source (custom H5 paths vs data_dir + prefix) and preprocess if needed ---
+    use_custom_data_paths = (args.train_data is not None and args.valid_data is not None)
+    if use_custom_data_paths:
+        if not os.path.exists(args.train_data):
+            logging.error(f"Training data file not found: {args.train_data}")
+            return
+        if not os.path.exists(args.valid_data):
+            logging.error(f"Validation data file not found: {args.valid_data}")
+            return
+        if rank == 0:
+            logging.info(f"Using custom datasets: train={args.train_data}, valid={args.valid_data}")
+        if args.distributed:
+            dist.barrier()
+    elif args.distributed:
         train_processed = os.path.join(args.data_dir, f'processed_{args.train_prefix}.h5')
         val_processed = os.path.join(args.data_dir, f'processed_{args.val_prefix}.h5')
         
@@ -487,29 +529,32 @@ def main():
         
         if rank == 0:
             logging.info(f"Found preprocessed data in {args.data_dir}/")
-        
-        # Barrier to ensure all processes are ready
         dist.barrier()
     else:
-        # Single process mode: can auto-preprocess
         data_ready = check_and_preprocess_data(
-            args.data_dir, 
-            args.train_prefix, 
-            args.val_prefix, 
-            args.max_radius, 
+            args.data_dir,
+            args.train_prefix,
+            args.val_prefix,
+            args.max_radius,
             args.num_workers,
-            args.input_file,
-            args.seed
+            input_file=args.input_file,
+            train_input_file=args.train_input_file,
+            valid_input_file=args.valid_input_file,
+            seed=args.seed
         )
         if not data_ready:
             logging.error("Data preparation failed. Exiting.")
             return
-    
-    # Load datasets
-    train_dataset = H5Dataset(args.train_prefix, data_dir=args.data_dir)
-    val_dataset = H5Dataset(args.val_prefix, data_dir=args.data_dir)
-    
-    # Create distributed samplers if using distributed training
+
+    # --- Build datasets (from custom paths or data_dir + prefix) ---
+    if use_custom_data_paths:
+        train_dataset = H5Dataset('train', data_dir=args.data_dir, file_path=args.train_data)
+        val_dataset = H5Dataset('val', data_dir=args.data_dir, file_path=args.valid_data)
+    else:
+        train_dataset = H5Dataset(args.train_prefix, data_dir=args.data_dir)
+        val_dataset = H5Dataset(args.val_prefix, data_dir=args.data_dir)
+
+    # --- DataLoaders and distributed samplers ---
     if args.distributed:
         train_sampler = DistributedSampler(
             train_dataset,
@@ -525,7 +570,7 @@ def main():
             shuffle=False,
             drop_last=False
         )
-        shuffle = False  # Shuffle is handled by DistributedSampler
+        shuffle = False
     else:
         train_sampler = None
         val_sampler = None
@@ -551,8 +596,7 @@ def main():
         pin_memory=True if torch.cuda.is_available() else False
     )
     
-    # Model configuration
-    # Convert dtype string to torch.dtype
+    # --- Model config ---
     config_dtype = torch.float64 if args.dtype in ['float64', 'double'] else torch.float32
     config = ModelConfig(
         dtype=config_dtype,
@@ -566,7 +610,7 @@ def main():
         max_radius=args.max_radius
     )
     
-    # Atomic reference energies (E0)
+    # --- Atomic reference energies (E0) ---
     if args.atomic_energy_keys is not None or args.atomic_energy_values is not None:
         if args.atomic_energy_keys is None or args.atomic_energy_values is None:
             raise ValueError("Both --atomic-energy-keys and --atomic-energy-values must be provided together.")
@@ -583,7 +627,7 @@ def main():
         e0_path = args.atomic_energy_file or os.path.join(args.data_dir, 'fitted_E0.csv')
         config.load_atomic_energies_from_file(e0_path)
     
-    # Log model hyperparameters
+    # --- Log hyperparameters ---
     if rank == 0:
         logging.info("=" * 80)
         logging.info("Model Hyperparameters:")

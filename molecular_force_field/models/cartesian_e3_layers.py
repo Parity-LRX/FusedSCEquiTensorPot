@@ -22,13 +22,14 @@ Main classes:
         Not strictly equivariant but significantly faster.
         Supports torch.compile for additional speedup (3-4x).
 
-    CartesianTransformerLayer:
-        Full transformer layer using EquivariantTensorProduct (strictly equivariant).
-        Uses CartesianE3ConvSparse and CartesianE3Conv2Sparse for convolutions.
+    CartesianTransformerLayerStrict:
+        Transformer layer with strict parity handling.
+        Uses CartesianFullyConnectedTensorProduct and elementwise products.
+        Alias: CartesianTransformerLayer (for backward compatibility).
 
     CartesianTransformerLayerLoose:
-        Fast transformer layer using CartesianFullyConnectedTensorProduct.
-        Not strictly equivariant but faster than CartesianTransformerLayer.
+        Fast transformer layer using CartesianFullyConnectedTensorProduct (norm product approximation).
+        Not strictly equivariant but faster than strict parity mode.
         Recommended for inference when speed is prioritized over strict equivariance.
 
 Performance characteristics:
@@ -58,12 +59,11 @@ import re
 from typing import Union, List, Tuple, Optional
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from e3nn.math import soft_one_hot_linspace
 from e3nn import o3
 from torch_scatter import scatter
 
-from molecular_force_field.models.mlp import MainNet2, MainNet, RobustScalarWeightedSum
+from molecular_force_field.models.mlp import MainNet, RobustScalarWeightedSum
 
 
 # ============================================================================
@@ -2455,248 +2455,35 @@ class CartesianElementwiseTensorProduct(nn.Module):
             f2 = x2[..., start:end].view(*batch_shape, mul, dim_l)
             
             # Contract over angular indices: Σ_m f1_m * f2_m → scalar per channel
-            # This is the invariant dot product for each l
+            # This matches e3nn ElementwiseTensorProduct(..., ["0e"]) behavior.
             contracted = (f1 * f2).sum(dim=-1)  # (..., mul)
             outputs.append(contracted)
         
-        return torch.cat(outputs, dim=-1)  # (..., output_channels)
+        if not outputs:
+            return x1.new_zeros(*batch_shape, 0)
+        
+        return torch.cat(outputs, dim=-1)
 
-
-class CartesianTransformerLayer(nn.Module):
-    """
-    Cartesian Transformer layer with lmax support and sparse tensor products.
-    
-    This is the main model architecture for molecular force field prediction.
-    It uses EquivariantTensorProduct for all tensor operations, ensuring
-    strict rotational equivariance. The architecture matches e3nn's
-    E3_TransformerLayer_multi structure for fair comparison.
-    
-    Architecture flow:
-        1. First convolution (CartesianE3ConvSparse):
-           Converts atom types and edge directions to higher-order irreps.
-        2. Second convolution (CartesianE3Conv2Sparse):
-           Further processes features with edge direction information.
-        3. Feature combination:
-           Concatenates outputs from both convolutions.
-        4. Product layer 3 (EquivariantTensorProduct):
-           Computes tensor product: f_combine ⊗ f_combine → scalars (32x0e)
-        5. Feature concatenation:
-           Combines f_combine and f_prod3 into T.
-        6. Product layer 5 (CartesianElementwiseTensorProduct):
-           Computes element-wise product: T ⊗ T → scalars
-        7. Readout:
-           MLP + weighted sum to predict atom energies
-    
-    All tensor products use EquivariantTensorProduct for strict equivariance.
-    
-    Args:
-        max_embed_radius: Maximum radius for embedding convolution.
-        main_max_radius: Maximum radius for main convolution.
-        main_number_of_basis: Number of radial basis functions.
-        hidden_dim_conv: Number of channels for convolutions.
-        hidden_dim_sh: Hidden dimension for spherical harmonics (not used, kept for compatibility).
-        hidden_dim: Hidden dimension for readout MLP (not used, kept for compatibility).
-        channel_in2: Channel dimension for intermediate layers (not used, kept for compatibility).
-        embedding_dim: Dimension of atom type embedding.
-        max_atomvalue: Maximum atomic number (for embedding lookup).
-        output_size: Size of atom feature MLP output in first convolution.
-        embed_size: List of hidden layer sizes for readout MLP.
-                   Default: [128, 128, 128]
-        main_hidden_sizes3: List of hidden layer sizes (not used, kept for compatibility).
-                           Default: [64, 32]
-        num_layers: Number of transformer layers (not used, kept for compatibility).
-                   Default: 1
-        device: Device to place model on. If None, uses CUDA if available.
-        function_type_main: Type of radial basis function.
-                           Options: 'gaussian', 'bessel', 'fourier', 'cosine', 'smooth_finite'
-        lmax: Maximum angular momentum. Default: 2
-    
-    Attributes:
-        e3_conv_emb: First convolution layer (CartesianE3ConvSparse).
-        e3_conv_emb2: Second convolution layer (CartesianE3Conv2Sparse).
-        product_3: Tensor product layer (EquivariantTensorProduct).
-        product_5: Element-wise tensor product layer (CartesianElementwiseTensorProduct).
-        proj_total: Readout MLP (MainNet).
-        weighted_sum: Weighted sum layer for final energy prediction.
-        channels: Number of channels (equal to hidden_dim_conv).
-        total_sh_dim: Total spherical harmonics dimension = sum(2*l+1 for l in range(lmax+1))
-    
-    Example:
-        >>> model = CartesianTransformerLayer(
-        ...     max_embed_radius=5.0,
-        ...     main_max_radius=5.0,
-        ...     main_number_of_basis=8,
-        ...     hidden_dim_conv=64,
-        ...     hidden_dim_sh=64,
-        ...     hidden_dim=64,
-        ...     lmax=2
-        ... )
-        >>> pos = torch.randn(50, 3)
-        >>> A = torch.randint(0, 10, (50,))
-        >>> batch = torch.zeros(50, dtype=torch.long)
-        >>> edge_src = torch.randint(0, 50, (200,))
-        >>> edge_dst = torch.randint(0, 50, (200,))
-        >>> edge_shifts = torch.zeros(200, 3)
-        >>> cell = torch.eye(3).unsqueeze(0)
-        >>> energy = model(pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
-        >>> # energy shape: (50, 1) - atom energies
-    
-    Note:
-        This model uses EquivariantTensorProduct for all tensor operations,
-        ensuring strict rotational equivariance. The output is atom energies,
-        and forces can be computed via: force = -d(energy)/d(pos).
-        
-        For training, forces require create_graph=True in autograd.grad,
-        which means loss.backward() computes second derivatives.
-        Therefore, torch.compile cannot be used during training.
-    """
-    
-    def __init__(self, max_embed_radius, main_max_radius, main_number_of_basis,
-                 hidden_dim_conv, hidden_dim_sh, hidden_dim, channel_in2=32, embedding_dim=16,
-                 max_atomvalue=10, output_size=8, embed_size=None, main_hidden_sizes3=None,
-                 num_layers=1, device=None, function_type_main='gaussian', lmax=2, num_interaction=2):
-        super().__init__()
-        
-        if embed_size is None:
-            embed_size = [128, 128, 128]
-        if main_hidden_sizes3 is None:
-            main_hidden_sizes3 = [64, 32]
-        if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self.device = device
-        
-        self.lmax = lmax
-        self.dims = [2 * l + 1 for l in range(lmax + 1)]
-        self.total_sh_dim = sum(self.dims)  # 9 for lmax=2
-        
-        # Use channel count, not full dimension
-        self.channels = hidden_dim_conv  # This should be 64, not 576
-        self.hidden_dim_conv = self.channels * self.total_sh_dim  # 64 * 9 = 576
-        
-        self.num_interaction = int(num_interaction)
-        if self.num_interaction < 2:
-            raise ValueError(f"num_interaction must be >= 2, got {self.num_interaction}")
-
-        # Convolution layers with sparse tensor products
-        self.e3_conv_layers = nn.ModuleList()
-        self.e3_conv_layers.append(
-            CartesianE3ConvSparse(
-                max_radius=max_embed_radius,
-                number_of_basis=main_number_of_basis,
-                channels_out=self.channels,
-                embedding_dim=embedding_dim,
-                max_atomvalue=max_atomvalue,
-                output_size=output_size,
-                lmax=lmax,
-                function_type=function_type_main
-            )
-        )
-        for _ in range(1, self.num_interaction):
-            self.e3_conv_layers.append(
-                CartesianE3Conv2Sparse(
-                    max_radius=max_embed_radius,
-                    number_of_basis=main_number_of_basis,
-                    channels_in=self.channels,
-                    channels_out=self.channels,
-                    embedding_dim=embedding_dim,
-                    max_atomvalue=max_atomvalue,
-                    lmax=lmax,
-                    function_type=function_type_main
-                )
-            )
-        
-        # Product layers matching e3nn structure:
-        # product_3: FullyConnectedTensorProduct(irreps_input*2, irreps_input*2, "32x0e")
-        # product_5: ElementwiseTensorProduct(T, T, ["0e"])
-        combined_channels = self.channels * self.num_interaction
-        irreps_combined = get_irreps_str(combined_channels, lmax)
-        scalar_channels = (self.num_interaction - 1) * 32
-        
-        # product_3: 高阶 ⊗ 高阶 → 标量 (32x0e) - 使用严格等变的 EquivariantTensorProduct
-        self.product_3 = EquivariantTensorProduct(
-            irreps_in1=irreps_combined,
-            irreps_in2=irreps_combined,
-            irreps_out=f"{scalar_channels}x0e",
-            shared_weights=True,
-            internal_weights=True
-        )
-        
-        # T = [f_combine, f_prod3] = (combined_channels * total_sh_dim + 32) features
-        # For ElementwiseTP, we need T to have proper irreps structure
-        # T irreps = combined_channels x (0e+1o+2e) + 32 x 0e
-        T_channels = combined_channels  # For the high-order part
-        T_scalar_channels = scalar_channels  # From product_3
-        
-        # Build T irreps string
-        irreps_T = get_irreps_str(T_channels, lmax) + " + " + f"{scalar_channels}x0e"
-        
-        # product_5: ElementwiseTensorProduct(T, T, ["0e"]) - 已经是严格等变的
-        self.product_5 = CartesianElementwiseTensorProduct(
-            irreps_in=irreps_T,
-            filter_ir_out=["0e"],
-            lmax=lmax
-        )
-        
-        # Readout input: product_5 outputs scalars (output_channels = T_channels * (lmax+1) + 32)
-        readout_dim = self.product_5.dim_out
-        self.proj_total = MainNet(readout_dim, embed_size, 17)
-        self.num_features = 17
-        self.weighted_sum = RobustScalarWeightedSum(self.num_features, init_weights='zero')
-        
-        print(f"CartesianTransformerLayer init complete: lmax={lmax}, channels={self.channels}")
-    
-    def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell):
-        sort_idx = torch.argsort(edge_dst)
-        edge_src = edge_src[sort_idx]
-        edge_dst = edge_dst[sort_idx]
-        edge_shifts = edge_shifts[sort_idx]
-        
-        # Convolutions
-        features = []
-        f_prev = self.e3_conv_layers[0](pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
-        features.append(f_prev)
-        for conv in self.e3_conv_layers[1:]:
-            f_prev = conv(f_prev, pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
-            features.append(f_prev)
-        
-        # Combine features: reorder to match e3nn's expected irreps format
-        # This ensures that f_combine has the correct structure for EquivariantTensorProduct
-        # Without reordering, the concatenation [f1, f2] produces:
-        #   [f1的l=0部分, f2的l=0部分, f1的l=1部分, f2的l=1部分, ...]
-        # But e3nn expects: [所有l=0部分, 所有l=1部分, ...]
-        f_combine = reorder_concatenated_irreps_multi(features, self.channels, self.lmax)
-        
-        # product_3: 高阶 ⊗ 高阶 → 32x0e (标量)
-        f_prod3 = self.product_3(f_combine, f_combine)  # (N, 32)
-        
-        # Build T features: [f_combine, f_prod3]
-        # T = high-order part + scalar part
-        T = torch.cat([f_combine, f_prod3], dim=-1)
-        
-        # product_5: ElementwiseTensorProduct(T, T) → scalars
-        f_prod5 = self.product_5(T, T)  # (N, output_channels)
-        
-        # Readout
-        product_proj = self.proj_total(f_prod5)
-        e_out = self.weighted_sum(product_proj)
-        atom_energies = e_out.sum(dim=-1, keepdim=True)
-        
-        return atom_energies
-
-
-# Backward compatibility alias
-Cartesian_TransformerLayer_multi = CartesianTransformerLayer
-
-
-# ============================================================================
-# Strict Parity Modules - Using CartesianFullyConnectedTensorProduct
-# ============================================================================
 
 class CartesianE3ConvStrict(nn.Module):
+    """
+    First Cartesian E3 convolution layer using strict parity tensor products.
+    
+    This layer converts atom embeddings to equivariant features using
+    CartesianFullyConnectedTensorProduct which respects parity.
+    
+    Forward flow:
+        1. Atom embedding: A → atom_emb → atom_feat (scalar)
+        2. Direction conversion: edge_vec → spherical harmonics sh_edge
+        3. First tensor product: atom_feat ⊗ sh_edge → irreps features
+        4. Radial basis: edge_length → radial basis expansion
+        5. Weight network: radial basis → tensor product weights
+        6. Second tensor product: irreps ⊗ sh_edge → output (with weights)
+        7. Aggregation: Aggregate edge features to nodes
+    """
     
     def __init__(self, max_radius, number_of_basis, channels_out,
-                 embedding_dim=16, max_atomvalue=10, output_size=8,
+                 embedding_dim=16, max_atomvalue=10, output_size=8, 
                  lmax=2, function_type='gaussian'):
         super().__init__()
         self.max_radius = max_radius
@@ -2705,16 +2492,17 @@ class CartesianE3ConvStrict(nn.Module):
         self.lmax = lmax
         self.function_type = function_type
         
-        # Standard irreps with correct parity
-        self.irreps_sh = get_irreps_str(1, lmax)  # "1x0e + 1x1o + 1x2e"
-        self.irreps_out = get_irreps_str(channels_out, lmax)  # "64x0e + 64x1o + 64x2e"
-        self.irreps_scalar = f"{output_size}x0e"
-        
+        # Irreps definitions
         self.dims = [2 * l + 1 for l in range(lmax + 1)]
         self.total_sh_dim = sum(self.dims)
         self.output_dim = channels_out * self.total_sh_dim
         
-        # Cartesian to irreps
+        # Irreps strings
+        self.irreps_scalar = f"{output_size}x0e"
+        self.irreps_sh = get_irreps_str(1, lmax)
+        self.irreps_out = get_irreps_str(channels_out, lmax)
+        
+        # Cartesian to irreps converter
         self.cart_to_irreps = CartesianToIrrepsLight(lmax=lmax)
         
         # Atom embedding
@@ -3027,13 +2815,32 @@ class CartesianTransformerLayerStrict(nn.Module):
         # Strict parity product layers
         combined_channels = self.channels * self.num_interaction  # 64 for channels=32, n=2
         scalar_channels = (self.num_interaction - 1) * 32
-        self.product_3 = CartesianProductStrict(combined_channels, scalar_channels, lmax=lmax)
         
-        # Second product: input is f_combine (64ch) + f_prod3 (32ch) = 96ch
-        self.product_5 = CartesianProductStrict(combined_channels + scalar_channels, 64, lmax=lmax)
+        # Build irreps strings for combined features
+        irreps_combined = get_irreps_str(combined_channels, lmax)
         
-        # Readout from product_5 output (64ch * total_sh_dim)
-        readout_input_dim = 64 * self.total_sh_dim
+        # product_3: 高阶 ⊗ 高阶 → 标量 (32x0e)
+        self.product_3 = CartesianFullyConnectedTensorProduct(
+            irreps_in1=irreps_combined,
+            irreps_in2=irreps_combined,
+            irreps_out=f"{scalar_channels}x0e",
+            shared_weights=True,
+            internal_weights=True
+        )
+        
+        # T = [f_combine, f_prod3] = (combined_channels * total_sh_dim + scalar_channels) features
+        # Build T irreps string
+        irreps_T = get_irreps_str(combined_channels, lmax) + " + " + f"{scalar_channels}x0e"
+        
+        # product_5: ElementwiseTensorProduct(T, T, ["0e"]) - 严格等变
+        self.product_5 = CartesianElementwiseTensorProduct(
+            irreps_in=irreps_T,
+            filter_ir_out=["0e"],
+            lmax=lmax
+        )
+        
+        # Readout input: product_5 outputs scalars
+        readout_input_dim = self.product_5.dim_out
         self.proj_total = MainNet(readout_input_dim, embed_size, 17)
         self.num_features = 17
         self.weighted_sum = RobustScalarWeightedSum(self.num_features, init_weights='zero')
@@ -3060,16 +2867,16 @@ class CartesianTransformerLayerStrict(nn.Module):
         f_combine = torch.cat(features, dim=-1)
         
         # First product layer (strict parity)
-        # Input: 64ch * 9 = 576, Output: 32ch * 9 = 288
-        f_prod3 = self.product_3(f_combine)
+        # Input: 64ch * 9 = 576, Output: 32ch * 9 = 288 (scalars per channel)
+        f_prod3 = self.product_3(f_combine, f_combine)
         
         # Concatenate for second product
         # f_combine: 64ch * 9, f_prod3: 32ch * 9 → 96ch * 9
         T = torch.cat([f_combine, f_prod3], dim=-1)
         
         # Second product layer
-        # Input: 96ch * 9 = 864, Output: 64ch * 9 = 576
-        f_prod5 = self.product_5(T)
+        # ElementwiseTensorProduct(T, T) → scalars
+        f_prod5 = self.product_5(T, T)
         
         # Readout
         product_proj = self.proj_total(f_prod5)
@@ -3591,7 +3398,6 @@ class CartesianTransformerLayerLoose(nn.Module):
         
         # T = [f_combine, f_prod3] = (combined_channels * total_sh_dim + 32) features
         T_channels = combined_channels  # For the high-order part
-        T_scalar_channels = scalar_channels  # From product_3
         
         # Build T irreps string
         irreps_T = get_irreps_str(T_channels, lmax) + " + " + f"{scalar_channels}x0e"
@@ -3646,3 +3452,13 @@ class CartesianTransformerLayerLoose(nn.Module):
         atom_energies = e_out.sum(dim=-1, keepdim=True)
         
         return atom_energies
+
+
+# ==============================================================================
+# Backward-compatible aliases
+# ==============================================================================
+
+# CartesianTransformerLayer is an alias for CartesianTransformerLayerStrict
+# for backward compatibility with existing code that imports CartesianTransformerLayer.
+# Both use CartesianFullyConnectedTensorProduct for tensor products.
+CartesianTransformerLayer = CartesianTransformerLayerStrict

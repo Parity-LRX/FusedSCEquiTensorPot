@@ -182,16 +182,20 @@ class CustomDataset(Dataset):
 class H5Dataset(Dataset):
     """Dataset loading from preprocessed HDF5 files."""
     
-    def __init__(self, prefix, data_dir='.'):
+    def __init__(self, prefix, data_dir='.', file_path=None):
         """
         Initialize H5 dataset.
         
         Args:
-            prefix: Prefix for HDF5 files (e.g., 'train' or 'val')
-            data_dir: Directory containing the HDF5 files (default: current directory)
+            prefix: Prefix for HDF5 files (e.g., 'train' or 'val'), used when file_path is None
+            data_dir: Directory containing the HDF5 files (default: current directory), used when file_path is None
+            file_path: Optional full path to processed H5 file. If given, use this file and ignore prefix/data_dir
         """
         import os
-        self.file_path = os.path.join(data_dir, f'processed_{prefix}.h5')
+        if file_path is not None:
+            self.file_path = os.path.abspath(file_path)
+        else:
+            self.file_path = os.path.join(data_dir, f'processed_{prefix}.h5')
         self._h5_file = None
         
         if not os.path.exists(self.file_path):
