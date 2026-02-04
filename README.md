@@ -4,7 +4,7 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.12%2B-orange)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-**FusedSCEquiTensorPot** is an E(3)-equivariant neural potential for predicting molecular energies and forces. Built with PyTorch, it supports **six equivariant tensor product modes**, including e3nn-based spherical harmonics and five self-implemented Cartesian tensor product methods.
+**FusedSCEquiTensorPot** is an E(3)-equivariant neural potential for predicting molecular and materials energies and forces. Built with PyTorch, it supports **six equivariant tensor product modes**, including e3nn-based spherical harmonics and five self-implemented Cartesian tensor product methods.
 
 ## ✨ Features
 
