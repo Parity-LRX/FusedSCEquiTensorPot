@@ -17,7 +17,20 @@ Or using the simpler python command:
 
 import sys
 import os
+
+# 在 import torch 之前设好线程限制，防止 LAMMPS 回调中多线程死锁
+for _env_var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                 "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_env_var, "1")
+
 import torch
+# 必须在首次 torch 并行操作之前调用一次，之后不可重复调用（否则可能死锁）
+try:
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    pass  # 已经设置过或已有并行操作
+
 import numpy as np
 from typing import Dict, Tuple, Optional, Mapping, Any
 
@@ -28,6 +41,45 @@ from molecular_force_field.models import E3_TransformerLayer_multi
 from molecular_force_field.utils.config import ModelConfig
 from molecular_force_field.utils.graph_utils import radius_graph_pbc_gpu
 from molecular_force_field.utils.tensor_utils import map_tensor_values
+
+# 小体系 CPU 下用纯 PyTorch 邻居列表，避免 LAMMPS 回调中 torch_cluster 可能导致的死锁
+_MAX_ATOMS_CPU_SIMPLE = 512
+
+
+def _radius_graph_pbc_cpu_simple(pos: torch.Tensor, r: float, cell: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """纯 PyTorch PBC 邻居列表，仅用于 CPU 且原子数较小时。"""
+    cell_mat = cell.squeeze(0) if cell.dim() == 3 else cell
+    n = pos.size(0)
+    device = pos.device
+    r2 = r * r
+    all_src, all_dst, all_shifts = [], [], []
+    for sx in (-1, 0, 1):
+        for sy in (-1, 0, 1):
+            for sz in (-1, 0, 1):
+                s = torch.tensor([sx, sy, sz], dtype=torch.float64, device=device)
+                shift = (s.unsqueeze(0) @ cell_mat).squeeze(0)
+                pos_shifted = pos + shift
+                for i in range(n):
+                    d = pos_shifted - pos[i : i + 1]
+                    dist2 = (d * d).sum(dim=1)
+                    for j in range(n):
+                        if sx == 0 and sy == 0 and sz == 0 and i == j:
+                            continue
+                        if dist2[j].item() <= r2 and dist2[j].item() > 1e-20:
+                            all_src.append(i)
+                            all_dst.append(j)
+                            all_shifts.append([sx, sy, sz])
+    if not all_src:
+        return (
+            torch.empty(0, device=device, dtype=torch.long),
+            torch.empty(0, device=device, dtype=torch.long),
+            torch.empty(0, 3, device=device, dtype=torch.float64),
+        )
+    return (
+        torch.tensor(all_src, device=device, dtype=torch.long),
+        torch.tensor(all_dst, device=device, dtype=torch.long),
+        torch.tensor(all_shifts, device=device, dtype=torch.float64),
+    )
 
 
 class LAMMPSPotential:
@@ -206,10 +258,15 @@ class LAMMPSPotential:
         if not any(pbc):
             cell = torch.eye(3, dtype=torch.float64, device=self.device).unsqueeze(0) * 100.0
         
-        # Compute neighbor list
-        edge_src, edge_dst, edge_shifts = radius_graph_pbc_gpu(
-            pos_all, self.max_radius, cell, max_num_neighbors=100
-        )
+        # Compute neighbor list（CPU 且原子数较小时用纯 PyTorch 实现，避免 LAMMPS 回调中 torch_cluster 死锁）
+        if self.device.type == "cpu" and pos_all.size(0) <= _MAX_ATOMS_CPU_SIMPLE:
+            edge_src, edge_dst, edge_shifts = _radius_graph_pbc_cpu_simple(
+                pos_all, self.max_radius, cell
+            )
+        else:
+            edge_src, edge_dst, edge_shifts = radius_graph_pbc_gpu(
+                pos_all, self.max_radius, cell, max_num_neighbors=100
+            )
         
         # Batch index (all atoms in same batch for single structure)
         batch_idx = torch.zeros(len(pos_all), dtype=torch.long, device=self.device)

@@ -33,14 +33,36 @@ setup(
         "torch>=1.12.0",
         "numpy>=1.21.0",
         "pandas>=1.3.0",
-        "e3nn>=0.5.0",
-        "torch-scatter>=2.0.9",
-        "torch-cluster>=1.6.0",
+        # Keep compatible with mace-torch (often pins e3nn==0.4.4)
+        "e3nn>=0.4.4,<0.6.0",
         "ase>=3.22.0",
+        "matscipy>=0.8.0",
         "tqdm>=4.62.0",
         "h5py>=3.6.0",
+        "tables>=3.8.0",
         "matplotlib>=3.5.0",
     ],
+    extras_require={
+        # Optional PyG extensions (faster scatter / radius graph). The codebase has
+        # pure-PyTorch fallbacks, but these are recommended when wheels are available.
+        "pyg": [
+            "torch-scatter>=2.0.9",
+            "torch-cluster>=1.6.0",
+        ],
+        # Optional backend: cuEquivariance (for tensor_product_mode="spherical-save-cue").
+        # This is kept optional to avoid pip upgrading torch in environments that pin torch/torchvision/torchaudio.
+        "cue": [
+            "cuequivariance-torch>=0.8.1",
+            "cuequivariance-ops-torch-cu12>=0.8.1; platform_system=='Linux'",
+        ],
+        # Convenience extra.
+        "full": [
+            "torch-scatter>=2.0.9",
+            "torch-cluster>=1.6.0",
+            "cuequivariance-torch>=0.8.1",
+            "cuequivariance-ops-torch-cu12>=0.8.1; platform_system=='Linux'",
+        ],
+    },
     entry_points={
         "console_scripts": [
             "mff-train=molecular_force_field.cli.train:main",

@@ -9,7 +9,7 @@ from e3nn import nn as e3nn_nn
 from e3nn.math import soft_one_hot_linspace
 from e3nn.nn import S2Activation
 from e3nn.nn import Gate
-from torch_scatter import scatter
+from molecular_force_field.utils.scatter import scatter
 
 from molecular_force_field.models.mlp import MainNet2, MainNet, RobustScalarWeightedSum
 
@@ -104,15 +104,14 @@ class E3Conv(nn.Module):
         if module.bias is not None:
             nn.init.zeros_(module.bias)
     
-    def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell):
-        edge_batch_idx = batch[edge_src]  # (Total_Edges,)
-        edge_cells = cell[edge_batch_idx]  # (Total_Edges, 3, 3)
-        
-        # Vector multiplication: shift_int * cell_matrix
-        shift_vecs = torch.einsum('ni,nij->nj', edge_shifts, edge_cells)
-        
-        # Calculate relative coordinates: r_ij = r_j - r_i + S . C
-        edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
+    def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell, *, precomputed_edge_vec=None):
+        if precomputed_edge_vec is not None:
+            edge_vec = precomputed_edge_vec
+        else:
+            edge_batch_idx = batch[edge_src]
+            edge_cells = cell[edge_batch_idx]
+            shift_vecs = torch.einsum('ni,nij->nj', edge_shifts, edge_cells)
+            edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
         edge_length = edge_vec.norm(dim=1)
 
         num_nodes = pos.size(0)
@@ -244,18 +243,17 @@ class E3Conv2(nn.Module):
         if module.bias is not None:
             nn.init.zeros_(module.bias)
     
-    def forward(self, f_in, pos, A, batch, edge_src, edge_dst, edge_shifts, cell):
+    def forward(self, f_in, pos, A, batch, edge_src, edge_dst, edge_shifts, cell, *, precomputed_edge_vec=None):
         assert not torch.isnan(pos).any(), "Input 'pos' contains NaN values."
         assert not torch.isinf(pos).any(), "Input 'pos' contains Inf values."
 
-        edge_batch_idx = batch[edge_src]  # (Total_Edges,)
-        edge_cells = cell[edge_batch_idx]  # (Total_Edges, 3, 3)
-        
-        # Vector multiplication: shift_int * cell_matrix
-        shift_vecs = torch.einsum('ni,nij->nj', edge_shifts, edge_cells)
-        
-        # Calculate relative coordinates: r_ij = r_j - r_i + S . C
-        edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
+        if precomputed_edge_vec is not None:
+            edge_vec = precomputed_edge_vec
+        else:
+            edge_batch_idx = batch[edge_src]
+            edge_cells = cell[edge_batch_idx]
+            shift_vecs = torch.einsum('ni,nij->nj', edge_shifts, edge_cells)
+            edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
         edge_length = edge_vec.norm(dim=1)
 
         num_nodes = pos.size(0)
@@ -512,27 +510,29 @@ class E3_TransformerLayer_multi(nn.Module):
         if module.bias is not None:
             nn.init.zeros_(module.bias)
     
-    def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell):
+    def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell, *, precomputed_edge_vec=None):
         sort_idx = torch.argsort(edge_dst)
         edge_src = edge_src[sort_idx]
         edge_dst = edge_dst[sort_idx]
-        edge_shifts = edge_shifts[sort_idx]  # PBC offset also needs sorting
-        
+        edge_shifts = edge_shifts[sort_idx]
+
+        if precomputed_edge_vec is not None:
+            edge_vec = precomputed_edge_vec[sort_idx]
+        else:
+            edge_vec = None
+
         features = []
-        f_prev = self.e3_conv_layers[0](pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
+        f_prev = self.e3_conv_layers[0](pos, A, batch, edge_src, edge_dst, edge_shifts, cell, precomputed_edge_vec=edge_vec)
         features.append(f_prev)
         for conv in self.e3_conv_layers[1:]:
-            f_prev = conv(f_prev, pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
+            f_prev = conv(f_prev, pos, A, batch, edge_src, edge_dst, edge_shifts, cell, precomputed_edge_vec=edge_vec)
             features.append(f_prev)
 
-        edge_batch_idx = batch[edge_src]  # (Total_Edges,)
-        edge_cells = cell[edge_batch_idx]  # (Total_Edges, 3, 3)
-        
-        # Vector multiplication: shift_int * cell_matrix
-        shift_vecs = torch.einsum('ni,nij->nj', edge_shifts, edge_cells)
-        
-        # Calculate relative coordinates: r_ij = r_j - r_i + S . C
-        edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
+        if edge_vec is None:
+            edge_batch_idx = batch[edge_src]
+            edge_cells = cell[edge_batch_idx]
+            shift_vecs = torch.einsum('ni,nij->nj', edge_shifts, edge_cells)
+            edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
         edge_length = edge_vec.norm(dim=1)
         
         f_combine = torch.cat(features, dim=-1)

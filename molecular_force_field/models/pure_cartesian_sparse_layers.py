@@ -12,7 +12,7 @@ import math
 import torch
 import torch.nn as nn
 from e3nn.math import soft_one_hot_linspace
-from torch_scatter import scatter
+from molecular_force_field.utils.scatter import scatter
 
 from molecular_force_field.models.mlp import RobustScalarWeightedSum
 from molecular_force_field.models.pure_cartesian import (
@@ -27,10 +27,12 @@ from molecular_force_field.models.pure_cartesian import (
 
 class PureCartesianSparseE3Conv(nn.Module):
     """
-    First convolution for pure-cartesian-sparse:
-      - build rank edge powers n^{⊗L}
-      - multiply by node scalar embedding
-      - apply sparse O(3) TP with neighbor scalar features and per-edge radial weights
+    First convolution for pure-cartesian-sparse (neighbor in TP).
+
+      - Build f_in = source scalar ⊗ edge rank powers n^{⊗L}
+      - Second operand x2 = neighbor (edge_dst) scalar features (rank0 only), C2=output_size
+      - TP(f_in, x2; weights(r)) with C1=output_size, C2=output_size
+      - scatter to nodes, normalize by neighbor_count (same as pure_cartesian_layers).
     """
 
     def __init__(
@@ -61,15 +63,15 @@ class PureCartesianSparseE3Conv(nn.Module):
             nn.Linear(64, output_size),
         )
 
+        # Second operand is neighbor scalar (C2=output_size), same as PureCartesianE3Conv.
         self.tp2 = PureCartesianTensorProductO3Sparse(
             C1=output_size,
             C2=output_size,
             Cout=channels_out,
             Lmax=Lmax,
-            # x2 is packed as scalar-only in this layer, so we can be much more aggressive:
-            max_rank_other=0,
+            max_rank_other=max_rank_other,
             allow_epsilon=False,
-            k_policy="k0",
+            k_policy=k_policy,
             share_parity_weights=True,
             assume_pseudo_zero=True,
             internal_weights=False,
@@ -101,10 +103,8 @@ class PureCartesianSparseE3Conv(nn.Module):
         Ai = self.atom_mlp(self.atom_embedding(A.long()))
         edge_vec = edge_vec.to(dtype=Ai.dtype)
 
-        # edge rank powers
         e = edge_rank_powers(edge_vec, self.Lmax, normalize=True)
 
-        # Build graded input f_in (E, output_size over ranks), true only (s=0)
         batch_shape = (edge_src.shape[0],)
         f1_blocks = {(0, 0): Ai[edge_src], (1, 0): torch.zeros_like(Ai[edge_src])}
         for L in range(1, self.Lmax + 1):
@@ -113,7 +113,7 @@ class PureCartesianSparseE3Conv(nn.Module):
             f1_blocks[(1, L)] = torch.zeros_like(base)
         f_in = merge_by_rank_o3(f1_blocks, self.output_size, self.Lmax)
 
-        # Neighbor scalar only as x2 (pack higher ranks as zero)
+        # Second operand: neighbor (edge_dst) scalar, rank0 only, C2=output_size
         x2_blocks = {(0, 0): Ai[edge_dst], (1, 0): torch.zeros_like(Ai[edge_dst])}
         for L in range(1, self.Lmax + 1):
             z = torch.zeros(Ai.size(0), self.output_size, *([3] * L), device=Ai.device, dtype=Ai.dtype)[edge_dst]
@@ -129,7 +129,6 @@ class PureCartesianSparseE3Conv(nn.Module):
 
         edge_features = self.tp2(f_in, x2, weights)
 
-        # Aggregate to nodes
         num_nodes = pos.size(0)
         neighbor_count = scatter(torch.ones_like(edge_dst), edge_dst, dim=0, dim_size=num_nodes).clamp(min=1).to(edge_features.dtype)
         out = scatter(edge_features, edge_dst, dim=0, dim_size=num_nodes).div(neighbor_count.unsqueeze(-1))
@@ -214,8 +213,9 @@ class PureCartesianSparseE3Conv2(nn.Module):
 
         num_nodes = pos.size(0)
         edge_features = self.tp(f_in[edge_src], e_flat, weights)
-        neighbor_count = scatter(torch.ones_like(edge_dst), edge_dst, dim=0, dim_size=num_nodes).clamp(min=1).to(edge_features.dtype)
-        out = scatter(edge_features, edge_dst, dim=0, dim_size=num_nodes).div(neighbor_count.unsqueeze(-1))
+        out = scatter(edge_features, edge_dst, dim=0, dim_size=num_nodes, reduce="sum")
+        avg_num_neighbors = float(edge_src.numel()) / float(max(num_nodes, 1))
+        out = out / max(avg_num_neighbors, 1e-8)
         return out
 
 

@@ -21,6 +21,176 @@ from molecular_force_field.utils.config import ModelConfig
 from molecular_force_field.interfaces.lammps_potential import LAMMPSPotential
 
 
+def _make_dummy_checkpoint_spherical_save(path: str, device: torch.device) -> ModelConfig:
+    """创建 spherical-save (e3nn_layers_channelwise) 的 dummy checkpoint。"""
+    from molecular_force_field.models.e3nn_layers_channelwise import (
+        E3_TransformerLayer_multi as E3_TransformerLayer_multi_channelwise,
+    )
+
+    config = ModelConfig(dtype=torch.float64)
+    config.atomic_energy_keys = torch.tensor([1, 8], dtype=torch.long)
+    config.atomic_energy_values = torch.tensor([-13.6, -75.0], dtype=config.dtype)
+
+    model = E3_TransformerLayer_multi_channelwise(
+        max_embed_radius=config.max_radius,
+        main_max_radius=config.max_radius_main,
+        main_number_of_basis=config.number_of_basis_main,
+        irreps_input=config.get_irreps_output_conv(),
+        irreps_query=config.get_irreps_query_main(),
+        irreps_key=config.get_irreps_key_main(),
+        irreps_value=config.get_irreps_value_main(),
+        irreps_output=config.get_irreps_output_conv_2(),
+        irreps_sh=config.get_irreps_sh_transformer(),
+        hidden_dim_sh=config.get_hidden_dim_sh(),
+        hidden_dim=config.emb_number_main_2,
+        channel_in2=config.channel_in2,
+        embedding_dim=config.embedding_dim,
+        max_atomvalue=config.max_atomvalue,
+        output_size=config.output_size,
+        embed_size=config.embed_size,
+        main_hidden_sizes3=config.main_hidden_sizes3,
+        num_layers=config.num_layers,
+        num_interaction=2,
+        function_type_main=config.function_type,
+        device=device,
+    ).to(device)
+
+    ckpt = {
+        "e3trans_state_dict": model.state_dict(),
+        "dtype": "float64",
+        "tensor_product_mode": "spherical-save",
+    }
+    torch.save(ckpt, path)
+    return config
+
+
+def _make_dummy_checkpoint_spherical_save_cue(path: str, device: torch.device) -> ModelConfig:
+    """创建 spherical-save-cue (cue_layers_channelwise, cuEquivariance) 的 dummy checkpoint。"""
+    try:
+        import cuequivariance_torch  # noqa: F401
+    except ImportError as e:
+        raise ImportError(
+            "spherical-save-cue requires cuEquivariance. "
+            "Install: pip install cuequivariance-torch cuequivariance-ops-torch-cu12"
+        ) from e
+    from molecular_force_field.models.cue_layers_channelwise import (
+        E3_TransformerLayer_multi as E3_TransformerLayer_multi_channelwise_cue,
+    )
+
+    config = ModelConfig(dtype=torch.float64)
+    config.atomic_energy_keys = torch.tensor([1, 8], dtype=torch.long)
+    config.atomic_energy_values = torch.tensor([-13.6, -75.0], dtype=config.dtype)
+
+    model = E3_TransformerLayer_multi_channelwise_cue(
+        max_embed_radius=config.max_radius,
+        main_max_radius=config.max_radius_main,
+        main_number_of_basis=config.number_of_basis_main,
+        irreps_input=config.get_irreps_output_conv(),
+        irreps_query=config.get_irreps_query_main(),
+        irreps_key=config.get_irreps_key_main(),
+        irreps_value=config.get_irreps_value_main(),
+        irreps_output=config.get_irreps_output_conv_2(),
+        irreps_sh=config.get_irreps_sh_transformer(),
+        hidden_dim_sh=config.get_hidden_dim_sh(),
+        hidden_dim=config.emb_number_main_2,
+        channel_in2=config.channel_in2,
+        embedding_dim=config.embedding_dim,
+        max_atomvalue=config.max_atomvalue,
+        output_size=config.output_size,
+        embed_size=config.embed_size,
+        main_hidden_sizes3=config.main_hidden_sizes3,
+        num_layers=config.num_layers,
+        num_interaction=2,
+        function_type_main=config.function_type,
+        device=device,
+    ).to(device)
+
+    ckpt = {
+        "e3trans_state_dict": model.state_dict(),
+        "dtype": "float64",
+        "tensor_product_mode": "spherical-save-cue",
+    }
+    torch.save(ckpt, path)
+    return config
+
+
+def _make_dummy_checkpoint_pure_cartesian_ictd(path: str, device: torch.device) -> ModelConfig:
+    """创建 pure-cartesian-ictd (pure_cartesian_ictd_layers_full) 的 dummy checkpoint。"""
+    from molecular_force_field.models.pure_cartesian_ictd_layers_full import PureCartesianICTDTransformerLayer
+
+    config = ModelConfig(dtype=torch.float64)
+    config.atomic_energy_keys = torch.tensor([1, 8], dtype=torch.long)
+    config.atomic_energy_values = torch.tensor([-13.6, -75.0], dtype=config.dtype)
+
+    model = PureCartesianICTDTransformerLayer(
+        max_embed_radius=config.max_radius,
+        main_max_radius=config.max_radius_main,
+        main_number_of_basis=config.number_of_basis_main,
+        hidden_dim_conv=config.channel_in,
+        hidden_dim_sh=config.get_hidden_dim_sh(),
+        hidden_dim=config.emb_number_main_2,
+        channel_in2=config.channel_in2,
+        embedding_dim=config.embedding_dim,
+        max_atomvalue=config.max_atomvalue,
+        output_size=config.output_size,
+        embed_size=config.embed_size,
+        main_hidden_sizes3=config.main_hidden_sizes3,
+        num_layers=config.num_layers,
+        num_interaction=2,
+        function_type_main=config.function_type,
+        lmax=config.lmax,
+        internal_compute_dtype=config.dtype,
+        device=device,
+    ).to(device)
+
+    ckpt = {
+        "e3trans_state_dict": model.state_dict(),
+        "dtype": "float64",
+        "tensor_product_mode": "pure-cartesian-ictd",
+    }
+    torch.save(ckpt, path)
+    return config
+
+
+def _make_dummy_checkpoint_pure_cartesian_ictd_save(path: str, device: torch.device) -> ModelConfig:
+    """创建 pure-cartesian-ictd-save (pure_cartesian_ictd_layers) 的 dummy checkpoint。"""
+    from molecular_force_field.models.pure_cartesian_ictd_layers import PureCartesianICTDTransformerLayer
+
+    config = ModelConfig(dtype=torch.float64)
+    config.atomic_energy_keys = torch.tensor([1, 8], dtype=torch.long)
+    config.atomic_energy_values = torch.tensor([-13.6, -75.0], dtype=config.dtype)
+
+    model = PureCartesianICTDTransformerLayer(
+        max_embed_radius=config.max_radius,
+        main_max_radius=config.max_radius_main,
+        main_number_of_basis=config.number_of_basis_main,
+        hidden_dim_conv=config.channel_in,
+        hidden_dim_sh=config.get_hidden_dim_sh(),
+        hidden_dim=config.emb_number_main_2,
+        channel_in2=config.channel_in2,
+        embedding_dim=config.embedding_dim,
+        max_atomvalue=config.max_atomvalue,
+        output_size=config.output_size,
+        embed_size=config.embed_size,
+        main_hidden_sizes3=config.main_hidden_sizes3,
+        num_layers=config.num_layers,
+        num_interaction=2,
+        function_type_main=config.function_type,
+        lmax=config.lmax,
+        ictd_tp_path_policy="full",
+        internal_compute_dtype=config.dtype,
+        device=device,
+    ).to(device)
+
+    ckpt = {
+        "e3trans_state_dict": model.state_dict(),
+        "dtype": "float64",
+        "tensor_product_mode": "pure-cartesian-ictd-save",
+    }
+    torch.save(ckpt, path)
+    return config
+
+
 @dataclass
 class SelfTestResult:
     energy_kcalmol: float

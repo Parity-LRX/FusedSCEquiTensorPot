@@ -4,6 +4,10 @@ Molecular Force Field - A Python library for molecular modeling with E3NN-based 
 
 __version__ = "0.1.0"
 
+import torch
+if hasattr(torch.serialization, 'add_safe_globals'):
+    torch.serialization.add_safe_globals([slice])
+
 # Import main classes and functions (lazy import to avoid circular dependencies)
 try:
     from molecular_force_field.models import (

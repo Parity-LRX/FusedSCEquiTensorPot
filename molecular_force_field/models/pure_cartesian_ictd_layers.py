@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from torch_scatter import scatter
+from molecular_force_field.utils.scatter import scatter
 from e3nn.math import soft_one_hot_linspace
 import math
 
 from molecular_force_field.models.ictd_irreps import (
+    HarmonicElementwiseProduct,
     HarmonicFullyConnectedTensorProduct,
     direction_harmonics,
     direction_harmonics_all,
@@ -111,9 +112,11 @@ def _elementwise_tensor_product_0e_blocks(
 
 class ICTDIrrepsE3Conv(nn.Module):
     """
-    First convolution in ICTD-irreps space:
-      scalar(Ai) ⊗ Y_l(n) -> output_size copies of each l
-      then (irreps) ⊗ scalar(Aj) with per-edge radial weights -> channels_out irreps
+    First convolution in ICTD-irreps space (channelwise form: no neighbor in TP).
+
+      scalar(Ai) ⊗ Y_l(n) -> f_in (output_size copies per l)
+      then TP(f_in, edge_Y; weights(r)) -> channels_out irreps  [second operand is edge geometry only, mul=1]
+      scatter_sum to receivers, normalize by avg_num_neighbors (global).
     """
 
     def __init__(
@@ -129,6 +132,8 @@ class ICTDIrrepsE3Conv(nn.Module):
         # ICTD tensor-product path control (e3nn-instructions-like)
         ictd_tp_path_policy: str = "full",
         ictd_tp_max_rank_other: int | None = None,
+        # Normalize messages by this (default None = use num_edges/num_nodes at runtime)
+        avg_num_neighbors: float | None = None,
         # Internal computation dtype for ICTD operations (default: float64 for stability)
         internal_compute_dtype: torch.dtype = torch.float64,
     ):
@@ -139,6 +144,7 @@ class ICTDIrrepsE3Conv(nn.Module):
         self.output_size = output_size
         self.lmax = lmax
         self.function_type = function_type
+        self.avg_num_neighbors = avg_num_neighbors
 
         self.atom_embedding = nn.Embedding(max_atomvalue, embedding_dim)
         self.atom_mlp = nn.Sequential(
@@ -147,9 +153,10 @@ class ICTDIrrepsE3Conv(nn.Module):
             nn.Linear(64, output_size),
         )
 
+        # Channelwise: (node ⊗ edge_Y) only; second input has mul=1 (edge geometry)
         self.tp2 = HarmonicFullyConnectedTensorProduct(
             mul_in1=output_size,
-            mul_in2=output_size,
+            mul_in2=1,
             mul_out=channels_out,
             lmax=lmax,
             internal_weights=True,
@@ -195,9 +202,8 @@ class ICTDIrrepsE3Conv(nn.Module):
         Y = {l: Y_list[l] for l in range(self.lmax + 1)}  # (E, 2l+1)
 
         f_in = {l: Ai[edge_src].unsqueeze(-1) * Y[l].unsqueeze(-2) for l in range(self.lmax + 1)}  # (E, output_size, 2l+1)
-
-        x2 = {l: torch.zeros(edge_src.shape[0], self.output_size, 2 * l + 1, device=Ai.device, dtype=Ai.dtype) for l in range(self.lmax + 1)}
-        x2[0] = Ai[edge_dst].unsqueeze(-1)  # scalar only
+        # Second operand: edge geometry only (mul=1), no neighbor
+        x2 = {l: Y_list[l].unsqueeze(-2) for l in range(self.lmax + 1)}  # (E, 1, 2l+1)
 
         emb = soft_one_hot_linspace(edge_length, 0.0, self.max_radius, self.number_of_basis, basis=self.function_type, cutoff=True)
         emb = emb.mul(self.number_of_basis ** 0.5).to(dtype=Ai.dtype)
@@ -206,8 +212,9 @@ class ICTDIrrepsE3Conv(nn.Module):
         edge_features = _merge_irreps(out_blocks, self.channels_out, self.lmax)
 
         num_nodes = pos.size(0)
-        neighbor_count = scatter(torch.ones_like(edge_dst), edge_dst, dim=0, dim_size=num_nodes).clamp(min=1).to(edge_features.dtype)
-        out = scatter(edge_features, edge_dst, dim=0, dim_size=num_nodes).div(neighbor_count.unsqueeze(-1))
+        out = scatter(edge_features, edge_dst, dim=0, dim_size=num_nodes, reduce="sum")
+        avg = self.avg_num_neighbors if self.avg_num_neighbors is not None else (float(edge_src.numel()) / float(max(num_nodes, 1)))
+        out = out / max(avg, 1e-8)
         return out
 
 
@@ -342,7 +349,6 @@ class PureCartesianICTDTransformerLayer(nn.Module):
                     raise ValueError(f"product5_muls_by_l[{l}] must be positive, got {self.product5_muls_by_l[l]}")
 
         # Optional per-l channel adapters for f1..fn to match desired muls_by_l.
-        # Default is identity (mul_l == channels).
         self._p5_adapt = nn.ModuleList()
         for _ in range(self.num_interaction):
             layer_adapt = nn.ModuleDict()
@@ -354,10 +360,31 @@ class PureCartesianICTDTransformerLayer(nn.Module):
                     layer_adapt[str(l)] = nn.Linear(self.channels, out_ch, bias=False)
             self._p5_adapt.append(layer_adapt)
 
+        # HarmonicElementwiseProduct replaces manual _irreps_elementwise_tensor_product_0e.
+        self.product_5 = HarmonicElementwiseProduct(
+            lmax=self.lmax,
+            mul=combined_channels,
+            irreps_out="0e",
+            internal_compute_dtype=internal_compute_dtype,
+        )
+
         sum_mul = sum(self.product5_muls_by_l[l] for l in range(self.lmax + 1))
         self.proj_total = MainNet(self.num_interaction * sum_mul + scalar_channels, embed_size, 17)
 
-    def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell):
+    def forward(
+        self,
+        pos,
+        A,
+        batch,
+        edge_src,
+        edge_dst,
+        edge_shifts,
+        cell,
+        *,
+        precomputed_edge_vec=None,
+        return_combined_features: bool = False,
+        sync_after_scatter: callable | None = None,
+    ):
         dtype = next(self.parameters()).dtype
         pos = pos.to(dtype=dtype)
         cell = cell.to(dtype=dtype)
@@ -368,11 +395,13 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         edge_dst = edge_dst[sort_idx]
         edge_shifts = edge_shifts[sort_idx]
 
-        # Precompute edge geometry once and reuse for conv1 + conv2
-        edge_batch_idx = batch[edge_src]
-        edge_cells = cell[edge_batch_idx]
-        shift_vecs = torch.einsum("ni,nij->nj", edge_shifts, edge_cells)
-        edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
+        if precomputed_edge_vec is not None:
+            edge_vec = precomputed_edge_vec[sort_idx]
+        else:
+            edge_batch_idx = batch[edge_src]
+            edge_cells = cell[edge_batch_idx]
+            shift_vecs = torch.einsum("ni,nij->nj", edge_shifts, edge_cells)
+            edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
         edge_length = edge_vec.norm(dim=1)
         n = edge_vec / edge_length.clamp(min=1e-8).unsqueeze(-1)
 
@@ -385,11 +414,13 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             precomputed_edge_length=edge_length,
             precomputed_Y_list=Y_list,
         )  # (N, C*(lmax+1)^2)
+        if sync_after_scatter is not None:
+            f1 = sync_after_scatter(f1)
         features = [f1]
 
-        # conv2..convN: node irreps x edge Y_l -> node irreps
+        # conv2..convN: node irreps x edge Y_l -> node irreps (channelwise); scatter_sum then / avg_num_neighbors
         num_nodes = pos.size(0)
-        neighbor_count = scatter(torch.ones_like(edge_dst), edge_dst, dim=0, dim_size=num_nodes).clamp(min=1)
+        avg_num_neighbors = float(edge_src.numel()) / float(max(num_nodes, 1))
         emb_base = soft_one_hot_linspace(
             edge_length,
             0.0,
@@ -410,8 +441,9 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             x1e = {l: x1[l][edge_src] for l in range(self.lmax + 1)}
             edge_blocks = tp2(x1e, Y, gates)  # dict l -> (E, C, 2l+1)
             edge_flat = _merge_irreps(edge_blocks, self.channels, self.lmax)
-            neighbor_count = neighbor_count.to(edge_flat.dtype)
-            f_next = scatter(edge_flat, edge_dst, dim=0, dim_size=num_nodes).div(neighbor_count.unsqueeze(-1))
+            f_next = scatter(edge_flat, edge_dst, dim=0, dim_size=num_nodes, reduce="sum") / max(avg_num_neighbors, 1e-8)
+            if sync_after_scatter is not None:
+                f_next = sync_after_scatter(f_next)
             features.append(f_next)
 
         f_combine = torch.cat(features, dim=-1)  # (N, nC*(lmax+1)^2)
@@ -424,33 +456,30 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             gram = torch.einsum("ncm,ndm->ncd", t, t) / ((2 * l + 1) ** 0.5)  # (N,2C,2C)
             scalars = scalars + torch.einsum("ocd,ncd->no", self.W_read[l], gram)
 
-        # Build product_5-like invariant vector aligned with e3nn ElementwiseTensorProduct(..., ["0e"]):
-        # allow per-l multiplicities via optional adapters.
-        # Fast path: if all adapters are Identity (default config), reuse old function directly.
+        # Build T = cat(features, scalars) per l, then product_5(T, T) → 0e.
+        # Scalars are appended to the l=0 block so they also go through normalized EWP.
         all_identity = all(
             isinstance(self._p5_adapt[i][str(l)], nn.Identity)
             for i in range(self.num_interaction)
             for l in range(self.lmax + 1)
         )
-        if all_identity:
-            # Fast path: no adapters needed, use old optimized function
-            invs = [
-                _irreps_elementwise_tensor_product_0e(f, f, self.channels, self.lmax)
-                for f in features
-            ]
-        else:
-            # Slow path: per-l adapters needed
-            invs = []
-            for i, f in enumerate(features):
-                b = _split_irreps(f, self.channels, self.lmax)
-                ba: dict[int, torch.Tensor] = {}
-                for l in range(self.lmax + 1):
-                    ba[l] = _apply_channel_adapter_per_l(b[l], self._p5_adapt[i][str(l)])
-                invs.append(_elementwise_tensor_product_0e_blocks(ba, ba, self.product5_muls_by_l, self.lmax))
-        inv3 = scalars * scalars
-        f_prod5 = torch.cat(invs + [inv3], dim=-1)
+        splits = [_split_irreps(f, self.channels, self.lmax) for f in features]
+        T_blocks: dict[int, torch.Tensor] = {}
+        for l in range(self.lmax + 1):
+            parts = []
+            for i in range(len(features)):
+                b_l = splits[i][l]
+                if not all_identity:
+                    b_l = _apply_channel_adapter_per_l(b_l, self._p5_adapt[i][str(l)])
+                parts.append(b_l)
+            T_blocks[l] = torch.cat(parts, dim=-2)
+        T_blocks[0] = torch.cat([T_blocks[0], scalars.unsqueeze(-1)], dim=-2)
+        f_prod5 = self.product_5(T_blocks, T_blocks)
 
         product_proj = self.proj_total(f_prod5)
         e_out = self.weighted_sum(product_proj)
-        return e_out.sum(dim=-1, keepdim=True)
+        out = e_out.sum(dim=-1, keepdim=True)
+        if return_combined_features:
+            return out, f_combine
+        return out
 

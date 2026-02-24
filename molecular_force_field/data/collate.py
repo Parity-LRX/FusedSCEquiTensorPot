@@ -30,8 +30,10 @@ def my_collate_fn(batch_list):
     
     num_nodes_accumulated = 0
 
+    stress_list = []
+
     for i, item in enumerate(batch_list):
-        read_tensor, target_energy, src, dst, shifts, cell = item
+        read_tensor, target_energy, src, dst, shifts, cell, stress = item
         num_atoms = read_tensor.shape[0]
         
         pos = read_tensor[:, 1:4]
@@ -49,6 +51,7 @@ def my_collate_fn(batch_list):
         edge_dst_list.append(dst + num_nodes_accumulated)
         edge_shifts_list.append(shifts)
         cell_list.append(cell)
+        stress_list.append(stress)
         
         num_nodes_accumulated += num_atoms
 
@@ -61,7 +64,8 @@ def my_collate_fn(batch_list):
         torch.cat(edge_src_list, dim=0),
         torch.cat(edge_dst_list, dim=0),
         torch.cat(edge_shifts_list, dim=0),
-        torch.stack(cell_list, dim=0)  # (B, 3, 3)
+        torch.stack(cell_list, dim=0),  # (B, 3, 3)
+        torch.stack(stress_list, dim=0)  # (B, 3, 3)
     )
 
 
@@ -76,7 +80,7 @@ def collate_fn_h5(batch_list):
         Batched data tuple
     """
     pos_l, A_l, b_idx_l, force_l, target_l = [], [], [], [], []
-    src_l, dst_l, shift_l, cell_l = [], [], [], []
+    src_l, dst_l, shift_l, cell_l, stress_l = [], [], [], [], []
     
     node_offset = 0
     for i, data in enumerate(batch_list):
@@ -92,6 +96,7 @@ def collate_fn_h5(batch_list):
         
         # Cell information (keep [1, 3, 3] for stacking)
         cell_l.append(data['cell'].view(1, 3, 3))
+        stress_l.append(data['stress'].view(1, 3, 3))
         
         # Core: Concatenate precomputed edge table (apply node offset)
         src_l.append(data['edge_src'] + node_offset)
@@ -109,7 +114,8 @@ def collate_fn_h5(batch_list):
         torch.cat(src_l),       # [Total_Edges]
         torch.cat(dst_l),       # [Total_Edges]
         torch.cat(shift_l),     # [Total_Edges, 3]
-        torch.cat(cell_l)       # [Batch_Size, 3, 3]
+        torch.cat(cell_l),      # [Batch_Size, 3, 3]
+        torch.cat(stress_l)     # [Batch_Size, 3, 3]
     )
 
 
@@ -127,7 +133,7 @@ def on_the_fly_collate(batch_list):
         return None
     
     # Initialize lists
-    pos_l, A_l, force_l, target_l, cell_l, b_idx_l = [], [], [], [], [], []
+    pos_l, A_l, force_l, target_l, cell_l, stress_l, b_idx_l = [], [], [], [], [], [], []
     src_l, dst_l, shift_l = [], [], []
     
     num_nodes_accum = 0
@@ -140,6 +146,7 @@ def on_the_fly_collate(batch_list):
         force_l.append(item['force'])
         target_l.append(item['target'])
         cell_l.append(item['cell'])
+        stress_l.append(item['stress'])
         b_idx_l.append(torch.full((num_atoms,), i, dtype=torch.long))
         
         # Concatenate graph data (add offset)
@@ -158,5 +165,6 @@ def on_the_fly_collate(batch_list):
         torch.cat(src_l),
         torch.cat(dst_l),
         torch.cat(shift_l),
-        torch.stack(cell_l)
+        torch.stack(cell_l),
+        torch.stack(stress_l)
     )

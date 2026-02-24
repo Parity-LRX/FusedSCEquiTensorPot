@@ -5,7 +5,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch_scatter import scatter
+from molecular_force_field.utils.scatter import scatter
 
 from molecular_force_field.utils.tensor_utils import map_tensor_values
 
@@ -73,7 +73,7 @@ class Evaluator:
             
             # Unpack
             (pos, A, batch_idx, force_ref, target_energies,
-             edge_src, edge_dst, edge_shifts, cell) = batch
+             edge_src, edge_dst, edge_shifts, cell, _stress_ref) = batch
 
             # Move to GPU
             pos = pos.to(self.device)

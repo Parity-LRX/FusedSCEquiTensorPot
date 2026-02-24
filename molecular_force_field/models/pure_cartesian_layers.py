@@ -25,7 +25,7 @@ import math
 import torch
 import torch.nn as nn
 from e3nn.math import soft_one_hot_linspace
-from torch_scatter import scatter
+from molecular_force_field.utils.scatter import scatter
 
 from molecular_force_field.models.mlp import MainNet, RobustScalarWeightedSum
 from molecular_force_field.models.pure_cartesian import (

@@ -2,7 +2,7 @@
 ICTD/trace-chain based irreps (2l+1) utilities and tensor products WITHOUT spherical harmonics.
 
 Goal:
-  - Provide a small-lmax (<=6) SO(3)-irreps representation built from harmonic polynomials
+  - Provide an SO(3)-irreps representation built from harmonic polynomials
     (a.k.a. STF tensors / Laplacian kernel), derived purely from Cartesian algebra.
   - Provide Clebsch-Gordan-like coupling tensors computed in THIS basis using only:
       - polynomial multiplication (in monomial coefficient space)
@@ -12,15 +12,18 @@ Goal:
 Important:
   - The basis for each l is fixed by our construction (harmonic nullspace + weighted orthonormalization).
     The CG tensors are computed consistently in the same basis, so equivariance is exact by construction.
-  - We target lmax<=6 for speed and simplicity.
+  - Arbitrary lmax is supported. Small lmax (<=6) is the fastest due to Triton kernel coverage;
+    higher lmax works correctly via automatic PyTorch fallback.
 """
 
 from __future__ import annotations
 
 import math
+import os
+import re
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -30,6 +33,38 @@ from molecular_force_field.models.ictd_fast import (
     _build_laplacian_matrix,
     _build_r2k_lift,
 )
+
+# ---------------------------------------------------------------------------
+# torch.compile (Dynamo) integration helpers
+# ---------------------------------------------------------------------------
+try:
+    import torch._dynamo as _dynamo  # type: ignore
+
+    def _dynamo_disable(fn):  # pragma: no cover
+        return _dynamo.disable(fn)
+except Exception:  # pragma: no cover
+    def _dynamo_disable(fn):
+        return fn
+
+# Optional: FlashTP-style fused outer-product + projection (Triton); set ICTD_USE_TRITON_TP=0 to disable
+try:
+    _triton_tp = __import__(
+        "molecular_force_field.models.ictd_irreps_triton",
+        fromlist=["_tp_fused_outer_proj", "_tp_fused_outer_proj_sparse", "_tp_fused_outer_proj_channel_mix"],
+    )
+    _tp_fused_outer_proj = getattr(_triton_tp, "_tp_fused_outer_proj", None)
+    _tp_fused_outer_proj_sparse = getattr(_triton_tp, "_tp_fused_outer_proj_sparse", None)
+    _tp_fused_outer_proj_channel_mix = getattr(_triton_tp, "_tp_fused_outer_proj_channel_mix", None)
+except Exception:
+    _tp_fused_outer_proj = None
+    _tp_fused_outer_proj_sparse = None
+    _tp_fused_outer_proj_channel_mix = None
+
+# Sparse CG: use sparse projection when zero fraction >= this (0.4 = 40% zeros)
+_SPARSE_MIN_ZERO_FRAC = 0.4
+_SPARSE_ZERO_THRESHOLD = 1e-12
+# Set ICTD_USE_SPARSE_TP=0 to disable sparse path (use dense Triton or PyTorch only)
+_USE_SPARSE_TP = os.environ.get("ICTD_USE_SPARSE_TP", "1") == "1"
 
 
 def sym_dim(L: int) -> int:
@@ -71,36 +106,41 @@ def _gram_gaussian(L: int) -> torch.Tensor:
     return G
 
 
+@lru_cache(maxsize=None)
+def _harmonic_basis_cpu_f64(L: int) -> torch.Tensor:
+    """
+    Harmonic basis in monomial (t_{abc}) coordinates, CPU float64.
+    Computed once per L and cached; use _harmonic_basis_t(L, device, dtype) for device/dtype.
+    Returns shape (Dsym(L), 2L+1).
+    """
+    if L == 0:
+        return torch.ones(1, 1, dtype=torch.float64)
+    if L == 1:
+        return torch.eye(3, dtype=torch.float64)
+
+    # Build harmonic subspace as nullspace of Laplacian on Sym^L -> Sym^{L-2}
+    Delta = _build_laplacian_matrix(L, dtype=torch.float64)  # (D_{L-2}, D_L)
+    _, s, vh = torch.linalg.svd(Delta, full_matrices=True)
+    rank = int((s > 1e-12).sum().item())
+    B = vh[rank:].T.contiguous()  # (D_L, 2L+1)
+
+    G = _gram_gaussian(L)
+    M = B.T @ G @ B
+    evals, evecs = torch.linalg.eigh(M)
+    evals = torch.clamp(evals, min=1e-14)
+    W = evecs @ torch.diag(evals.rsqrt()) @ evecs.T
+    return (B @ W).contiguous()
+
+
 def _harmonic_basis_t(L: int, device=None, dtype=None) -> torch.Tensor:
     """
     Harmonic basis in monomial coefficient (t_{abc}) coordinates.
 
-    Returns B_t with shape (Dsym(L), 2L+1) such that columns are orthonormal under
-    weighted inner product <t,u> = t^T diag(w) u, where w = multinomial counts.
+    Returns B_t with shape (Dsym(L), 2L+1). Base matrix is computed once per L (cached on CPU)
+    and copied to the requested device/dtype.
     """
-    if L == 0:
-        return torch.ones(1, 1, device=device, dtype=dtype)
-    if L == 1:
-        return torch.eye(3, device=device, dtype=dtype)
-
-    # Build harmonic subspace as nullspace of Laplacian on Sym^L -> Sym^{L-2}
-    Delta = _build_laplacian_matrix(L, dtype=torch.float64)  # (D_{L-2}, D_L)
-    # nullspace via SVD: Delta = U S V^T, nullspace basis are last columns of V
-    _, s, vh = torch.linalg.svd(Delta, full_matrices=True)
-    rank = int((s > 1e-12).sum().item())
-    B = vh[rank:].T.contiguous()  # (D_L, dim_null) == (D_L, 2L+1)
-
-    # Orthonormalize under O(3)-invariant Gram matrix G_L
-    G = _gram_gaussian(L)  # (D_L,D_L) float64
-    M = B.T @ G @ B
-    # symmetric PSD; use eigh and whitening
-    evals, evecs = torch.linalg.eigh(M)
-    evals = torch.clamp(evals, min=1e-14)
-    W = evecs @ torch.diag(evals.rsqrt()) @ evecs.T
-    B_ortho = (B @ W).contiguous()
-
-    B_ortho = B_ortho.to(device=device, dtype=dtype)
-    return B_ortho
+    B = _harmonic_basis_cpu_f64(L)
+    return B.to(device=device, dtype=dtype)
 
 
 @dataclass(frozen=True)
@@ -213,6 +253,20 @@ def _dir_proj_cpu_f64(l: int) -> torch.Tensor:
 
 _dir_proj_cache_by_dev_dtype: Dict[Tuple[str, str, int], torch.Tensor] = {}
 
+# Optional CUDA path (Triton fused kernel). PyTorch (N,D)@(D,K) is often faster due to cuBLAS;
+# set ICTD_USE_TRITON=1 to try Triton anyway (e.g. to reduce peak memory by not materializing t).
+def _direction_harmonics_triton_optional(
+    n: torch.Tensor, l: int, exps: torch.Tensor, coefs: torch.Tensor, P: torch.Tensor
+) -> torch.Tensor | None:
+    import os
+    if os.environ.get("ICTD_USE_TRITON", "0") != "1":
+        return None
+    try:
+        from molecular_force_field.models.ictd_irreps_triton import direction_harmonics_triton
+        return direction_harmonics_triton(n, l, exps, coefs, P)
+    except Exception:
+        return None
+
 
 def direction_harmonics_fast(n: torch.Tensor, l: int) -> torch.Tensor:
     """
@@ -237,11 +291,65 @@ def direction_harmonics_fast(n: torch.Tensor, l: int) -> torch.Tensor:
     a = exps[:, 0]
     b = exps[:, 1]
     c = exps[:, 2]
-    # (..., Dsym)
+    # (..., Dsym) — GPU: one fused broadcast pow kernel; very fast
     t = (nx.unsqueeze(-1) ** a) * (ny.unsqueeze(-1) ** b) * (nz.unsqueeze(-1) ** c)
     t = t * coefs
     # (..., 2l+1)
     return t @ P
+
+
+def parse_irreps_string(irreps: str) -> List[Tuple[int, int]]:
+    """
+    Parse e3nn-style irreps string into (mul, l) list.
+    Examples: "0e + 1o + 2e" -> [(1,0), (1,1), (1,2)]; "5x0e + 2x2e" -> [(5,0), (2,2)].
+    """
+    out: List[Tuple[int, int]] = []
+    for part in irreps.replace(",", " ").split("+"):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.match(r"^(\d*)x?(\d+)(e|o)$", part.strip(), re.IGNORECASE)
+        if not m:
+            raise ValueError(f"Invalid irreps token: {part!r}")
+        mul_s, l_s, _ = m.groups()
+        mul = int(mul_s) if mul_s else 1
+        l_val = int(l_s)
+        out.append((mul, l_val))
+    return out
+
+
+def parse_irreps_to_l3_list(irreps: str, allowed_l3: Optional[List[int]] = None) -> List[int]:
+    """
+    Parse e3nn-style irreps string to an ordered list of l values (e.g. for output filtering).
+    Examples: "0e + 2e" -> [0, 2]; "2e + 0e" -> [2, 0].
+    If allowed_l3 is provided, only l that are in allowed_l3 are included (e.g. l⊗l gives only even l3).
+    """
+    parts = parse_irreps_string(irreps)
+    out: List[int] = []
+    seen: Set[int] = set()
+    for _, l_val in parts:
+        if allowed_l3 is not None and l_val not in allowed_l3:
+            continue
+        if l_val not in seen:
+            seen.add(l_val)
+            out.append(l_val)
+    return out
+
+
+def direction_harmonics_irreps(n: torch.Tensor, irreps: str) -> torch.Tensor:
+    """
+    Like e3nn spherical_harmonics(irreps_out, x): compute direction harmonics in ICTD basis
+    for the given irreps and return a single tensor (..., dim).
+
+    irreps: e3nn-style string, e.g. "0e + 1o + 2e" or "5x0e + 3x1o + 10x2e".
+    Returns: (..., sum over (mul * (2l+1))) in order of irreps.
+    """
+    parts = parse_irreps_string(irreps)
+    chunks: List[torch.Tensor] = []
+    for mul, l_val in parts:
+        h = direction_harmonics_fast(n, l_val)  # (..., 2l+1)
+        chunks.append(h.unsqueeze(-2).expand(*h.shape[:-1], mul, 2 * l_val + 1).reshape(*h.shape[:-1], mul * (2 * l_val + 1)))
+    return torch.cat(chunks, dim=-1)
 
 
 def direction_harmonics_all(n: torch.Tensor, lmax: int) -> List[torch.Tensor]:
@@ -314,6 +422,150 @@ def build_cg_tensor(l1: int, l2: int, l3: int) -> torch.Tensor:
     return C.contiguous()
 
 
+def cg_tensor_sparsity(C: torch.Tensor, threshold: float = 1e-10) -> Tuple[int, int, float]:
+    """
+    Return (numel, num_nonzero, zero_fraction) for an ICTD CG tensor.
+    Many (l1,l2,l3) triples yield 60--85%% zeros (exact or |x|<=threshold); useful for sparse kernels.
+    """
+    n = C.numel()
+    nz = (C.abs() > threshold).sum().item()
+    return n, nz, 1.0 - (nz / n)
+
+
+class HarmonicElementwiseProduct(nn.Module):
+    """
+    Element-wise tensor product in ICTD basis, analogous to e3nn ElementwiseTensorProduct.
+
+    Pairs same-l blocks: for each l, x1[l] and x2[l] have shape (..., mul, 2l+1);
+    computes l⊗l -> l3 with CG and (optionally) filters to output irreps.
+
+    - irreps_out="0e": only scalar invariants per (l, channel): (x1*x2).sum(m)/sqrt(2l+1).
+      Output shape (..., mul * (lmax+1)).
+    - irreps_out="0e + 2e", "2e + 0e", etc.: output only the requested l3 (order preserved).
+      l⊗l yields only even l3 (0e, 2e, 4e, ...); odd l in the string are ignored.
+      Returns a single tensor (..., sum over mul_l3*(2l3+1)) in irreps order.
+    - irreps_out=None or "full": output all l3 from l⊗l for l=0..lmax (only even l3 by parity).
+      Output dict l3 -> (..., mul_l3, 2l3+1) where mul_l3 = mul * (number of l that contribute to l3).
+
+    normalization (str):
+      "component" (default, same as e3nn): CG tensors are scaled so that each output m3-component
+          has unit variance when inputs have i.i.d. unit-variance components.
+          Factor per (l, l3) path: alpha = sqrt(2*l3+1) / ||C_raw||_F.
+      "norm": CG tensors are scaled so that the output L2-norm has unit expected squared norm.
+          Factor: alpha = 1 / ||C_raw||_F.
+      "none": use raw CG tensors from build_cg_tensor (no rescaling).
+    """
+
+
+    def __init__(
+        self,
+        lmax: int,
+        mul: int,
+        irreps_out: str | None = "0e",
+        normalization: str = "component",
+        internal_compute_dtype: torch.dtype = torch.float64,
+    ):
+        super().__init__()
+        self.lmax = int(lmax)
+        self.mul = int(mul)
+        self.internal_compute_dtype = internal_compute_dtype
+        self._normalization = normalization
+        self._irreps_out = irreps_out.strip().lower() if (irreps_out and isinstance(irreps_out, str)) else "full"
+        self._output_0e_only = self._irreps_out == "0e"
+
+        # Precompute which (l, l3) paths exist: l⊗l -> l3, (2l+l3) even
+        self._paths: List[Tuple[int, int]] = []
+        for l in range(self.lmax + 1):
+            for l3 in range(0, 2 * l + 1):
+                if (2 * l + l3) % 2 == 0:
+                    self._paths.append((l, l3))
+        allowed_l3 = sorted(set(l3 for (_, l3) in self._paths))
+        if self._irreps_out not in ("0e", "full"):
+            self._filter_l3: Optional[List[int]] = parse_irreps_to_l3_list(self._irreps_out, allowed_l3)
+        else:
+            self._filter_l3 = None
+
+        # Build CG tensors eagerly and apply normalization.
+        #   component: each output m3-component has unit variance when inputs have
+        #              i.i.d. unit-variance components → alpha = sqrt(2l3+1) / ||C||_F
+        #   norm:      output L2-norm has unit expected squared norm
+        #              → alpha = 1 / ||C||_F
+        #   none:      use raw CG tensors from build_cg_tensor
+        self._cg_cache: List[torch.Tensor] = []
+        for (l, l3) in self._paths:
+            C = build_cg_tensor(l, l, l3)
+            C_fn = C.norm().item()
+            if normalization == "component" and C_fn > 1e-30:
+                C = C * (math.sqrt(2 * l3 + 1) / C_fn)
+            elif normalization == "norm" and C_fn > 1e-30:
+                C = C * (1.0 / C_fn)
+            self._cg_cache.append(C)
+
+        # For the 0e fast path: precompute per-l scalar factor from the (diagonal)
+        # normalized CG of l⊗l→0 so that out = factor * (a · b).
+        self._0e_factors: List[float] = []
+        for l in range(self.lmax + 1):
+            path_idx = next(i for i, (ll, l3) in enumerate(self._paths) if ll == l and l3 == 0)
+            self._0e_factors.append(self._cg_cache[path_idx][0, 0, 0].item())
+
+        self._cg_cache_device_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
+
+    def _get_cg_list(self, device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
+        key = (str(device), str(dtype))
+        if key in self._cg_cache_device_dtype:
+            return self._cg_cache_device_dtype[key]
+        compute_dtype = self.internal_compute_dtype
+        cg_list = [C.to(device=device, dtype=compute_dtype) for C in self._cg_cache]
+        self._cg_cache_device_dtype[key] = cg_list
+        return cg_list
+
+    def forward(
+        self,
+        x1: Dict[int, torch.Tensor],
+        x2: Dict[int, torch.Tensor],
+    ) -> Dict[int, torch.Tensor] | torch.Tensor:
+        """
+        x1, x2: dict l -> (..., mul, 2l+1). Same keys (l=0..lmax).
+        If irreps_out=="0e": returns (..., mul*(lmax+1)).
+        If irreps_out is a filter string (e.g. "0e + 2e"): returns (..., sum of mul_l3*(2l3+1)).
+        Else (full): returns dict l3 -> (..., mul_l3, 2l3+1).
+        """
+        sample = next(iter(x1.values()))
+        batch_shape = sample.shape[:-2]
+        device = sample.device
+        dtype = sample.dtype
+
+        if self._output_0e_only:
+            out_list = []
+            for l in range(self.lmax + 1):
+                a = x1[l]
+                b = x2[l]
+                out_list.append((a * b).sum(dim=-1) * self._0e_factors[l])
+            return torch.cat(out_list, dim=-1)
+
+        compute_dtype = self.internal_compute_dtype
+        cg_list = self._get_cg_list(device, dtype)
+        out: Dict[int, List[torch.Tensor]] = {}
+        for idx, (l, l3) in enumerate(self._paths):
+            C = cg_list[idx]
+            a = x1[l].to(dtype=compute_dtype)
+            b = x2[l].to(dtype=compute_dtype)
+            a_flat = a.reshape(-1, self.mul, 2 * l + 1)
+            b_flat = b.reshape(-1, self.mul, 2 * l + 1)
+            out_l3 = torch.einsum("bcm,bcn,mno->bco", a_flat, b_flat, C)
+            out_l3 = out_l3.reshape(*batch_shape, self.mul, 2 * l3 + 1).to(dtype=dtype)
+            out.setdefault(l3, []).append(out_l3)
+        result: Dict[int, torch.Tensor] = {}
+        for l3 in out:
+            result[l3] = torch.cat(out[l3], dim=-2)
+        if self._filter_l3 is not None:
+            return torch.cat(
+                [result[l3].reshape(*batch_shape, -1) for l3 in self._filter_l3 if l3 in result],
+                dim=-1,
+            )
+        return result
+
+
 class HarmonicFullyConnectedTensorProduct(nn.Module):
     """
     Fully-connected tensor product in harmonic/ICTD basis (SO(3) irreps, no spherical harmonics).
@@ -341,6 +593,11 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         # - "max_rank_other": keep paths with min(l1,l2) <= max_rank_other (like sparse heuristic)
         path_policy: str = "full",
         max_rank_other: int | None = None,
+        # CG normalization (same convention as e3nn TP):
+        #   "component" (default): alpha = sqrt(2*l3+1) / ||C||_F per path
+        #   "norm": alpha = 1 / ||C||_F per path
+        #   "none": raw CG tensors
+        normalization: str = "component",
         # Internal computation dtype for CG tensors and projections (default: float64 for stability)
         internal_compute_dtype: torch.dtype = torch.float64,
     ):
@@ -350,6 +607,7 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         self.mul_out = mul_out
         self.lmax = lmax
         self.internal_weights = internal_weights
+        self._normalization = normalization
         self.internal_compute_dtype = internal_compute_dtype
 
         # Enumerate all valid (l1,l2,l3) with parity selection (even step)
@@ -430,7 +688,10 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         # Cache per-group projection matrices per (device,dtype) matching _groups:
         #   U_g: (m1*m2, K_total), where K_total = sum_{paths in group} (2*l3+1)
         self._proj_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
+        # Sparse U per group when zero_frac >= _SPARSE_MIN_ZERO_FRAC: list of None or (d_idx, k_idx, vals)
+        self._proj_sparse_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]] = {}
 
+    @_dynamo_disable
     def _get_cg_list(self, device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
         # Use internal_compute_dtype for CG tensors (for numerical stability)
         compute_dtype = self.internal_compute_dtype
@@ -440,13 +701,21 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
             return cached
 
         if self._cg_cpu_f64 is None:
-            # Build CPU float64 tensors once, in path order.
-            self._cg_cpu_f64 = [build_cg_tensor(l1, l2, l3) for (l1, l2, l3) in self.paths]
+            self._cg_cpu_f64 = []
+            for (l1, l2, l3) in self.paths:
+                C = build_cg_tensor(l1, l2, l3)
+                C_fn = C.norm().item()
+                if self._normalization == "component" and C_fn > 1e-30:
+                    C = C * (math.sqrt(2 * l3 + 1) / C_fn)
+                elif self._normalization == "norm" and C_fn > 1e-30:
+                    C = C * (1.0 / C_fn)
+                self._cg_cpu_f64.append(C)
 
         cg_list = [C.to(device=device, dtype=compute_dtype) for C in self._cg_cpu_f64]
         self._cg_cache_by_dev_dtype[key] = cg_list
         return cg_list
 
+    @_dynamo_disable
     def _get_proj_group_list(self, device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
         """
         Returns a list of projection matrices U_g, one per (l1,l2) group:
@@ -464,6 +733,7 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
 
         cg_list = self._get_cg_list(device=device, dtype=dtype)
         proj_list: List[torch.Tensor] = []
+        sparse_list: List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = []
         for g in self._groups:
             l1 = int(g["l1"])  # type: ignore[arg-type]
             l2 = int(g["l2"])  # type: ignore[arg-type]
@@ -478,8 +748,45 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                 U[:, int(s): int(e)] = C.reshape(m1 * m2, int(e) - int(s))
             proj_list.append(U)
 
+            # Build sparse (d_idx, k_idx, vals) only on CUDA (Triton is CUDA-only; on CPU it adds overhead)
+            if device.type == "cuda":
+                n = U.numel()
+                nz = (U.abs() > _SPARSE_ZERO_THRESHOLD).sum().item()
+                zero_frac = 1.0 - (nz / n) if n else 0.0
+                if zero_frac >= _SPARSE_MIN_ZERO_FRAC:
+                    mask = U.abs() > _SPARSE_ZERO_THRESHOLD
+                    nz_flat = mask.nonzero(as_tuple=False)  # (nnz, 2)
+                    d_idx = nz_flat[:, 0].contiguous()
+                    k_idx = nz_flat[:, 1].contiguous()
+                    vals = U[mask].contiguous()
+                    sparse_list.append((d_idx, k_idx, vals))
+                else:
+                    sparse_list.append(None)
+            else:
+                sparse_list.append(None)
+
         self._proj_group_cache_by_dev_dtype[key] = proj_list
+        self._proj_sparse_cache_by_dev_dtype[key] = sparse_list
         return proj_list
+
+    @_dynamo_disable
+    def _get_proj_sparse_list(self, device: torch.device, dtype: torch.dtype) -> List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+        """Return sparse (d_idx, k_idx, vals) per group; None where dense is used. Call _get_proj_group_list first."""
+        self._get_proj_group_list(device=device, dtype=dtype)
+        compute_dtype = self.internal_compute_dtype
+        key = (str(device), str(compute_dtype))
+        return self._proj_sparse_cache_by_dev_dtype[key]
+
+    @_dynamo_disable
+    def prewarm_caches(self, device: torch.device, dtype: torch.dtype) -> None:
+        """Pre-build internal caches on (device, dtype).
+
+        This keeps one-time Python-side work (and `.item()` calls) out of torch.compile tracing.
+        Safe to call multiple times.
+        """
+        _ = self._get_cg_list(device=device, dtype=dtype)
+        _ = self._get_proj_group_list(device=device, dtype=dtype)
+        _ = self._get_proj_sparse_list(device=device, dtype=dtype)
 
     def forward(
         self,
@@ -516,6 +823,8 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         # Fast path: internal_weights + per-path scalar gates (this is what our models use).
         if self.internal_weights and (weights is None or weights.shape[-1] == self.num_paths):
             proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+            # Only fetch sparse list on CUDA (Triton is CUDA-only; avoids extra work on CPU)
+            sparse_list = self._get_proj_sparse_list(device=device, dtype=dtype) if device.type == "cuda" else None
             for g_idx, g in enumerate(self._groups):
                 l1 = int(g["l1"])  # type: ignore[arg-type]
                 l2 = int(g["l2"])  # type: ignore[arg-type]
@@ -536,36 +845,80 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                 # Convert inputs to compute_dtype for numerical stability
                 a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
                 b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
-                # Optimized outer product: (..., i, m1) x (..., j, m2) -> (..., i, j, m1, m2)
-                # Using broadcast instead of einsum for better performance
-                t_mn = (a_comp.unsqueeze(-2).unsqueeze(-1) * b_comp.unsqueeze(-3).unsqueeze(-2))  # (..., i, j, m1, m2)
-                t_flat = t_mn.reshape(*batch_shape, self.mul_in1, self.mul_in2, m1 * m2)
-                y = torch.matmul(t_flat, U)  # (..., i, j, K_total) in compute_dtype
-                if y.shape[-1] != k_total:
-                    raise RuntimeError("ICTD TP projection produced wrong K_total")
+                # FlashTP-style: fused projection+channel-mix (one kernel), or sparse/dense TP then per-path mix
+                y = None
+                used_fused_mix = False
+                if a_comp.is_cuda and a_comp.dim() >= 2:
+                    B_flat = 1
+                    for s in batch_shape:
+                        B_flat *= int(s)
+                    a_flat = a_comp.reshape(B_flat, self.mul_in1, m1)
+                    b_flat = b_comp.reshape(B_flat, self.mul_in2, m2)
+                    num_paths_in_group = len(segments)
+                    # Try fused outer-product + projection + channel mixing (one kernel, no y write-back)
+                    if (
+                        _tp_fused_outer_proj_channel_mix is not None
+                        and num_paths_in_group <= 16
+                    ):
+                        W_stack = torch.stack(
+                            [w_param[int(p_idx)].to(dtype=compute_dtype) for p_idx, _, _, _ in segments],
+                            dim=0,
+                        )
+                        W_stack = W_stack.to(device=a_comp.device).contiguous().view(
+                            num_paths_in_group, self.mul_out, self.mul_in1 * self.mul_in2
+                        )
+                        out_buf = _tp_fused_outer_proj_channel_mix(
+                            a_flat, b_flat, U, W_stack, segments, k_total, self.mul_out, m1, m2
+                        )
+                        if out_buf is not None:
+                            out_buf = out_buf.to(dtype=dtype) if out_buf.dtype != dtype else out_buf
+                            for seg_idx, (p_idx, l3, s, e) in enumerate(segments):  # type: ignore[misc]
+                                seg_out = out_buf[:, seg_idx, :, int(s) : int(e)]
+                                if weights is not None:
+                                    seg_out = seg_out * weights[..., int(p_idx), None, None]
+                                out[int(l3)] = out[int(l3)] + seg_out
+                            used_fused_mix = True
+                    if not used_fused_mix:
+                        sparse_repr = (sparse_list[g_idx] if _USE_SPARSE_TP else None) if sparse_list is not None else None
+                        if sparse_repr is not None and _tp_fused_outer_proj_sparse is not None:
+                            d_idx, k_idx, vals = sparse_repr
+                            y_flat = _tp_fused_outer_proj_sparse(a_flat, b_flat, d_idx, k_idx, vals, m1, m2, k_total)
+                            if y_flat is not None:
+                                y = y_flat.reshape(*batch_shape, self.mul_in1, self.mul_in2, k_total)
+                        if y is None and _tp_fused_outer_proj is not None:
+                            y_flat = _tp_fused_outer_proj(a_flat, b_flat, U, m1, m2)
+                            if y_flat is not None:
+                                y = y_flat.reshape(*batch_shape, self.mul_in1, self.mul_in2, k_total)
+                if not used_fused_mix:
+                    if y is None:
+                        # PyTorch path: outer product then matmul projection
+                        t_mn = (a_comp.unsqueeze(-2).unsqueeze(-1) * b_comp.unsqueeze(-3).unsqueeze(-2))  # (..., i, j, m1, m2)
+                        t_flat = t_mn.reshape(*batch_shape, self.mul_in1, self.mul_in2, m1 * m2)
+                        if not t_flat.is_contiguous():
+                            t_flat = t_flat.contiguous()
+                        y = torch.matmul(t_flat, U)  # (..., i, j, K_total) in compute_dtype
 
-                # Process each path in the group (projection is already done once for the group)
-                # The key optimization is that projection (y) is computed once per group
-                i, j = self.mul_in1, self.mul_in2
-                for p_idx, l3, s, e in segments:  # type: ignore[misc]
-                    Wp = w_param[int(p_idx)]  # (o,i,j)
-                    Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
-                    y_seg = y[..., :, :, int(s): int(e)]  # (..., i, j, kdim) in compute_dtype
-                    # GEMM-style channel mixing (optimized)
-                    kdim = int(e) - int(s)
-                    y2 = y_seg.movedim(-1, -3).contiguous().view(*y_seg.shape[:-3], kdim, i * j)  # (..., k, ij)
-                    W2 = Wp_comp.contiguous().view(Wp_comp.shape[0], i * j)  # (o, ij)
-                    out_seg = torch.matmul(y2, W2.transpose(0, 1)).movedim(-1, -2)  # (..., o, k) in compute_dtype
-                    # Convert back to output dtype
-                    out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
-                    if weights is not None:
-                        gate = weights[..., int(p_idx)]
-                        out_seg = out_seg * gate[..., None, None]
-                    out[int(l3)] = out[int(l3)] + out_seg
+                    # Per-path channel mixing
+                    i, j = self.mul_in1, self.mul_in2
+                    ij = i * j
+                    for p_idx, l3, s, e in segments:  # type: ignore[misc]
+                        Wp = w_param[int(p_idx)]  # (o,i,j)
+                        Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                        y_seg = y[..., :, :, int(s): int(e)]  # (..., i, j, kdim)
+                        kdim = int(e) - int(s)
+                        y2 = y_seg.movedim(-1, -3).contiguous().view(*y_seg.shape[:-3], kdim, ij)  # (..., k, ij)
+                        W2 = Wp_comp.contiguous().view(Wp_comp.shape[0], ij)  # (o, ij)
+                        out_seg = torch.matmul(y2, W2.transpose(0, 1)).movedim(-1, -2)  # (..., o, k)
+                        out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
+                        if weights is not None:
+                            gate = weights[..., int(p_idx)]
+                            out_seg = out_seg * gate[..., None, None]
+                        out[int(l3)] = out[int(l3)] + out_seg
         # Fast path: external full per-example weights (..., weight_numel).
         # Still uses the e3nn-like factorization (projection first, then channel mixing).
         elif weights is not None and weights.shape[-1] == self.weight_numel:
             proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+            sparse_list = self._get_proj_sparse_list(device=device, dtype=dtype) if device.type == "cuda" else None
             # Reshape once:
             #   weights_full: (..., P, o, i, j)
             weights_full = weights.view(*batch_shape, self.num_paths, self.mul_out, self.mul_in1, self.mul_in2)
@@ -586,11 +939,30 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                 # Convert inputs to compute_dtype for numerical stability
                 a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
                 b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
-                # Optimized outer product: (..., i, m1) x (..., j, m2) -> (..., i, j, m1, m2)
-                # Using broadcast instead of einsum for better performance
-                t_mn = (a_comp.unsqueeze(-2).unsqueeze(-1) * b_comp.unsqueeze(-3).unsqueeze(-2))  # (..., i, j, m1, m2)
-                t_flat = t_mn.reshape(*batch_shape, self.mul_in1, self.mul_in2, m1 * m2)
-                y = torch.matmul(t_flat, U)  # (..., i, j, K_total) in compute_dtype
+                # FlashTP-style: sparse or dense fused outer-product + projection
+                y = None
+                if a_comp.is_cuda and a_comp.dim() >= 2:
+                    B_flat = 1
+                    for s in batch_shape:
+                        B_flat *= int(s)
+                    a_flat = a_comp.reshape(B_flat, self.mul_in1, m1)
+                    b_flat = b_comp.reshape(B_flat, self.mul_in2, m2)
+                    sparse_repr = (sparse_list[g_idx] if _USE_SPARSE_TP else None) if sparse_list is not None else None
+                    if sparse_repr is not None and _tp_fused_outer_proj_sparse is not None:
+                        d_idx, k_idx, vals = sparse_repr
+                        y_flat = _tp_fused_outer_proj_sparse(a_flat, b_flat, d_idx, k_idx, vals, m1, m2, k_total)
+                        if y_flat is not None:
+                            y = y_flat.reshape(*batch_shape, self.mul_in1, self.mul_in2, k_total)
+                    if y is None and _tp_fused_outer_proj is not None:
+                        y_flat = _tp_fused_outer_proj(a_flat, b_flat, U, m1, m2)
+                        if y_flat is not None:
+                            y = y_flat.reshape(*batch_shape, self.mul_in1, self.mul_in2, k_total)
+                if y is None:
+                    t_mn = (a_comp.unsqueeze(-2).unsqueeze(-1) * b_comp.unsqueeze(-3).unsqueeze(-2))
+                    t_flat = t_mn.reshape(*batch_shape, self.mul_in1, self.mul_in2, m1 * m2)
+                    if not t_flat.is_contiguous():
+                        t_flat = t_flat.contiguous()
+                    y = torch.matmul(t_flat, U)
                 if y.shape[-1] != k_total:
                     raise RuntimeError("ICTD TP projection produced wrong K_total")
 

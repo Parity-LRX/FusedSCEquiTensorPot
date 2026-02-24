@@ -84,3 +84,40 @@ class MyE3NNCalculator(Calculator):
         # 4. Output
         self.results['energy'] = E_total.item()
         self.results['forces'] = -grads.detach().cpu().numpy()
+
+
+class DDPCalculator(Calculator):
+    """
+    ASE Calculator 的 DDP 版本：仅在 rank 0 与 ASE 交互，每次 calculate() 时通过
+    run_one_ddp_inference_from_ase_atoms 与其它 rank 协同完成推理（多卡分摊大结构）。
+    需用 torchrun 启动，且非 rank 0 进程需在别处运行 worker 循环。
+    """
+
+    implemented_properties = ["energy", "forces"]
+
+    def __init__(self, model, atomic_energies_dict, device, max_radius, **kwargs):
+        Calculator.__init__(self, **kwargs)
+        self.model = model
+        self.device = device
+        self.max_radius = max_radius
+        self.atomic_energies_dict = atomic_energies_dict or {}
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+    def calculate(self, atoms=None, properties=("energy", "forces"), system_changes=all_changes):
+        super().calculate(atoms, properties, system_changes)
+        from molecular_force_field.cli.inference_ddp import run_one_ddp_inference_from_ase_atoms
+        dtype = next(self.model.parameters()).dtype
+        energy, forces = run_one_ddp_inference_from_ase_atoms(
+            self.atoms,
+            self.model,
+            self.max_radius,
+            self.device,
+            dtype,
+            return_forces=True,
+            atomic_energies_dict=self.atomic_energies_dict,
+        )
+        if energy is not None and forces is not None:
+            self.results["energy"] = energy
+            self.results["forces"] = forces.cpu().numpy()

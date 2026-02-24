@@ -22,6 +22,12 @@ from molecular_force_field.models import (
     PureCartesianICTDTransformerLayer,
     MainNet,
 )
+from molecular_force_field.models.pure_cartesian_ictd_layers_full import (
+    PureCartesianICTDTransformerLayer as PureCartesianICTDTransformerLayerFull,
+)
+from molecular_force_field.models.e3nn_layers_channelwise import (
+    E3_TransformerLayer_multi as E3_TransformerLayer_multi_channelwise,
+)
 from molecular_force_field.data import H5Dataset
 from molecular_force_field.data.collate import collate_fn_h5
 from molecular_force_field.training.trainer import Trainer
@@ -84,8 +90,8 @@ def check_and_preprocess_data(data_dir, train_prefix, val_prefix, max_radius, nu
         import pandas as pd
         import numpy as np
         os.makedirs(data_dir, exist_ok=True)
-        train_blocks, train_energy, train_raw_energy, train_cells, train_pbcs = extract_data_blocks(train_input_file)
-        val_blocks, val_energy, val_raw_energy, val_cells, val_pbcs = extract_data_blocks(valid_input_file)
+        train_blocks, train_energy, train_raw_energy, train_cells, train_pbcs, train_stresses = extract_data_blocks(train_input_file)
+        val_blocks, val_energy, val_raw_energy, val_cells, val_pbcs, val_stresses = extract_data_blocks(valid_input_file)
         logging.info(f"Train frames: {len(train_blocks)}, Valid frames: {len(val_blocks)}")
         train_atoms = []
         for block in train_blocks:
@@ -102,9 +108,9 @@ def check_and_preprocess_data(data_dir, train_prefix, val_prefix, max_radius, nu
         train_correction = compute_correction(train_blocks, train_raw_energy, keys, fitted_values)
         val_correction = compute_correction(val_blocks, val_raw_energy, keys, fitted_values)
         save_set(train_prefix, np.arange(len(train_blocks)), train_blocks, train_raw_energy,
-                 train_correction, train_cells, pbc_list=train_pbcs, output_dir=data_dir)
+                 train_correction, train_cells, pbc_list=train_pbcs, stress_list=train_stresses, output_dir=data_dir)
         save_set(val_prefix, np.arange(len(val_blocks)), val_blocks, val_raw_energy,
-                 val_correction, val_cells, pbc_list=val_pbcs, output_dir=data_dir)
+                 val_correction, val_cells, pbc_list=val_pbcs, stress_list=val_stresses, output_dir=data_dir)
         save_to_h5_parallel(train_prefix, max_radius, num_workers, data_dir=data_dir)
         save_to_h5_parallel(val_prefix, max_radius, num_workers, data_dir=data_dir)
         logging.info(f"Preprocessing completed! Data saved to {data_dir}/")
@@ -123,7 +129,7 @@ def check_and_preprocess_data(data_dir, train_prefix, val_prefix, max_radius, nu
         import pandas as pd
 
         os.makedirs(data_dir, exist_ok=True)
-        all_blocks, all_energy, all_raw_energy, all_cells, all_pbcs = extract_data_blocks(input_file)
+        all_blocks, all_energy, all_raw_energy, all_cells, all_pbcs, all_stresses = extract_data_blocks(input_file)
         logging.info(f"Total frames: {len(all_blocks)}")
 
         # 90/10 train/val split (fixed ratio)
@@ -159,8 +165,8 @@ def check_and_preprocess_data(data_dir, train_prefix, val_prefix, max_radius, nu
 
         train_correction = compute_correction(train_blocks, train_raw_E, keys, fitted_values)
         val_correction = compute_correction(val_blocks, val_raw_E, keys, fitted_values)
-        save_set('train', train_indices, train_blocks, train_raw_E, train_correction, all_cells, pbc_list=all_pbcs, output_dir=data_dir)
-        save_set('val', val_indices, val_blocks, val_raw_E, val_correction, all_cells, pbc_list=all_pbcs, output_dir=data_dir)
+        save_set('train', train_indices, train_blocks, train_raw_E, train_correction, all_cells, pbc_list=all_pbcs, stress_list=all_stresses, output_dir=data_dir)
+        save_set('val', val_indices, val_blocks, val_raw_E, val_correction, all_cells, pbc_list=all_pbcs, stress_list=all_stresses, output_dir=data_dir)
         save_to_h5_parallel('train', max_radius, num_workers, data_dir=data_dir)
         save_to_h5_parallel('val', max_radius, num_workers, data_dir=data_dir)
         logging.info(f"Preprocessing completed! Data saved to {data_dir}/")
@@ -243,19 +249,27 @@ def main():
                              'Default: False (use checkpoint weights)')
     parser.add_argument('--num-workers', type=int, default=8,
                         help='Number of workers for data preprocessing')
+    parser.add_argument('--mp-context', type=str, default='auto',
+                        choices=['auto', 'fork', 'spawn'],
+                        help='Multiprocessing start method for DataLoader workers. '
+                             '"auto" forces "spawn" when validation compile is enabled (safer with CUDA/compile), '
+                             'otherwise uses the default OS method (often "fork" on Linux, faster).')
     parser.add_argument('--device', type=str, default=None,
                         help='Device to use (cuda/cpu)')
     parser.add_argument('--dtype', type=str, default='float64',
                         choices=['float32', 'float64', 'float', 'double'],
                         help='Default dtype for tensors (float32 or float64, default: float64)')
+    parser.add_argument('--matmul-precision', type=str, default='high',
+                        choices=['highest', 'high', 'medium'],
+                        help='Float32 matmul precision. "high" (default) enables TF32 on Ampere+ GPUs for ~2x matmul speedup. Use "highest" for strict FP32.')
     parser.add_argument('--dump-frequency', type=int, default=250,
                         help='Frequency (in batches) for validation and model saving (default: 250)')
     parser.add_argument('--train-eval-sample-ratio', type=float, default=0.2,
                         help='Ratio of training set to evaluate during validation (0.0-1.0, default: 0.2). '
                              'Set to 1.0 for full evaluation, or lower (e.g., 0.2 for 20%%) for faster validation. '
                              'Useful for large datasets.')
-    parser.add_argument('--energy-log-frequency', type=int, default=10,
-                        help='Frequency (in batches) to log energy predictions (default: 10)')
+    parser.add_argument('--energy-log-frequency', type=int, default=100,
+                        help='Frequency (in batches) to log energy predictions (default: 100)')
     parser.add_argument('--energy-weight', '-a', type=float, default=1.0,
                         help='Initial weight for energy loss (default: 1.0)')
     parser.add_argument('--force-weight', '-b', type=float, default=10.0,
@@ -303,6 +317,14 @@ def main():
                              'If False, energy predictions are only logged to file, not console.')
     parser.add_argument('--force-shift-value', type=float, default=1.0,
                         help='Scaling factor for force labels (default: 1.0)')
+    parser.add_argument('--stress-weight', '-c', type=float, default=0.0,
+                        help='Weight for stress loss (default: 0.0, disabled). '
+                             'Set > 0 to enable stress training via cell strain derivative. '
+                             'Requires stress/virial data in the training XYZ files.')
+    parser.add_argument('--c-min', type=float, default=0.0,
+                        help='Minimum clamp for stress weight c (default: 0.0).')
+    parser.add_argument('--c-max', type=float, default=1000.0,
+                        help='Maximum clamp for stress weight c (default: 1000.0).')
 
     # Atomic reference energies (E0)
     parser.add_argument('--atomic-energy-file', type=str, default=None,
@@ -367,13 +389,17 @@ def main():
                         choices=['gaussian', 'bessel', 'fourier', 'cosine', 'smooth_finite'],
                         help='Basis function type for radial basis (default: gaussian). Options: gaussian, bessel, fourier, cosine, smooth_finite')
     parser.add_argument('--tensor-product-mode', type=str, default='spherical',
-                        choices=['spherical', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-ictd'],
+                        choices=['spherical', 'spherical-save', 'spherical-save-cue', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-ictd', 'pure-cartesian-ictd-save'],
                         help='Tensor product mode: "spherical" uses e3nn spherical harmonics (default), '
+                             '"spherical-save" uses channelwise edge convolution (e3nn backend; fewer params, same irreps), '
+                             '"spherical-save-cue" uses channelwise edge convolution (cuEquivariance backend; requires cuequivariance-torch), '
                              '"partial-cartesian" uses Cartesian tensor products with EquivariantTensorProduct (strictly equivariant), '
                              '"partial-cartesian-loose" uses non-strictly-equivariant Cartesian tensor products (norm product approximation, not strictly equivariant), '
                              '"pure-cartesian" uses full rank Cartesian tensors (3^L) with delta/epsilon contractions (most pure), '
                              '"pure-cartesian-sparse" uses a sparse pure-cartesian delta/epsilon tensor product (O(3) strict) by restricting rank-rank paths, '
-                             '"pure-cartesian-ictd" uses pure-cartesian message passing but ICTD trace-chain invariants for readout')
+                             '"pure-cartesian-ictd" uses pure_cartesian_ictd_layers_full (ICTD, DDP supported). '
+                             '"pure-cartesian-ictd-save" uses pure_cartesian_ictd_layers (original ICTD, same readout, DDP supported). '
+                             'Note: ICTD inference is typically ~3x faster than spherical-save.')
     parser.add_argument('--max-rank-other', type=int, default=1,
                         help='Max rank for sparse tensor product in pure-cartesian-sparse mode (default: 1). '
                              'Only interactions where min(L1, L2) <= max_rank_other are allowed. '
@@ -382,8 +408,12 @@ def main():
                         choices=['k0', 'k1', 'both'],
                         help='K policy for sparse tensor product in pure-cartesian-sparse mode (default: k0). '
                              'k0: only k=0 (promotes higher rank), k1: only k=1 (contracts to lower rank), both: keep both')
+    parser.add_argument('--num-interaction', type=int, default=2,
+                        help='Number of message-passing steps (conv layers) per block (default: 2). '
+                             'Used by: pure-cartesian, pure-cartesian-ictd, pure-cartesian-ictd-save, pure-cartesian-sparse, '
+                             'partial-cartesian, partial-cartesian-loose, spherical, spherical-save, spherical-save-cue. Must be >= 2.')
 
-    # ICTD path pruning controls (pure-cartesian-ictd only)
+    # ICTD path pruning controls (pure-cartesian-ictd and pure-cartesian-ictd-save)
     parser.add_argument('--ictd-tp-path-policy', type=str, default='full',
                         choices=['full', 'max_rank_other'],
                         help='Path policy for ICTD tensor products in pure-cartesian-ictd mode (default: full). '
@@ -392,6 +422,22 @@ def main():
     parser.add_argument('--ictd-tp-max-rank-other', type=int, default=None,
                         help='Used when --ictd-tp-path-policy=max_rank_other. '
                              'Keeps only paths with min(l1,l2) <= this value (e.g. 1 keeps scalar/vector couplings).')
+
+    # Validation acceleration (evaluation-only; training uses double backward and is NOT compiled)
+    parser.add_argument('--compile-val', type=str, default='none',
+                        choices=['none', 'e3trans'],
+                        help='Enable torch.compile during validation only. '
+                             '"e3trans" compiles the eval forward used in validate(). '
+                             'Training forward/backward is NOT compiled (double backward unsupported).')
+    parser.add_argument('--compile-val-mode', type=str, default='reduce-overhead',
+                        choices=['default', 'reduce-overhead', 'max-autotune'],
+                        help='torch.compile mode for validation (default: reduce-overhead)')
+    parser.add_argument('--compile-val-fullgraph', action='store_true',
+                        help='Pass fullgraph=True to torch.compile for validation (may fail more often).')
+    parser.add_argument('--compile-val-dynamic', action='store_true',
+                        help='Pass dynamic=True to torch.compile for validation.')
+    parser.add_argument('--compile-val-precache', action='store_true',
+                        help='Run one eager forward on the first validation batch before compiling (recommended for ICTD).')
     
     args = parser.parse_args()
 
@@ -411,6 +457,8 @@ def main():
         raise ValueError("--a-min must be <= --a-max")
     if args.b_min is not None and args.b_max is not None and args.b_min > args.b_max:
         raise ValueError("--b-min must be <= --b-max")
+    if args.num_interaction < 2:
+        raise ValueError(f"--num-interaction must be >= 2, got {args.num_interaction}")
     
     # --- SWA (Stochastic Weight Averaging) ---
     if args.swa_start_epoch is not None:
@@ -443,6 +491,8 @@ def main():
     if torch.cuda.is_available():
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+        # TF32: faster float32 matmul on Ampere+ (removes inductor warning, ~2x matmul speed)
+        torch.set_float32_matmul_precision(args.matmul_precision)
     
     # --- Distributed training (DDP) ---
     if args.distributed:
@@ -478,6 +528,19 @@ def main():
             logging.basicConfig(level=logging.WARNING)
     else:
         setup_logging()
+
+    # Log scatter backend (helps diagnose performance regressions when torch_scatter is broken).
+    try:
+        from molecular_force_field.utils.scatter import scatter_backend, require_torch_scatter
+
+        if not args.distributed or rank == 0:
+            logging.info("Scatter backend: %s", scatter_backend())
+
+        # For cuEquivariance backend, torch_scatter is strongly recommended for speed.
+        if args.tensor_product_mode == "spherical-save-cue":
+            require_torch_scatter(reason="tensor_product_mode='spherical-save-cue' aims for maximum speed.")
+    except Exception:
+        pass
 
     # --- Default dtype ---
     if args.dtype == 'float64' or args.dtype == 'double':
@@ -576,14 +639,25 @@ def main():
         val_sampler = None
         shuffle = True
     
+    train_num_workers = max(1, args.num_workers // 2)
+    val_num_workers = max(1, args.num_workers // 4)
+    if args.mp_context == "spawn":
+        mp_ctx = "spawn"
+    elif args.mp_context == "fork":
+        mp_ctx = "fork"
+    else:
+        # auto: only force spawn when validation compile is enabled on CUDA to avoid fork deadlocks
+        mp_ctx = "spawn" if (args.compile_val != "none" and torch.cuda.is_available() and train_num_workers > 0) else None
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=shuffle,
         sampler=train_sampler,
         collate_fn=collate_fn_h5,
-        num_workers=max(1, args.num_workers // 2),
-        pin_memory=True if torch.cuda.is_available() else False
+        num_workers=train_num_workers,
+        pin_memory=True if torch.cuda.is_available() else False,
+        multiprocessing_context=mp_ctx,
     )
     
     val_loader = DataLoader(
@@ -592,8 +666,9 @@ def main():
         shuffle=False,
         sampler=val_sampler,
         collate_fn=collate_fn_h5,
-        num_workers=max(1, args.num_workers // 4),
-        pin_memory=True if torch.cuda.is_available() else False
+        num_workers=val_num_workers,
+        pin_memory=True if torch.cuda.is_available() else False,
+        multiprocessing_context=mp_ctx,
     )
     
     # --- Model config ---
@@ -651,7 +726,7 @@ def main():
     
     # Initialize model based on tensor product mode
     if args.tensor_product_mode == 'pure-cartesian':
-        logging.info("Using PURE Cartesian mode (rank tensors 3^L with delta/epsilon contractions)")
+        logging.info("Using PURE Cartesian mode (rank tensors 3^L with delta/epsilon contractions), num_interaction=%d", args.num_interaction)
         e3trans = PureCartesianTransformerLayer(
             max_embed_radius=config.max_radius,
             main_max_radius=config.max_radius_main,
@@ -666,12 +741,38 @@ def main():
             embed_size=config.embed_size,
             main_hidden_sizes3=config.main_hidden_sizes3,
             num_layers=config.num_layers,
+            num_interaction=args.num_interaction,
             function_type_main=config.function_type,
             lmax=config.lmax,
             device=device
         ).to(device)
     elif args.tensor_product_mode == 'pure-cartesian-ictd':
-        logging.info("Using PURE Cartesian ICTD mode (trace-chain invariants for readout)")
+        logging.info("Using PURE Cartesian ICTD mode (pure_cartesian_ictd_layers_full, DDP sync), num_interaction=%d", args.num_interaction)
+        logging.info(f"  ictd_tp_path_policy={args.ictd_tp_path_policy}, ictd_tp_max_rank_other={args.ictd_tp_max_rank_other}")
+        e3trans = PureCartesianICTDTransformerLayerFull(
+            max_embed_radius=config.max_radius,
+            main_max_radius=config.max_radius_main,
+            main_number_of_basis=config.number_of_basis_main,
+            hidden_dim_conv=config.channel_in,
+            hidden_dim_sh=config.get_hidden_dim_sh(),
+            hidden_dim=config.emb_number_main_2,
+            channel_in2=config.channel_in2,
+            embedding_dim=config.embedding_dim,
+            max_atomvalue=config.max_atomvalue,
+            output_size=config.output_size,
+            embed_size=config.embed_size,
+            main_hidden_sizes3=config.main_hidden_sizes3,
+            num_layers=config.num_layers,
+            num_interaction=args.num_interaction,
+            function_type_main=config.function_type,
+            lmax=config.lmax,
+            ictd_tp_path_policy=args.ictd_tp_path_policy,
+            ictd_tp_max_rank_other=args.ictd_tp_max_rank_other,
+            internal_compute_dtype=config.dtype,
+            device=device,
+        ).to(device)
+    elif args.tensor_product_mode == 'pure-cartesian-ictd-save':
+        logging.info("Using PURE Cartesian ICTD mode (pure_cartesian_ictd_layers, save/original), num_interaction=%d", args.num_interaction)
         logging.info(f"  ictd_tp_path_policy={args.ictd_tp_path_policy}, ictd_tp_max_rank_other={args.ictd_tp_max_rank_other}")
         e3trans = PureCartesianICTDTransformerLayer(
             max_embed_radius=config.max_radius,
@@ -687,6 +788,7 @@ def main():
             embed_size=config.embed_size,
             main_hidden_sizes3=config.main_hidden_sizes3,
             num_layers=config.num_layers,
+            num_interaction=args.num_interaction,
             function_type_main=config.function_type,
             lmax=config.lmax,
             ictd_tp_path_policy=args.ictd_tp_path_policy,
@@ -696,7 +798,7 @@ def main():
         ).to(device)
     elif args.tensor_product_mode == 'pure-cartesian-sparse':
         logging.info("Using PURE Cartesian SPARSE mode (δ/ε path-sparse within 3^L, O(3) strict)")
-        logging.info(f"  max_rank_other={args.max_rank_other}, k_policy={args.k_policy}")
+        logging.info(f"  max_rank_other={args.max_rank_other}, k_policy={args.k_policy}, num_interaction={args.num_interaction}")
         e3trans = PureCartesianSparseTransformerLayer(
             max_embed_radius=config.max_radius,
             main_max_radius=config.max_radius_main,
@@ -711,6 +813,7 @@ def main():
             embed_size=config.embed_size,
             main_hidden_sizes3=config.main_hidden_sizes3,
             num_layers=config.num_layers,
+            num_interaction=args.num_interaction,
             function_type_main=config.function_type,
             lmax=config.lmax,
             max_rank_other=args.max_rank_other,
@@ -718,7 +821,7 @@ def main():
             device=device
         ).to(device)
     elif args.tensor_product_mode == 'partial-cartesian':
-        logging.info("Using Partial-Cartesian tensor product mode (strict)")
+        logging.info("Using Partial-Cartesian tensor product mode (strict), num_interaction=%d", args.num_interaction)
         e3trans = CartesianTransformerLayer(
             max_embed_radius=config.max_radius,
             main_max_radius=config.max_radius_main,
@@ -733,12 +836,13 @@ def main():
             embed_size=config.embed_size,
             main_hidden_sizes3=config.main_hidden_sizes3,
             num_layers=config.num_layers,
+            num_interaction=args.num_interaction,
             function_type_main=config.function_type,
             lmax=config.lmax,
             device=device
         ).to(device)
     elif args.tensor_product_mode == 'partial-cartesian-loose':
-        logging.info("Using Partial-Cartesian LOOSE mode (non-strictly-equivariant, norm product approximation)")
+        logging.info("Using Partial-Cartesian LOOSE mode (non-strictly-equivariant, norm product approximation), num_interaction=%d", args.num_interaction)
         e3trans = CartesianTransformerLayerLoose(
             max_embed_radius=config.max_radius,
             main_max_radius=config.max_radius_main,
@@ -753,12 +857,78 @@ def main():
             embed_size=config.embed_size,
             main_hidden_sizes3=config.main_hidden_sizes3,
             num_layers=config.num_layers,
+            num_interaction=args.num_interaction,
             function_type_main=config.function_type,
             lmax=config.lmax,
             device=device
         ).to(device)
+    elif args.tensor_product_mode == 'spherical-save':
+        logging.info("Using Spherical (channelwise conv) tensor product mode (e3nn_layers_channelwise), num_interaction=%d", args.num_interaction)
+        e3trans = E3_TransformerLayer_multi_channelwise(
+            max_embed_radius=config.max_radius,
+            main_max_radius=config.max_radius_main,
+            main_number_of_basis=config.number_of_basis_main,
+            irreps_input=config.get_irreps_output_conv(),
+            irreps_query=config.get_irreps_query_main(),
+            irreps_key=config.get_irreps_key_main(),
+            irreps_value=config.get_irreps_value_main(),
+            irreps_output=config.get_irreps_output_conv_2(),
+            irreps_sh=config.get_irreps_sh_transformer(),
+            hidden_dim_sh=config.get_hidden_dim_sh(),
+            hidden_dim=config.emb_number_main_2,
+            channel_in2=config.channel_in2,
+            embedding_dim=config.embedding_dim,
+            max_atomvalue=config.max_atomvalue,
+            output_size=config.output_size,
+            embed_size=config.embed_size,
+            main_hidden_sizes3=config.main_hidden_sizes3,
+            num_layers=config.num_layers,
+            num_interaction=args.num_interaction,
+            function_type_main=config.function_type,
+            device=device
+        ).to(device)
+    elif args.tensor_product_mode == 'spherical-save-cue':
+        logging.info("Using Spherical (channelwise conv) tensor product mode (cuEquivariance backend), num_interaction=%d", args.num_interaction)
+        # Detect optional dependency early with a clear message.
+        try:
+            import cuequivariance_torch  # noqa: F401
+        except Exception as e:
+            raise ImportError(
+                "tensor_product_mode='spherical-save-cue' requires cuEquivariance.\n"
+                "Install one of:\n"
+                "  pip install -e \".[cue]\"\n"
+                "  pip install -r requirements-cue.txt\n"
+                "Notes: CUDA kernels package (cuequivariance-ops-torch-cu12) is Linux CUDA only.\n"
+                f"Original import error: {e}"
+            ) from e
+        from molecular_force_field.models.cue_layers_channelwise import (
+            E3_TransformerLayer_multi as E3_TransformerLayer_multi_channelwise_cue,
+        )
+        e3trans = E3_TransformerLayer_multi_channelwise_cue(
+            max_embed_radius=config.max_radius,
+            main_max_radius=config.max_radius_main,
+            main_number_of_basis=config.number_of_basis_main,
+            irreps_input=config.get_irreps_output_conv(),
+            irreps_query=config.get_irreps_query_main(),
+            irreps_key=config.get_irreps_key_main(),
+            irreps_value=config.get_irreps_value_main(),
+            irreps_output=config.get_irreps_output_conv_2(),
+            irreps_sh=config.get_irreps_sh_transformer(),
+            hidden_dim_sh=config.get_hidden_dim_sh(),
+            hidden_dim=config.emb_number_main_2,
+            channel_in2=config.channel_in2,
+            embedding_dim=config.embedding_dim,
+            max_atomvalue=config.max_atomvalue,
+            output_size=config.output_size,
+            embed_size=config.embed_size,
+            main_hidden_sizes3=config.main_hidden_sizes3,
+            num_layers=config.num_layers,
+            num_interaction=args.num_interaction,
+            function_type_main=config.function_type,
+            device=device,
+        ).to(device)
     else:  # spherical (default)
-        logging.info("Using Spherical harmonics tensor product mode (e3nn)")
+        logging.info("Using Spherical harmonics tensor product mode (e3nn), num_interaction=%d", args.num_interaction)
         e3trans = E3_TransformerLayer_multi(
             max_embed_radius=config.max_radius,
             main_max_radius=config.max_radius_main,
@@ -778,6 +948,7 @@ def main():
             embed_size=config.embed_size,
             main_hidden_sizes3=config.main_hidden_sizes3,
             num_layers=config.num_layers,
+            num_interaction=args.num_interaction,
             function_type_main=config.function_type,
             device=device
         ).to(device)
@@ -824,6 +995,9 @@ def main():
         use_ema_for_validation=args.use_ema_for_validation,
         save_ema_model=args.save_ema_model,
         force_shift_value=args.force_shift_value,
+        c=args.stress_weight,
+        c_min=args.c_min,
+        c_max=args.c_max,
         patience=args.patience,
         atomic_energy_keys=config.atomic_energy_keys,
         atomic_energy_values=config.atomic_energy_values,
@@ -836,6 +1010,11 @@ def main():
         train_eval_sample_ratio=args.train_eval_sample_ratio,
         log_val_batch_energy_to_console=args.log_val_batch_energy,
         tensor_product_mode=args.tensor_product_mode,
+        compile_val=args.compile_val,
+        compile_val_mode=args.compile_val_mode,
+        compile_val_fullgraph=args.compile_val_fullgraph,
+        compile_val_dynamic=args.compile_val_dynamic,
+        compile_val_precache=args.compile_val_precache,
     )
     
     # Start training

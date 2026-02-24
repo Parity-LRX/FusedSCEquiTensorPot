@@ -61,7 +61,7 @@ import torch
 import torch.nn as nn
 from e3nn.math import soft_one_hot_linspace
 from e3nn import o3
-from torch_scatter import scatter
+from molecular_force_field.utils.scatter import scatter
 
 from molecular_force_field.models.mlp import MainNet, RobustScalarWeightedSum
 
@@ -260,10 +260,10 @@ def reorder_concatenated_irreps(f1: torch.Tensor, f2: torch.Tensor, channels: in
     
     When concatenating two irreps features f1 and f2, the naive concatenation
     `torch.cat([f1, f2], dim=-1)` produces:
-        [f1的l=0部分, f2的l=0部分, f1的l=1部分, f2的l=1部分, ...]
+        [f1's l=0 block, f2's l=0 block, f1's l=1 block, f2's l=1 block, ...]
     
     But e3nn's Irreps expects:
-        [所有l=0部分, 所有l=1部分, ...]
+        [all l=0 blocks, all l=1 blocks, ...]
     
     This function reorders the concatenated features to match e3nn's format.
     
@@ -278,11 +278,10 @@ def reorder_concatenated_irreps(f1: torch.Tensor, f2: torch.Tensor, channels: in
     
     Example:
         For lmax=2, channels=64:
-        - f1 shape: (N, 576) = [64个0e, 192个1o, 320个2e]
-        - f2 shape: (N, 576) = [64个0e, 192个1o, 320个2e]
-        - Naive concat: [f1的64个0e, f2的64个0e, f1的192个1o, f2的192个1o, f1的320个2e, f2的320个2e]
-        - Reordered: [f1的64个0e, f2的64个0e, f1的192个1o, f2的192个1o, f1的320个2e, f2的320个2e]
-        - Actually, the reordered version groups by l: [所有128个0e, 所有128个1o, 所有128个2e]
+        - f1 shape: (N, 576) = [64 of 0e, 192 of 1o, 320 of 2e]
+        - f2 shape: (N, 576) = [64 of 0e, 192 of 1o, 320 of 2e]
+        - Naive concat: [f1's 64 of 0e, f2's 64 of 0e, f1's 192 of 1o, f2's 192 of 1o, f1's 320 of 2e, f2's 320 of 2e]
+        - Reordered: groups by l: [all 128 of 0e, all 128 of 1o, all 128 of 2e]
     """
     return reorder_concatenated_irreps_multi([f1, f2], channels, lmax)
 
@@ -2028,9 +2027,9 @@ class CartesianE3ConvSparse(nn.Module):
         )
         
         # ------------------------------------------------------------------
-        # tp1: scalar(Ai[edge_src]) ⊗ sh_edge → 高阶 irreps
+        # tp1: scalar(Ai[edge_src]) ⊗ sh_edge → higher-order irreps
         # Like e3nn: o3.FullTensorProduct(f"{output_size}x0e", "1x0e + 1x1o + 1x2e")
-        # 使用严格等变的 EquivariantTensorProduct
+        # Uses strictly equivariant EquivariantTensorProduct
         # ------------------------------------------------------------------
         irreps_sh = get_irreps_str(1, lmax)  # "1x0e + 1x1o + 1x2e"
         self.tp1_irreps_out = get_irreps_str(output_size, lmax)
@@ -2043,14 +2042,14 @@ class CartesianE3ConvSparse(nn.Module):
         )
         
         # ------------------------------------------------------------------
-        # tp2: 高阶irreps(f_in) ⊗ scalar(Ai[edge_dst]) → 高阶输出
+        # tp2: higher-order irreps(f_in) ⊗ scalar(Ai[edge_dst]) → higher-order output
         # Like e3nn: o3.FullyConnectedTensorProduct(tp1.irreps_out, f"{output_size}x0e", irreps_output)
-        # 使用严格等变的 EquivariantTensorProduct
+        # Uses strictly equivariant EquivariantTensorProduct
         # ------------------------------------------------------------------
         self.tp2 = EquivariantTensorProduct(
-            irreps_in1=self.tp1_irreps_out,       # 高阶 (output_size x 0e + output_size x 1o + ...)
+            irreps_in1=self.tp1_irreps_out,       # higher-order (output_size x 0e + output_size x 1o + ...)
             irreps_in2=f"{output_size}x0e",       # scalar (neighbor atom features)
-            irreps_out=get_irreps_str(channels_out, lmax),  # 高阶输出
+            irreps_out=get_irreps_str(channels_out, lmax),  # higher-order output
             shared_weights=False,
             internal_weights=False
         )
@@ -2094,7 +2093,7 @@ class CartesianE3ConvSparse(nn.Module):
         atom_emb = self.atom_embedding(A.long())
         Ai = self.atom_mlp(atom_emb)  # (N, output_size)
         
-        # tp1: scalar(Ai[edge_src]) ⊗ sh_edge → 高阶 irreps
+        # tp1: scalar(Ai[edge_src]) ⊗ sh_edge → higher-order irreps
         # Like e3nn: f_in = self.tensor_product(Ai[edge_src], sh_edge)
         f_in = self.tp1(Ai[edge_src], sh_edge)  # (E, output_size * total_sh_dim)
         
@@ -2107,7 +2106,7 @@ class CartesianE3ConvSparse(nn.Module):
         # tp2 weights from radial basis
         weights = self.fc(emb)  # (E, tp2.weight_numel)
         
-        # tp2: 高阶irreps(f_in) ⊗ scalar(Ai[edge_dst]) → 高阶输出
+        # tp2: higher-order irreps(f_in) ⊗ scalar(Ai[edge_dst]) → higher-order output
         # Like e3nn: edge_features = self.tp(f_in, Ai[edge_dst], self.fc(emb))
         edge_features = self.tp2(f_in, Ai[edge_dst], weights)  # (E, channels_out * total_sh_dim)
         
@@ -2201,9 +2200,9 @@ class CartesianE3Conv2Sparse(nn.Module):
         self.cart_to_irreps = CartesianToIrrepsLight(lmax=lmax)
         
         # ------------------------------------------------------------------
-        # tp: 高阶irreps(f_in[edge_src]) ⊗ 方向sh → 高阶输出
+        # tp: higher-order irreps(f_in[edge_src]) ⊗ direction sh → higher-order output
         # Like e3nn: o3.FullyConnectedTensorProduct(irreps_input_conv, self.irreps_out, self.irreps_output)
-        # 使用严格等变的 EquivariantTensorProduct
+        # Uses strictly equivariant EquivariantTensorProduct
         # ------------------------------------------------------------------
         irreps_in = get_irreps_str(channels_in, lmax)   # channels_in x (0e + 1o + 2e)
         irreps_sh = get_irreps_str(1, lmax)              # 1x0e + 1x1o + 1x2e
@@ -2258,7 +2257,7 @@ class CartesianE3Conv2Sparse(nn.Module):
         # tp weights from radial basis
         weights = self.fc(emb)  # (E, tp.weight_numel)
         
-        # tp: 高阶irreps(f_in[edge_src]) ⊗ 方向sh → 高阶输出
+        # tp: higher-order irreps(f_in[edge_src]) ⊗ direction sh → higher-order output
         # Like e3nn: edge_features = self.tp(f_in[edge_src], Feature, self.fc(emb))
         edge_features = self.tp(f_in[edge_src], sh_edge, weights)  # (E, channels_out * total_sh_dim)
         
@@ -2819,7 +2818,7 @@ class CartesianTransformerLayerStrict(nn.Module):
         # Build irreps strings for combined features
         irreps_combined = get_irreps_str(combined_channels, lmax)
         
-        # product_3: 高阶 ⊗ 高阶 → 标量 (32x0e)
+        # product_3: higher-order ⊗ higher-order → scalar (32x0e)
         self.product_3 = CartesianFullyConnectedTensorProduct(
             irreps_in1=irreps_combined,
             irreps_in2=irreps_combined,

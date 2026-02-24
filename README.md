@@ -4,12 +4,14 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.12%2B-orange)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-**FusedSCEquiTensorPot** is an E(3)-equivariant neural potential for predicting molecular energies and forces. Built with PyTorch, it supports **six equivariant tensor product modes**, including e3nn-based spherical harmonics and five self-implemented Cartesian tensor product methods.
+**FusedSCEquiTensorPot** is an E(3)-equivariant neural potential for predicting molecular energies and forces. Built with PyTorch, it supports **eight equivariant tensor product modes**, including e3nn-based spherical harmonics, channelwise spherical backends, and multiple self-implemented Cartesian tensor product methods.
 
 ## ✨ Features
 
-- **Six Equivariant Tensor Product Modes**: 
+- **Eight Equivariant Tensor Product Modes**: 
   - `spherical`: e3nn-based spherical harmonics (strictly equivariant, default, standard implementation)
+  - `spherical-save`: channelwise edge convolution (e3nn backend; fewer params)
+  - `spherical-save-cue`: channelwise edge convolution (cuEquivariance backend; optional dependency)
   - `partial-cartesian`: Cartesian tensor products with CG coefficients (strictly equivariant, -17.4% params)
   - `partial-cartesian-loose`: Optimized Cartesian tensor products (approximate equivariance, faster)
   - `pure-cartesian`: Pure Cartesian \(3^L\) representation (strictly equivariant, very slow, not recommended)
@@ -44,6 +46,38 @@ Or install dependencies from requirements.txt:
 ```bash
 pip install -r requirements.txt
 ```
+
+### Recommended (Linux CUDA): pinned cu128 toolchain
+
+Some dependencies (PyTorch CUDA wheels, PyG `torch_scatter` wheels) require pip flags like
+`--index-url` / `-f`, which **cannot be enforced from `setup.py`**. For a reproducible setup
+with cuEquivariance + PyG wheels, use the provided script:
+
+```bash
+bash scripts/install_pt271_cu128.sh
+pip install -e .
+```
+
+### Optional: cuEquivariance backend (for `tensor_product_mode=spherical-save-cue`)
+
+This project supports an additional channelwise spherical backend powered by NVIDIA **cuEquivariance**.
+
+Install via extras (recommended):
+
+```bash
+pip install -e ".[cue]"
+```
+
+Or via requirements files:
+
+```bash
+pip install -r requirements.txt
+pip install -r requirements-cue.txt
+```
+
+Notes:
+- `cuequivariance-ops-torch-cu12` (CUDA kernels) is **Linux CUDA only**. On macOS you can still install `cuequivariance-torch` for CPU fallback.
+- If you select `--tensor-product-mode spherical-save-cue` without the dependency installed, the CLI will raise a clear ImportError with install instructions.
 
 ## Quick Start
 

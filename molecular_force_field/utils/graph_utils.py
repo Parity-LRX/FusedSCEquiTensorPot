@@ -4,11 +4,11 @@ import torch
 from torch import Tensor
 try:
     from torch_cluster import radius_graph, radius
-except ImportError:
+except Exception:
     # Fallback if torch_cluster is not available
     radius_graph = None
     radius = None
-from torch_scatter import scatter
+from molecular_force_field.utils.scatter import scatter
 
 
 def optimized_sorted_radius_graph(

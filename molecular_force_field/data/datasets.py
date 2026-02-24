@@ -5,8 +5,7 @@ import pandas as pd
 import torch
 import h5py
 from torch.utils.data import Dataset
-from ase import Atoms
-from ase.neighborlist import neighbor_list
+from matscipy.neighbours import neighbour_list as matscipy_neighbour_list
 from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
 from typing import Tuple, Optional
@@ -44,12 +43,16 @@ def compute_graph_worker(args):
     Worker function for computing graph structure in parallel.
     
     Args:
-        args: Tuple of (idx, block, target, cell, pbc, max_radius)
+        args: Tuple of (idx, block, target, cell, pbc, max_radius[, stress])
         
     Returns:
         Dictionary with precomputed graph data
     """
-    idx, block, target, cell, pbc, max_radius = args
+    if len(args) == 7:
+        idx, block, target, cell, pbc, max_radius, stress = args
+    else:
+        idx, block, target, cell, pbc, max_radius = args
+        stress = np.zeros((3, 3), dtype=np.float64)
     
     # Extract coordinates and atom types (numpy)
     pos = block[:, 1:4].numpy()
@@ -70,9 +73,9 @@ def compute_graph_worker(args):
         pbc_flags = [False, False, False]
         current_cell = np.eye(3) * 100.0  # Virtual large box
         
-    # ASE compute neighbors
-    atoms = Atoms(numbers=atom_types, positions=pos, cell=current_cell, pbc=pbc_flags)
-    i, j, S = neighbor_list('ijS', atoms, max_radius)
+    i, j, S = matscipy_neighbour_list(
+        'ijS', positions=pos, cell=current_cell, pbc=pbc_flags, cutoff=max_radius
+    )
     
     # Return cache dictionary (all converted to Tensor)
     return {
@@ -81,14 +84,15 @@ def compute_graph_worker(args):
         'edge_src': torch.tensor(i, dtype=torch.long),
         'edge_dst': torch.tensor(j, dtype=torch.long),
         'edge_shifts': torch.tensor(S, dtype=torch.float64),
-        'cell': torch.tensor(current_cell, dtype=torch.float64)
+        'cell': torch.tensor(current_cell, dtype=torch.float64),
+        'stress': torch.tensor(stress, dtype=torch.float64)
     }
 
 
 class CustomDataset(Dataset):
     """Custom dataset with precomputed graph structures."""
     
-    def __init__(self, read_file_path, energy_file_path, cell_file_path, max_radius=5.0, num_workers=10):
+    def __init__(self, read_file_path, energy_file_path, cell_file_path, stress_file_path=None, max_radius=5.0, num_workers=10):
         """
         Initialize custom dataset.
         
@@ -96,6 +100,7 @@ class CustomDataset(Dataset):
             read_file_path: Path to read HDF5 file
             energy_file_path: Path to energy HDF5 file
             cell_file_path: Path to cell HDF5 file
+            stress_file_path: Path to stress HDF5 file (optional)
             max_radius: Maximum radius for neighbor search
             num_workers: Number of worker processes for preprocessing
         """
@@ -106,6 +111,14 @@ class CustomDataset(Dataset):
         read_data = pd.read_hdf(read_file_path)
         energy_df = pd.read_hdf(energy_file_path)
         cell_df = pd.read_hdf(cell_file_path)
+        
+        # Load stress data (optional)
+        import os
+        if stress_file_path is not None and os.path.exists(stress_file_path):
+            stress_df = pd.read_hdf(stress_file_path)
+            stresses_all = stress_df.values.astype(np.float64).reshape(-1, 3, 3)
+        else:
+            stresses_all = None
         
         # 2. Process energy and Cell
         if 'RawEnergy' in energy_df.columns:
@@ -140,7 +153,8 @@ class CustomDataset(Dataset):
         tasks = []
         for i in range(len(blocks)):
             pbc_i = pbcs[i] if pbcs is not None and i < len(pbcs) else None
-            tasks.append((i, blocks[i], targets[i], cells[i], pbc_i, self.max_radius))
+            stress_i = stresses_all[i] if stresses_all is not None and i < len(stresses_all) else np.zeros((3, 3), dtype=np.float64)
+            tasks.append((i, blocks[i], targets[i], cells[i], pbc_i, self.max_radius, stress_i))
         
         # Use process pool for parallel computation
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -175,7 +189,8 @@ class CustomDataset(Dataset):
             d['edge_src'],
             d['edge_dst'],
             d['edge_shifts'],
-            d['cell']
+            d['cell'],
+            d['stress']
         )
 
 
@@ -223,6 +238,10 @@ class H5Dataset(Dataset):
             self._h5_file = h5py.File(self.file_path, 'r')
         
         g = self._h5_file[f'sample_{idx}']
+        if 'stress' in g:
+            stress = torch.from_numpy(g['stress'][:]).double()
+        else:
+            stress = torch.zeros((3, 3), dtype=torch.float64)
         return {
             'pos': torch.from_numpy(g['pos'][:]).double(),
             'A': torch.from_numpy(g['A'][:]).long(),
@@ -231,14 +250,15 @@ class H5Dataset(Dataset):
             'edge_src': torch.from_numpy(g['edge_src'][:]).long(),
             'edge_dst': torch.from_numpy(g['edge_dst'][:]).long(),
             'edge_shifts': torch.from_numpy(g['edge_shifts'][:]).double(),
-            'cell': torch.from_numpy(g['cell'][:]).double()
+            'cell': torch.from_numpy(g['cell'][:]).double(),
+            'stress': stress,
         }
 
 
 class OnTheFlyDataset(Dataset):
     """Dataset that computes graph structure on-the-fly during loading."""
     
-    def __init__(self, read_file_path, energy_file_path, cell_file_path, max_radius=5.0):
+    def __init__(self, read_file_path, energy_file_path, cell_file_path, stress_file_path=None, max_radius=5.0):
         """
         Initialize on-the-fly dataset.
         
@@ -246,6 +266,7 @@ class OnTheFlyDataset(Dataset):
             read_file_path: Path to read HDF5 file
             energy_file_path: Path to energy HDF5 file
             cell_file_path: Path to cell HDF5 file
+            stress_file_path: Path to stress HDF5 file (optional)
             max_radius: Maximum radius for neighbor search
         """
         print(f"Loading raw data indices from {read_file_path}...")
@@ -256,6 +277,14 @@ class OnTheFlyDataset(Dataset):
         self.read_data = pd.read_hdf(read_file_path)
         self.energy_df = pd.read_hdf(energy_file_path)
         self.cell_df = pd.read_hdf(cell_file_path)
+        
+        # Load stress data (optional)
+        import os
+        if stress_file_path is not None and os.path.exists(stress_file_path):
+            stress_df = pd.read_hdf(stress_file_path)
+            self.stresses = stress_df.values.astype(np.float64).reshape(-1, 3, 3)
+        else:
+            self.stresses = None
         
         # 2. Prepare data indices
         if 'RawEnergy' in self.energy_df.columns:
@@ -312,12 +341,17 @@ class OnTheFlyDataset(Dataset):
             pbc_flags = [False, False, False]
             current_cell = np.eye(3) * 100.0
         
-        # 3. Real-time ASE neighbor computation
-        # This step consumes CPU, but is masked by DataLoader multiprocessing
-        atoms = Atoms(numbers=atom_types, positions=pos, cell=current_cell, pbc=pbc_flags)
-        i, j, S = neighbor_list('ijS', atoms, self.max_radius)
+        i, j, S = matscipy_neighbour_list(
+            'ijS', positions=pos, cell=current_cell, pbc=pbc_flags, cutoff=self.max_radius
+        )
         
-        # 4. Convert to Tensor and return
+        # 4. Get stress
+        if self.stresses is not None and idx < len(self.stresses):
+            stress = self.stresses[idx]
+        else:
+            stress = np.zeros((3, 3), dtype=np.float64)
+
+        # 5. Convert to Tensor and return
         return {
             'pos': torch.tensor(pos, dtype=torch.float64),
             'A': torch.tensor(atom_types, dtype=torch.float64),
@@ -326,5 +360,6 @@ class OnTheFlyDataset(Dataset):
             'edge_src': torch.tensor(i, dtype=torch.long),
             'edge_dst': torch.tensor(j, dtype=torch.long),
             'edge_shifts': torch.tensor(S, dtype=torch.float64),
-            'cell': torch.tensor(current_cell, dtype=torch.float64)
+            'cell': torch.tensor(current_cell, dtype=torch.float64),
+            'stress': torch.tensor(stress, dtype=torch.float64),
         }

@@ -7,9 +7,8 @@ import pandas as pd
 import h5py
 from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
-from ase import Atoms
-from ase.neighborlist import neighbor_list
 from ase.data import chemical_symbols, atomic_numbers
+from matscipy.neighbours import neighbour_list as matscipy_neighbour_list
 
 
 def _parse_pbc_from_comment(line: str):
@@ -71,6 +70,72 @@ def _parse_energy_from_comment(line: str):
         return np.float64(m.group(1))
     except Exception:
         return None
+
+
+def _parse_stress_from_comment(line: str, cell_9: list = None):
+    """
+    Parse stress tensor from extended XYZ comment line.
+
+    Supported formats:
+      - stress="xx yy zz yz xz xy"  (6 Voigt components, eV/Å³)
+      - stress="xx xy xz yx yy yz zx zy zz"  (9 full 3×3 components, row-major, eV/Å³)
+      - virial="xx xy xz yx yy yz zx zy zz"  (9 full 3×3 virial in eV; converted via stress = -virial / V)
+
+    Returns: np.ndarray shape (3, 3), or None if not found.
+    """
+    # Try stress first
+    m = re.search(r'\bstress\s*=\s*["\']([^"\']+)["\']', line, flags=re.IGNORECASE)
+    if m:
+        tokens = m.group(1).strip().split()
+        try:
+            vals = [np.float64(t) for t in tokens]
+        except Exception:
+            return None
+
+        if len(vals) == 9:
+            return np.array(vals, dtype=np.float64).reshape(3, 3)
+        elif len(vals) == 6:
+            # Voigt: xx yy zz yz xz xy
+            s = np.zeros((3, 3), dtype=np.float64)
+            s[0, 0] = vals[0]
+            s[1, 1] = vals[1]
+            s[2, 2] = vals[2]
+            s[1, 2] = s[2, 1] = vals[3]
+            s[0, 2] = s[2, 0] = vals[4]
+            s[0, 1] = s[1, 0] = vals[5]
+            return s
+        return None
+
+    # Try virial (convert to stress = -virial / volume)
+    m = re.search(r'\bvirial\s*=\s*["\']([^"\']+)["\']', line, flags=re.IGNORECASE)
+    if m:
+        tokens = m.group(1).strip().split()
+        try:
+            vals = [np.float64(t) for t in tokens]
+        except Exception:
+            return None
+
+        if len(vals) == 9:
+            virial = np.array(vals, dtype=np.float64).reshape(3, 3)
+        elif len(vals) == 6:
+            virial = np.zeros((3, 3), dtype=np.float64)
+            virial[0, 0] = vals[0]
+            virial[1, 1] = vals[1]
+            virial[2, 2] = vals[2]
+            virial[1, 2] = virial[2, 1] = vals[3]
+            virial[0, 2] = virial[2, 0] = vals[4]
+            virial[0, 1] = virial[1, 0] = vals[5]
+        else:
+            return None
+
+        if cell_9 is not None:
+            cell_mat = np.array(cell_9, dtype=np.float64).reshape(3, 3)
+            volume = abs(np.linalg.det(cell_mat))
+            if volume > 1e-10:
+                return -virial / volume
+        return None
+
+    return None
 
 
 def _parse_properties_spec(line: str):
@@ -151,11 +216,13 @@ def extract_data_blocks(file_path, elements=None):
     raw_energy_list = []   # raw energy from comment line (typically total energy)
     cell_list = []         # 9 numbers (row-major) or zeros if non-periodic/unknown
     pbc_list = []          # list of (px,py,pz) booleans
+    stress_list = []       # list of (3,3) stress tensors (eV/Å³), zeros if not present
     data_blocks = []
     
     current_block = []
     current_cell = [np.float64(0.0)] * 9
     current_pbc = (False, False, False)
+    current_stress = np.zeros((3, 3), dtype=np.float64)
 
     current_natoms = None
     current_properties = None
@@ -168,9 +235,11 @@ def extract_data_blocks(file_path, elements=None):
                 data_blocks.append(current_block)
                 cell_list.append(current_cell)
                 pbc_list.append(current_pbc)
+                stress_list.append(current_stress)
                 current_block = []
                 current_cell = [np.float64(0.0)] * 9
                 current_pbc = (False, False, False)
+                current_stress = np.zeros((3, 3), dtype=np.float64)
                 current_natoms = None
                 current_properties = None
             continue
@@ -182,15 +251,17 @@ def extract_data_blocks(file_path, elements=None):
                 data_blocks.append(current_block)
                 cell_list.append(current_cell)
                 pbc_list.append(current_pbc)
+                stress_list.append(current_stress)
                 current_block = []
                 current_cell = [np.float64(0.0)] * 9
                 current_pbc = (False, False, False)
+                current_stress = np.zeros((3, 3), dtype=np.float64)
                 current_properties = None
             current_natoms = int(line)
             continue
         
-        # Comment line (extended XYZ) - contains energy/pbc/lattice/properties
-        if "energy=" in line.lower() or "properties" in line or "lattice" in line or "pbc" in line:
+        # Comment line (extended XYZ) - contains energy/pbc/lattice/properties/stress/virial
+        if "energy=" in line.lower() or "properties" in line or "lattice" in line or "pbc" in line or "stress" in line.lower() or "virial" in line.lower():
             # Properties spec (optional)
             spec = _parse_properties_spec(line)
             if spec is not None:
@@ -221,6 +292,11 @@ def extract_data_blocks(file_path, elements=None):
                 # If lattice exists but pbc missing, assume periodic in all directions.
                 # If lattice missing, assume non-periodic.
                 current_pbc = (True, True, True) if lat is not None else (False, False, False)
+
+            # Stress / virial
+            parsed_stress = _parse_stress_from_comment(line, cell_9=current_cell)
+            if parsed_stress is not None:
+                current_stress = parsed_stress
 
             continue
 
@@ -330,8 +406,9 @@ def extract_data_blocks(file_path, elements=None):
         data_blocks.append(current_block)
         cell_list.append(current_cell)
         pbc_list.append(current_pbc)
+        stress_list.append(current_stress)
 
-    return data_blocks, energy_list, raw_energy_list, cell_list, pbc_list
+    return data_blocks, energy_list, raw_energy_list, cell_list, pbc_list, stress_list
 
 
 def objective_function(new_values, keys, atom_indices_list, energy_list):
@@ -428,7 +505,7 @@ def compute_correction(blocks, raw_energies, keys, fitted_vals):
     return corrections
 
 
-def save_set(prefix, indices, blocks, raw_E, correction_E, cell_list, pbc_list=None, max_atom=1, output_dir='.'):
+def save_set(prefix, indices, blocks, raw_E, correction_E, cell_list, pbc_list=None, stress_list=None, max_atom=1, output_dir='.'):
     """
     Save dataset to HDF5 and CSV files.
     
@@ -475,7 +552,20 @@ def save_set(prefix, indices, blocks, raw_E, correction_E, cell_list, pbc_list=N
     df_cells.to_hdf(os.path.join(output_dir, f'cell_{prefix}.h5'), key='df', mode='w')
     df_cells.to_csv(os.path.join(output_dir, f'cell_{prefix}.csv'), index=False)
     
-    # 4. Save atomic detailed data (Atom Data / read_*.h5)
+    # 4. Save stress tensor (Stress)
+    if stress_list is not None:
+        stresses = [stress_list[i] for i in indices]
+    else:
+        stresses = [np.zeros((3, 3), dtype=np.float64) for _ in indices]
+    stress_flat = np.array([s.flatten() for s in stresses], dtype=np.float64)
+    df_stress = pd.DataFrame(
+        stress_flat,
+        columns=['sxx', 'sxy', 'sxz', 'syx', 'syy', 'syz', 'szx', 'szy', 'szz']
+    ).astype(np.float64)
+    df_stress.to_hdf(os.path.join(output_dir, f'stress_{prefix}.h5'), key='df', mode='w')
+    df_stress.to_csv(os.path.join(output_dir, f'stress_{prefix}.csv'), index=False)
+
+    # 5. Save atomic detailed data (Atom Data / read_*.h5)
     all_data = []
     for block in blocks:
         curr_len = len(block)
@@ -535,9 +625,9 @@ def process_single_frame(args):
         pbc_flags = [False, False, False]
         current_cell = np.eye(3) * 100.0
     
-    # ASE computation
-    atoms = Atoms(numbers=atom_types, positions=pos, cell=current_cell, pbc=pbc_flags)
-    i, j, S = neighbor_list('ijS', atoms, max_radius)
+    i, j, S = matscipy_neighbour_list(
+        'ijS', positions=pos, cell=current_cell, pbc=pbc_flags, cutoff=max_radius
+    )
     pos_checksum = np.sum(pos)
     
     # Return pure data (dictionary form)
@@ -641,6 +731,7 @@ def save_to_h5_parallel(prefix, max_radius, num_workers, data_dir='.'):
     read_file = os.path.join(data_dir, f'read_{prefix}.h5')
     energy_file = os.path.join(data_dir, f'raw_energy_{prefix}.h5')
     cell_file = os.path.join(data_dir, f'cell_{prefix}.h5')
+    stress_file = os.path.join(data_dir, f'stress_{prefix}.h5')
     
     if not os.path.exists(read_file):
         raise FileNotFoundError(
@@ -651,6 +742,13 @@ def save_to_h5_parallel(prefix, max_radius, num_workers, data_dir='.'):
     df_read = pd.read_hdf(read_file)
     df_energy = pd.read_hdf(energy_file)
     df_cell = pd.read_hdf(cell_file)
+
+    # Load stress data (optional, zeros if not available)
+    if os.path.exists(stress_file):
+        df_stress = pd.read_hdf(stress_file)
+        stress_all = df_stress.values.astype(np.float64).reshape(-1, 3, 3)
+    else:
+        stress_all = None
     
     targets = df_energy.values.flatten().astype(np.float64)
 
@@ -739,5 +837,9 @@ def save_to_h5_parallel(prefix, max_radius, num_workers, data_dir='.'):
                 g.create_dataset('edge_dst', data=res['edge_dst'])
                 g.create_dataset('edge_shifts', data=res['edge_shifts'])
                 g.create_dataset('cell', data=res['cell'])
+                if stress_all is not None and idx < len(stress_all):
+                    g.create_dataset('stress', data=stress_all[idx])
+                else:
+                    g.create_dataset('stress', data=np.zeros((3, 3), dtype=np.float64))
 
     print(f"Success! Saved to {output_file}")

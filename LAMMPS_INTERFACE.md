@@ -4,13 +4,225 @@
 
 ## 概述
 
-FusedEquiTensorPot 提供了 Python 接口，可以通过 LAMMPS 的 `fix python/invoke` 或 `pair_style python` 命令调用。接口会自动处理：
-- 模型加载和初始化
-- 邻居列表计算（支持周期性边界条件）
-- 能量和力的计算
-- 单位转换（模型使用 eV，LAMMPS 使用 kcal/mol）
+FusedEquiTensorPot 提供三种 LAMMPS 集成方式：
 
-## 快速开始
+| 方式 | 速度 | 要求 | 适用场景 |
+|------|------|------|----------|
+| **USER-MFFTORCH（纯 C++）** | 最快，无 Python/GIL | LAMMPS 编译时开启 KOKKOS + USER-MFFTORCH | HPC、超算、生产部署 |
+| **ML-IAP unified** | 较快（比 fix external 约 1.7x） | LAMMPS 编译时开启 ML-IAP | 推荐，支持 GPU 加速 |
+| **fix external / pair_style python** | 较慢 | 标准 LAMMPS + Python | 快速验证、无 ML-IAP 时 |
+
+- **USER-MFFTORCH**：模型导出为 TorchScript `core.pt`，LAMMPS 用 LibTorch C++ API 直接加载，**运行时完全不需要 Python**。
+- **ML-IAP / fix external**：需 Python 驱动或 Python 解释器，自动处理模型加载、邻居列表、能量/力计算、单位转换。
+
+---
+
+## 方式一：USER-MFFTORCH 纯 C++ 接口（HPC 推荐）
+
+**USER-MFFTORCH** 是自定义 LAMMPS 包，提供 `pair_style mff/torch`，在 C++ 侧用 LibTorch 加载 TorchScript 模型，**无需 Python 解释器**，适合超算与生产部署。
+
+**完整编译与运行流程**见：[lammps_user_mfftorch/docs/BUILD_AND_RUN.md](lammps_user_mfftorch/docs/BUILD_AND_RUN.md)
+
+### 快速步骤
+
+1. **导出 core.pt**（需 Python，一次性）：
+   ```bash
+   python molecular_force_field/scripts/export_libtorch_core.py \
+     --checkpoint model.pth --elements H O --device cuda \
+     --max-radius 5.0 --embed-e0 --e0-csv fitted_E0.csv --out core.pt
+   ```
+
+2. **编译 LAMMPS**：启用 `PKG_KOKKOS`、`PKG_USER-MFFTORCH`，详见 BUILD_AND_RUN.md。
+
+3. **运行**（纯 LAMMPS，无 Python）：
+   ```bash
+   lmp -k on g 1 -sf kk -pk kokkos newton off neigh full -in in.mfftorch
+   ```
+
+**LAMMPS 输入示例**：
+```lammps
+pair_style mff/torch 5.0 cuda
+pair_coeff * * /path/to/core.pt H O
+```
+
+**模型限制**：目前支持 `pure-cartesian-ictd` 系列模型。元素顺序、cutoff 需与导出时一致。
+
+---
+
+## 方式二：ML-IAP unified 接口
+
+ML-IAP 是 LAMMPS 的机器学习势接口，比 fix external 更快，且支持 Kokkos GPU。LAMMPS 需编译时开启 `PKG_ML-IAP=ON`、`MLIAP_ENABLE_PYTHON=ON`，详见 `molecular_force_field/docs/INSTALL_LAMMPS_PYTHON.md`。
+
+**力计算方式**：使用 atom forces 模式（`dE/d(pos)`），通过 dummy position 张量做 autograd 叶变量，
+梯度存储从 O(npairs) 降至 O(natoms)。Per-atom forces 直接写入 LAMMPS force buffer，
+全局 virial 由 LAMMPS 的 `virial_fdotr_compute()` 自动处理。
+
+**模型限制**：仅以下四种模型支持 ML-IAP（因其支持 `precomputed_edge_vec`）：
+- `e3nn_layers.py`（spherical）
+- `e3nn_layers_channelwise.py`（spherical-save）
+- `pure_cartesian_ictd_layers.py`（pure-cartesian-ictd-save）
+- `pure_cartesian_ictd_layers_full.py`（pure-cartesian-ictd）
+
+其他模型（如 pure-cartesian、pure-cartesian-sparse 等）暂不支持 ML-IAP 导出。
+
+### 步骤 1：导出模型
+
+```bash
+python -m molecular_force_field.cli.export_mliap your_checkpoint.pth \
+    --elements H O \
+    --atomic-energy-keys 1 8 \
+    --atomic-energy-values -13.6 -75.0 \
+    --max-radius 5.0 \
+    --output model-mliap.pt
+```
+
+### 步骤 2：Python 驱动 LAMMPS
+
+```python
+import torch
+import lammps
+from lammps.mliap import activate_mliappy, load_unified
+
+lmp = lammps.lammps()
+activate_mliappy(lmp)
+
+model = torch.load("model-mliap.pt", weights_only=False)
+load_unified(model)
+
+lmp.commands_string("""
+units metal
+atom_style atomic
+read_data your_system.data
+pair_style mliap unified model-mliap.pt 0
+pair_coeff * * H O
+velocity all create 300 12345
+fix 1 all nve
+thermo 100
+run 1000
+""")
+lmp.close()
+```
+
+### 步骤 3：纯 LAMMPS 输入文件
+
+创建 `run.py`：
+
+```python
+import torch
+import lammps
+from lammps.mliap import activate_mliappy, load_unified
+
+lmp = lammps.lammps()
+activate_mliappy(lmp)
+model = torch.load("model-mliap.pt", weights_only=False)
+load_unified(model)
+lmp.file("input.lammps")
+lmp.close()
+```
+
+`input.lammps` 示例：
+
+```
+units metal
+atom_style atomic
+read_data system.data
+
+pair_style mliap unified model-mliap.pt 0
+pair_coeff * * H O
+
+velocity all create 300 12345
+fix 1 all nvt temp 300 300 0.1
+thermo 100
+dump 1 all xyz 100 traj.xyz
+run 10000
+```
+
+运行（macOS 需设置 `DYLD_LIBRARY_PATH`）：
+
+```bash
+export DYLD_LIBRARY_PATH="$HOME/.local/lib:/opt/homebrew/opt/python@3.12/Frameworks/Python.framework/Versions/3.12/lib"
+python run.py
+```
+
+**ML-IAP 注意事项：**
+- `pair_coeff * * H O` 中元素顺序必须与导出时 `--elements` 一致
+- `pair_style mliap unified model.pt 0` 末尾 `0` 表示不包含 ghost 邻居；多层消息传递时改为 `1`
+- 使用 `units metal`（eV, Angstrom）
+
+### GPU 加速（ML-IAP-Kokkos）
+
+若 LAMMPS 使用 Kokkos + CUDA 编译，接口会自动检测 GPU 并将 per-atom forces 直接写入 GPU 端的 LAMMPS force buffer（`data.f`），避免 CPU↔GPU 拷贝。全局 virial 由 LAMMPS 的 `virial_fdotr_compute()` 自动计算。
+
+**Python 驱动示例（Kokkos）：**
+
+```python
+import torch
+import lammps
+from lammps.mliap import activate_mliappy_kokkos, load_unified
+
+lmp = lammps.lammps(cmdargs=["-k", "on", "g", "1", "-sf", "kk"])
+activate_mliappy_kokkos(lmp)
+
+model = torch.load("model-mliap.pt", weights_only=False)
+load_unified(model)
+
+lmp.file("input.lammps")
+lmp.close()
+```
+
+**命令行（多 GPU）：**
+
+```bash
+mpirun -np 4 lmp -k on g 4 -sf kk -pk kokkos newton on neigh half -in input.lammps
+```
+
+详见 [NVIDIA ML-IAP-Kokkos 教程](https://developer.nvidia.cn/blog/enabling-scalable-ai-driven-molecular-dynamics-simulations/)。
+
+### 步骤 4：Kokkos GPU 加速（参考 MACE/LAMMPS 文档）
+
+若 LAMMPS 已用 Kokkos + CUDA 编译，可通过命令行启用 GPU：
+
+**方式 A：直接运行 LAMMPS 可执行文件**
+
+```bash
+lmp -k on g 1 -sf kk -pk kokkos newton on neigh half -in input.lammps
+```
+
+- `-k on g 1`：启用 Kokkos，使用 1 块 GPU
+- `-sf kk`：使用 Kokkos 变体（如 `pair_style mliap/kk`）
+- `-pk kokkos newton on neigh half`：Kokkos 包选项
+
+多 GPU 示例：
+
+```bash
+mpirun -np 2 lmp -k on g 2 -sf kk -pk kokkos newton on neigh half -in input.lammps
+```
+
+**方式 B：Python 驱动 + Kokkos**
+
+若通过 Python 库启动 LAMMPS 并希望使用 Kokkos GPU，需用 `activate_mliappy_kokkos` 替代 `activate_mliappy`：
+
+```python
+import torch
+import lammps
+from lammps.mliap import activate_mliappy_kokkos, load_unified  # Kokkos 版本
+
+lmp = lammps.lammps(cmdargs=["-k", "on", "g", "1", "-sf", "kk", "-pk", "kokkos", "newton", "on", "neigh", "half"])
+activate_mliappy_kokkos(lmp)
+model = torch.load("model-mliap.pt", weights_only=False)
+load_unified(model)
+lmp.file("input.lammps")
+lmp.close()
+```
+
+**编译要求**：需 `PKG_KOKKOS=ON`、`Kokkos_ENABLE_CUDA=yes` 等，详见 `molecular_force_field/docs/INSTALL_LAMMPS_PYTHON.md`。
+**注意**：Python + Kokkos 联机存在已知问题（如 `mliap_unified_couple_kokkos` 模块不可用），可优先尝试方式 A。
+
+参考：[MACE in LAMMPS with ML-IAP](https://mace-docs.readthedocs.io/en/latest/guide/lammps_mliap.html)
+
+---
+
+## 方式三：fix external / pair_style python
 
 ### 1. 生成 LAMMPS 接口文件
 
@@ -176,10 +388,12 @@ run 10000
 
 ## 性能优化建议
 
-1. **使用 GPU**: 如果可用，设置 `device cuda` 可以显著加速计算
-2. **邻居列表**: `max_radius` 应该与训练时使用的值一致
-3. **批量处理**: LAMMPS 会自动处理多个时间步，模型在 `eval()` 模式下运行
-4. **内存管理**: 对于大系统，考虑使用 CPU 模式或减少 `max_num_neighbors`
+1. **优先使用 USER-MFFTORCH**: 若需 HPC、无 Python 部署，推荐 `pair_style mff/torch` + Kokkos 纯 C++ 链路
+2. **其次 ML-IAP**: 若 LAMMPS 已编译 ML-IAP，推荐 `pair_style mliap unified`，比 fix external 更快
+3. **使用 GPU**: fix external 模式下，设置 `device cuda` 可显著加速；ML-IAP 与 USER-MFFTORCH 均支持 Kokkos GPU
+4. **邻居列表**: `max_radius` 应与训练时一致
+5. **批量处理**: LAMMPS 会自动处理多个时间步，模型在 `eval()` 模式下运行
+6. **内存管理**: 大系统可考虑 CPU 模式或减少 `max_num_neighbors`
 
 ## 故障排除
 
@@ -229,7 +443,15 @@ KeyError: atomic number not found in energy mapping
 
 ## 测试接口
 
-你可以直接测试 Python 接口：
+**USER-MFFTORCH 接口：**
+
+```bash
+bash lammps_user_mfftorch/examples/run_smoke_mfftorch.sh /path/to/lmp cuda
+# 或完整 GPU 测试（含 dummy 模型）：
+bash molecular_force_field/scripts/run_gpu_lammps_with_corept.sh --lmp /path/to/lmp --dummy-ictd --elements H O
+```
+
+**fix external 接口：**
 
 ```bash
 python -m molecular_force_field.interfaces.lammps_potential \
@@ -239,7 +461,13 @@ python -m molecular_force_field.interfaces.lammps_potential \
     --atomic-energy-file fitted_E0.csv
 ```
 
-这会使用随机数据测试接口，输出能量和力的示例值。
+**ML-IAP 接口：**
+
+```bash
+python -m molecular_force_field.interfaces.test_mliap
+```
+
+会依次测试 atom forces 数值一致性（AtomForcesWrapper）、legacy edge forces 一致性、导出/加载往返、以及 LAMMPS 联机（需已编译 ML-IAP）。
 
 ## 高级用法
 
@@ -261,13 +489,16 @@ fix 1 all python/invoke 1 1 1 lammps_potential.py lammps_potential_init lammps_p
 ## 注意事项
 
 1. **模型超参数**: 确保 LAMMPS 中使用的 `max_radius` 与训练时一致
-2. **原子类型**: LAMMPS 的原子类型（type）应该对应模型的原子序数（Z）
-   - 更推荐：显式提供 `type_to_Z`（例如 type 1->Si=14），避免静默错误。
-3. **周期性边界条件**: 接口会自动检测 PBC，但确保 LAMMPS 中的 PBC 设置正确
-4. **性能**: Python 接口比原生 C++ 插件慢，但对于大多数应用仍然足够快
+2. **原子类型**: LAMMPS 的原子类型（type）应对应模型的原子序数（Z）
+   - 更推荐：显式提供 `type_to_Z`（例如 type 1->Si=14），避免静默错误
+3. **周期性边界条件**: 接口会自动检测 PBC，但需确保 LAMMPS 中的 PBC 设置正确
+4. **性能**: USER-MFFTORCH（纯 C++）> ML-IAP > fix external；HPC 部署优先 USER-MFFTORCH
 
 ## 参考
 
+- [USER-MFFTORCH 编译与运行指南](lammps_user_mfftorch/docs/BUILD_AND_RUN.md)（纯 C++ / Kokkos）
 - [LAMMPS Python 接口文档](https://docs.lammps.org/Python.html)
+- [ML-IAP 接入说明](molecular_force_field/docs/LAMMPS_MLIAP_README.md)
+- [LAMMPS 加速方案对比](molecular_force_field/docs/LAMMPS_ACCELERATION.md)
 - [FusedEquiTensorPot 主文档](README.md)
 - [使用指南](USAGE.md)

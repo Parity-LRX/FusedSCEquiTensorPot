@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch_scatter import scatter
+from molecular_force_field.utils.scatter import scatter
 from torch.optim.lr_scheduler import SequentialLR, LambdaLR, StepLR
 import copy
 
@@ -103,6 +103,15 @@ class Trainer:
         train_eval_sample_ratio=0.2,
         log_val_batch_energy_to_console=False,
         tensor_product_mode='spherical',
+        c=0.0,
+        c_min=0.0,
+        c_max=1000.0,
+        # Validation-only torch.compile (safe for create_graph=False in validate)
+        compile_val: str = "none",
+        compile_val_mode: str = "reduce-overhead",
+        compile_val_fullgraph: bool = False,
+        compile_val_dynamic: bool = False,
+        compile_val_precache: bool = False,
     ):
         """
         Initialize trainer.
@@ -154,7 +163,7 @@ class Trainer:
                 If True (default), use checkpoint values. If False, use the values passed to __init__.
             tensor_product_mode: Tensor product mode used (default: 'spherical').
                 Options: 'spherical', 'partial-cartesian', 'partial-cartesian-loose',
-                'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-ictd'
+                'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-ictd', 'pure-cartesian-ictd-save'
         """
         self.distributed = distributed
         self.rank = rank
@@ -163,15 +172,28 @@ class Trainer:
         self.val_sampler = val_sampler
         self.is_main_process = (rank == 0)
         self.tensor_product_mode = tensor_product_mode
+
+        # Validation-only compile settings
+        self.compile_val = str(compile_val)
+        self.compile_val_mode = str(compile_val_mode)
+        self.compile_val_fullgraph = bool(compile_val_fullgraph)
+        self.compile_val_dynamic = bool(compile_val_dynamic)
+        self.compile_val_precache = bool(compile_val_precache)
+        self._val_compiled_current = None
+        self._val_compiled_ema = None
+        self._val_compile_failed_current = False
+        self._val_compile_failed_ema = False
         
         # Convert tensor_product_mode to suffix format (e.g., 'pure-cartesian' -> '_pure_cartesian')
         mode_suffix_map = {
             'spherical': '_spherical',
+            'spherical-save': '_spherical_save',
             'partial-cartesian': '_partial_cartesian',
             'partial-cartesian-loose': '_partial_cartesian_loose',
             'pure-cartesian': '_pure_cartesian',
             'pure-cartesian-sparse': '_pure_cartesian_sparse',
             'pure-cartesian-ictd': '_pure_cartesian_ictd',
+            'pure-cartesian-ictd-save': '_pure_cartesian_ictd_save',
         }
         self.tensor_product_suffix = mode_suffix_map.get(tensor_product_mode, '_spherical')
         
@@ -207,6 +229,9 @@ class Trainer:
         self.a_max = a_max
         self.b_min = b_min
         self.b_max = b_max
+        self.c = c
+        self.c_min = c_min
+        self.c_max = c_max
         self.swa_start_epoch = swa_start_epoch
         self.swa_a = swa_a
         self.swa_b = swa_b
@@ -338,6 +363,7 @@ class Trainer:
             logging.info(f"  Validation Samples: {len(self.val_dataset)}")
             logging.info(f"  Energy Loss Weight (a): {self.a}")
             logging.info(f"  Force Loss Weight (b): {self.b}")
+            logging.info(f"  Stress Loss Weight (c): {self.c}")
             if self.swa_start_epoch is not None:
                 logging.info(f"  SWA enabled: Will switch to a={self.swa_a}, b={self.swa_b} at epoch {self.swa_start_epoch}")
             if self.ema_start_epoch is not None:
@@ -370,9 +396,109 @@ class Trainer:
         
         if checkpoint_to_load:
             self.load_checkpoint(checkpoint_to_load)
+
+    def _cudagraph_step_begin_if_available(self):
+        try:
+            torch.compiler.cudagraph_mark_step_begin()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    def _maybe_compile_validation_model(self, eval_model: nn.Module, batch_tensors, *, is_ema: bool) -> nn.Module:
+        """
+        Optionally compile the validation forward (create_graph=False path only).
+        We compile only the selected eval_model (current or EMA) and cache it.
+        """
+        if self.compile_val == "none":
+            return eval_model
+        if self.compile_val != "e3trans":
+            return eval_model
+        if self.device.type != "cuda":
+            return eval_model
+        if not hasattr(torch, "compile"):
+            return eval_model
+
+        if is_ema:
+            if self._val_compiled_ema is not None:
+                return self._val_compiled_ema
+            if self._val_compile_failed_ema:
+                return eval_model
+        else:
+            if self._val_compiled_current is not None:
+                return self._val_compiled_current
+            if self._val_compile_failed_current:
+                return eval_model
+
+        # Precache to avoid CPU-side cache build during tracing (ICTD direction_harmonics_fast)
+        if self.compile_val_precache:
+            try:
+                (pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell) = batch_tensors
+                with torch.no_grad():
+                    self._cudagraph_step_begin_if_available()
+                    _ = eval_model(pos.detach(), A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
+            except Exception as e:
+                if self.is_main_process:
+                    logging.warning(f"Validation compile precache failed; continuing. Error: {e}")
+
+        # NOTE: torch.compile(mode="reduce-overhead") may enable CUDA Graphs. With custom CUDA
+        # extensions (e.g., cuEquivariance ops) this can occasionally segfault. Validation
+        # correctness does not require CUDA Graphs, so we disable cudagraph capture here.
+        # (Inductor still provides fusion / lowered kernels without cudagraphs.)
+        old_inductor_cfg = {}
+        try:
+            import torch._inductor.config as inductor_config  # type: ignore
+
+            for key in ("cudagraphs", "triton.cudagraphs"):
+                # Some versions expose nested configs; we handle both patterns.
+                if key == "cudagraphs" and hasattr(inductor_config, "cudagraphs"):
+                    old_inductor_cfg[key] = getattr(inductor_config, "cudagraphs")
+                    setattr(inductor_config, "cudagraphs", False)
+                elif key == "triton.cudagraphs" and hasattr(inductor_config, "triton") and hasattr(inductor_config.triton, "cudagraphs"):
+                    old_inductor_cfg[key] = getattr(inductor_config.triton, "cudagraphs")
+                    setattr(inductor_config.triton, "cudagraphs", False)
+        except Exception:
+            old_inductor_cfg = {}
+
+        try:
+            if self.is_main_process:
+                logging.info(
+                    "Compiling validation e3trans (mode=%s, fullgraph=%s, dynamic=%s)",
+                    self.compile_val_mode,
+                    self.compile_val_fullgraph,
+                    self.compile_val_dynamic,
+                )
+            compiled = torch.compile(
+                eval_model,
+                mode=self.compile_val_mode,
+                fullgraph=self.compile_val_fullgraph,
+                dynamic=self.compile_val_dynamic,
+            )
+            if is_ema:
+                self._val_compiled_ema = compiled
+            else:
+                self._val_compiled_current = compiled
+            return compiled
+        except Exception as e:
+            if self.is_main_process:
+                logging.warning(f"Validation torch.compile failed; continuing without compile. Error: {e}")
+            if is_ema:
+                self._val_compile_failed_ema = True
+            else:
+                self._val_compile_failed_current = True
+            return eval_model
+        finally:
+            # Restore inductor config.
+            try:
+                import torch._inductor.config as inductor_config  # type: ignore
+
+                if "cudagraphs" in old_inductor_cfg and hasattr(inductor_config, "cudagraphs"):
+                    setattr(inductor_config, "cudagraphs", old_inductor_cfg["cudagraphs"])
+                if "triton.cudagraphs" in old_inductor_cfg and hasattr(inductor_config, "triton") and hasattr(inductor_config.triton, "cudagraphs"):
+                    setattr(inductor_config.triton, "cudagraphs", old_inductor_cfg["triton.cudagraphs"])
+            except Exception:
+                pass
     
     def _clamp_loss_weights(self):
-        """Clamp loss weights a/b to configured bounds."""
+        """Clamp loss weights a/b/c to configured bounds."""
         if self.a_min is not None:
             self.a = max(self.a, self.a_min)
         if self.a_max is not None:
@@ -381,6 +507,10 @@ class Trainer:
             self.b = max(self.b, self.b_min)
         if self.b_max is not None:
             self.b = min(self.b, self.b_max)
+        if self.c_min is not None:
+            self.c = max(self.c, self.c_min)
+        if self.c_max is not None:
+            self.c = min(self.c, self.c_max)
 
     def load_checkpoint(self, checkpoint_path):
         """Load checkpoint and restore training state."""
@@ -423,13 +553,15 @@ class Trainer:
                 self.a = checkpoint['a']
             if 'b' in checkpoint:
                 self.b = checkpoint['b']
+            if 'c' in checkpoint:
+                self.c = checkpoint['c']
             self._clamp_loss_weights()
             if self.is_main_process:
-                logging.info(f"  Using loss weights from checkpoint: a={self.a:.4f}, b={self.b:.4f}")
+                logging.info(f"  Using loss weights from checkpoint: a={self.a:.4f}, b={self.b:.4f}, c={self.c:.4f}")
         else:
             self._clamp_loss_weights()
             if self.is_main_process:
-                logging.info(f"  Using new loss weights (ignoring checkpoint): a={self.a:.4f}, b={self.b:.4f}")
+                logging.info(f"  Using new loss weights (ignoring checkpoint): a={self.a:.4f}, b={self.b:.4f}, c={self.c:.4f}")
         if 'swa_applied' in checkpoint:
             self.swa_applied = checkpoint['swa_applied']
         if 'ema_enabled' in checkpoint:
@@ -490,6 +622,8 @@ class Trainer:
         total_batch_energy_rmse_avg = []
         total_batch_force_loss = []
         total_batch_force_rmse = []
+        total_batch_stress_loss = []
+        total_batch_stress_rmse = []
         
         all_nets = [self.e3trans, self.model]
         all_parameters = [param for net in all_nets for param in net.parameters()]
@@ -510,7 +644,7 @@ class Trainer:
                 continue
             
             (pos, A, batch_idx, force_ref, target_energies,
-             edge_src, edge_dst, edge_shifts, cell) = batch_data
+             edge_src, edge_dst, edge_shifts, cell, stress_ref) = batch_data
             
             # Move to device
             pos = pos.to(self.device)
@@ -522,6 +656,7 @@ class Trainer:
             edge_dst = edge_dst.to(self.device)
             edge_shifts = edge_shifts.to(self.device)
             cell = cell.to(self.device)
+            stress_ref = stress_ref.to(self.device)
             
             pos.requires_grad_(True)
             
@@ -607,23 +742,51 @@ class Trainer:
             mapped_A = map_tensor_values(A, self.keys, self.values).to(self.device)
             E_offset_mol = scatter(mapped_A, batch_idx, dim=0, reduce='sum')
             
+            # Apply per-molecule strain for stress computation
+            compute_stress = (self.c > 0)
+            if compute_stress:
+                num_mol = cell.shape[0]
+                strain = torch.zeros((num_mol, 3, 3), dtype=pos.dtype, device=self.device, requires_grad=True)
+                symmetric_strain = 0.5 * (strain + strain.transpose(-1, -2))
+                I3 = torch.eye(3, dtype=pos.dtype, device=self.device)
+                deformation = I3 + symmetric_strain  # [B, 3, 3]
+                deformation_per_atom = deformation[batch_idx]  # [N_atoms, 3, 3]
+                pos_input = torch.einsum('ni,nij->nj', pos, deformation_per_atom)
+                cell_input = torch.bmm(cell, deformation)
+            else:
+                strain = None
+                pos_input = pos
+                cell_input = cell
+
             # Forward pass
-            E_per_atom = self.e3trans(pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
+            E_per_atom = self.e3trans(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input)
             E_conv_mol = scatter(E_per_atom, batch_idx, dim=0, reduce='sum').squeeze(-1)
             E_mean = E_conv_mol + E_offset_mol
             
-            # Compute forces
+            # Compute forces (and stress if enabled)
+            grad_targets = [pos]
+            if compute_stress:
+                grad_targets.append(strain)
+            
             grads = torch.autograd.grad(
                 E_mean.sum(),
-                pos,
+                grad_targets,
                 create_graph=True,
                 retain_graph=True
-            )[0]
+            )
             
-            fx_pred = self.train_dataset.restore_force(-grads[:, 0])
-            fy_pred = self.train_dataset.restore_force(-grads[:, 1])
-            fz_pred = self.train_dataset.restore_force(-grads[:, 2])
+            force_grads = grads[0]
+            fx_pred = self.train_dataset.restore_force(-force_grads[:, 0])
+            fy_pred = self.train_dataset.restore_force(-force_grads[:, 1])
+            fz_pred = self.train_dataset.restore_force(-force_grads[:, 2])
             f_pred = torch.stack([fx_pred, fy_pred, fz_pred], dim=1)
+            
+            # Compute predicted stress: σ = (1/V) * dE/dε
+            if compute_stress:
+                stress_grads = grads[1]  # [B, 3, 3]
+                volume = torch.abs(torch.det(cell))  # [B]
+                volume = torch.clamp(volume, min=1e-10)
+                stress_pred = stress_grads / volume.view(-1, 1, 1)  # [B, 3, 3]
             
             force_ref_scaled = force_ref * self.force_shift_value
             force_loss = self.criterion(f_pred.view(-1), force_ref_scaled.view(-1))
@@ -631,6 +794,15 @@ class Trainer:
             with torch.no_grad():
                 force_rmse = torch.sqrt(self.criterion_2(f_pred.view(-1), force_ref_scaled.view(-1)))
             
+            # Stress loss
+            if compute_stress:
+                stress_loss = self.criterion(stress_pred.view(-1), stress_ref.view(-1))
+                with torch.no_grad():
+                    stress_rmse = torch.sqrt(self.criterion_2(stress_pred.view(-1), stress_ref.view(-1)))
+            else:
+                stress_loss = torch.tensor(0.0, device=self.device)
+                stress_rmse = torch.tensor(0.0, device=self.device)
+
             # Energy loss
             num_atoms_per_mol = scatter(torch.ones_like(batch_idx), batch_idx, dim=0, reduce='sum')
             E_avg_pred = E_mean / num_atoms_per_mol
@@ -673,7 +845,7 @@ class Trainer:
                 energy_rmse_avg = torch.sqrt(self.criterion_2(E_avg_pred, target_energy_avg))
             
             # Total loss
-            total_loss = self.a * energy_loss + self.b * force_loss
+            total_loss = self.a * energy_loss + self.b * force_loss + self.c * stress_loss
             total_loss.backward()
             
             # Gradient clipping
@@ -712,6 +884,8 @@ class Trainer:
             total_batch_energy_rmse_avg.append(energy_rmse_avg.item())
             total_batch_force_loss.append(force_loss.item())
             total_batch_force_rmse.append(force_rmse.item())
+            total_batch_stress_loss.append(stress_loss.item())
+            total_batch_stress_rmse.append(stress_rmse.item())
             
             # Record batch time
             batch_end_time = time.time()
@@ -724,6 +898,7 @@ class Trainer:
                 if (batch_idx_loader + 1) % progress_interval == 0 or (batch_idx_loader + 1) == total_batches:
                     current_energy_loss = np.mean(total_batch_energy_loss[-10:]) if len(total_batch_energy_loss) >= 10 else total_batch_energy_loss[-1] if total_batch_energy_loss else 0
                     current_force_loss = np.mean(total_batch_force_loss[-10:]) if len(total_batch_force_loss) >= 10 else total_batch_force_loss[-1] if total_batch_force_loss else 0
+                    current_stress_loss = np.mean(total_batch_stress_loss[-10:]) if len(total_batch_stress_loss) >= 10 else total_batch_stress_loss[-1] if total_batch_stress_loss else 0
                     current_lr = self.optimizer.param_groups[0]['lr']
                     avg_batch_time = np.mean(batch_times[-10:]) if len(batch_times) >= 10 else np.mean(batch_times)
                     elapsed_time = batch_end_time - epoch_start_time
@@ -731,9 +906,10 @@ class Trainer:
                     remaining_batches = total_batches - (batch_idx_loader + 1)
                     eta = remaining_batches * avg_batch_time
                     # Log to file only
+                    stress_log = f" | Stress Loss: {current_stress_loss:.6f}" if self.c > 0 else ""
                     logging.info(
                         f"Epoch {epoch} | Batch {batch_idx_loader + 1}/{total_batches} | "
-                        f"Energy Loss: {current_energy_loss:.6f} | Force Loss: {current_force_loss:.6f} | "
+                        f"Energy Loss: {current_energy_loss:.6f} | Force Loss: {current_force_loss:.6f}{stress_log} | "
                         f"LR: {current_lr:.2e} | Batch Count: {self.batch_count} | "
                         f"Batch Time: {batch_time:.3f}s | Avg: {avg_batch_time:.3f}s | "
                         f"Elapsed: {elapsed_time:.1f}s | ETA: {eta:.1f}s"
@@ -760,6 +936,8 @@ class Trainer:
             'energy_rmse_avg': np.mean(total_batch_energy_rmse_avg) if total_batch_energy_rmse_avg else 0,
             'force_loss': np.mean(total_batch_force_loss) if total_batch_force_loss else 0,
             'force_rmse': np.mean(total_batch_force_rmse) if total_batch_force_rmse else 0,
+            'stress_loss': np.mean(total_batch_stress_loss) if total_batch_stress_loss else 0,
+            'stress_rmse': np.mean(total_batch_stress_rmse) if total_batch_stress_rmse else 0,
             'epoch_time': epoch_time,
             'avg_batch_time': avg_batch_time,
         }
@@ -828,6 +1006,8 @@ class Trainer:
         val_E_avg_targets = []
         val_F_preds = []
         val_F_targets = []
+        val_S_preds = []
+        val_S_targets = []
         
         total_batches = len(self.val_loader)
         if self.is_main_process:
@@ -840,7 +1020,7 @@ class Trainer:
                 continue
             
             (pos, A, batch_idx, force_ref, target_energies,
-             edge_src, edge_dst, edge_shifts, cell) = batch
+             edge_src, edge_dst, edge_shifts, cell, stress_ref) = batch
             
             pos = pos.to(self.device)
             A = A.to(self.device)
@@ -851,6 +1031,7 @@ class Trainer:
             edge_dst = edge_dst.to(self.device)
             edge_shifts = edge_shifts.to(self.device)
             cell = cell.to(self.device)
+            stress_ref = stress_ref.to(self.device)
             
             pos.requires_grad = True
             
@@ -860,25 +1041,60 @@ class Trainer:
             # Choose evaluation model: EMA (optional) vs current
             if self.use_ema_for_validation and self.ema_enabled and self.e3trans_ema is not None:
                 eval_model = self.e3trans_ema
+                is_ema = True
             else:
                 eval_model = self.e3trans.module if self.distributed else self.e3trans
+                is_ema = False
 
-            E_per_atom = eval_model(pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
-            # E_conv_val 形状: [Batch_Size, 1] (consistent with original train-val.py)
+            # Optional: compile validation forward (CUDA only)
+            eval_model = self._maybe_compile_validation_model(
+                eval_model,
+                batch_tensors=(pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell),
+                is_ema=is_ema,
+            )
+            if self.device.type == "cuda" and self.compile_val != "none":
+                self._cudagraph_step_begin_if_available()
+
+            # Apply per-molecule strain for stress computation
+            compute_stress = (self.c > 0)
+            if compute_stress:
+                num_mol = cell.shape[0]
+                strain = torch.zeros((num_mol, 3, 3), dtype=pos.dtype, device=self.device, requires_grad=True)
+                symmetric_strain = 0.5 * (strain + strain.transpose(-1, -2))
+                I3 = torch.eye(3, dtype=pos.dtype, device=self.device)
+                deformation = I3 + symmetric_strain
+                deformation_per_atom = deformation[batch_idx]
+                pos_input = torch.einsum('ni,nij->nj', pos, deformation_per_atom)
+                cell_input = torch.bmm(cell, deformation)
+            else:
+                strain = None
+                pos_input = pos
+                cell_input = cell
+
+            E_per_atom = eval_model(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input)
             E_conv_val = scatter(E_per_atom, batch_idx, dim=0, reduce='sum')
-            # E_mean_val 形状: [Batch_Size] (consistent with original train-val.py)
             E_mean_val = E_conv_val.view(-1) + E_offset_val
             
-            # Calculate forces (need gradients, so not in no_grad context)
-            grads = torch.autograd.grad(
-                E_mean_val.sum(), pos, create_graph=False, retain_graph=False
-            )[0]
+            # Calculate forces (and stress if enabled)
+            grad_targets = [pos]
+            if compute_stress:
+                grad_targets.append(strain)
             
-            # Restore force units (consistent with training)
-            fx_pred = self.val_dataset.restore_force(-grads[:, 0])
-            fy_pred = self.val_dataset.restore_force(-grads[:, 1])
-            fz_pred = self.val_dataset.restore_force(-grads[:, 2])
+            grads = torch.autograd.grad(
+                E_mean_val.sum(), grad_targets, create_graph=False, retain_graph=False
+            )
+            
+            force_grads = grads[0]
+            fx_pred = self.val_dataset.restore_force(-force_grads[:, 0])
+            fy_pred = self.val_dataset.restore_force(-force_grads[:, 1])
+            fz_pred = self.val_dataset.restore_force(-force_grads[:, 2])
             f_pred_final = torch.stack([fx_pred, fy_pred, fz_pred], dim=1)
+            
+            if compute_stress:
+                stress_grads = grads[1]  # [B, 3, 3]
+                volume = torch.abs(torch.det(cell))
+                volume = torch.clamp(volume, min=1e-10)
+                stress_pred = stress_grads / volume.view(-1, 1, 1)
             
             f_ref_final = force_ref * self.force_shift_value
             
@@ -896,6 +1112,10 @@ class Trainer:
                 
                 val_F_preds.append(f_pred_final.detach().cpu())
                 val_F_targets.append(f_ref_final.detach().cpu())
+
+                if compute_stress:
+                    val_S_preds.append(stress_pred.detach().cpu())
+                    val_S_targets.append(stress_ref.detach().cpu())
                 
                 # Stream output: log first sample's restored energy (consistent with original train-val.py)
                 # Only log on main process
@@ -932,6 +1152,8 @@ class Trainer:
             all_E_avg_targets = torch.tensor([], dtype=torch.get_default_dtype())
             all_F_preds = torch.zeros((0, 3), dtype=torch.get_default_dtype())
             all_F_targets = torch.zeros((0, 3), dtype=torch.get_default_dtype())
+            all_S_preds = torch.zeros((0, 3, 3), dtype=torch.get_default_dtype())
+            all_S_targets = torch.zeros((0, 3, 3), dtype=torch.get_default_dtype())
         else:
             # Concatenate all predictions and targets
             all_E_preds = torch.cat(val_E_preds)
@@ -940,6 +1162,12 @@ class Trainer:
             all_E_avg_targets = torch.cat(val_E_avg_targets)
             all_F_preds = torch.cat(val_F_preds)
             all_F_targets = torch.cat(val_F_targets)
+            if val_S_preds:
+                all_S_preds = torch.cat(val_S_preds)
+                all_S_targets = torch.cat(val_S_targets)
+            else:
+                all_S_preds = torch.zeros((0, 3, 3), dtype=torch.get_default_dtype())
+                all_S_targets = torch.zeros((0, 3, 3), dtype=torch.get_default_dtype())
         
         # In distributed training, gather results from all processes using variable-size gather
         if self.distributed:
@@ -949,6 +1177,9 @@ class Trainer:
             all_E_avg_targets = self._gather_variable_tensors(all_E_avg_targets)
             all_F_preds = self._gather_variable_tensors(all_F_preds)
             all_F_targets = self._gather_variable_tensors(all_F_targets)
+            if all_S_preds.numel() > 0:
+                all_S_preds = self._gather_variable_tensors(all_S_preds)
+                all_S_targets = self._gather_variable_tensors(all_S_targets)
         
         # Verify shapes match
         assert all_E_preds.shape == all_E_targets.shape, \
@@ -985,28 +1216,46 @@ class Trainer:
         val_force_mae = self.val_dataset.restore_force(val_force_mae)  # Restore units for consistency
         val_force_loss = F.mse_loss(all_F_preds.view(-1), all_F_targets.view(-1)).item()  # For logging
         
+        # Stress metrics
+        if all_S_preds.numel() > 0:
+            val_stress_rmse = torch.sqrt(F.mse_loss(all_S_preds.view(-1), all_S_targets.view(-1))).item()
+            val_stress_mae = F.l1_loss(all_S_preds.view(-1), all_S_targets.view(-1)).item()
+            val_stress_loss = F.mse_loss(all_S_preds.view(-1), all_S_targets.view(-1)).item()
+        else:
+            val_stress_rmse = 0.0
+            val_stress_mae = 0.0
+            val_stress_loss = 0.0
+
         # Keep total loss for logging, but use a composite metric for best/early-stop:
         # metric = val_energy_rmse + (b/a) * val_force_rmse
-        current_val_loss = self.a * val_energy_loss + self.b * val_force_loss
+        current_val_loss = self.a * val_energy_loss + self.b * val_force_loss + self.c * val_stress_loss
         ab_ratio = (self.b / self.a) if self.a != 0 else 0.0
-        current_val_metric = val_energy_rmse + ab_ratio * val_force_rmse
+        ac_ratio = (self.c / self.a) if self.a != 0 else 0.0
+        current_val_metric = val_energy_rmse + ab_ratio * val_force_rmse + ac_ratio * val_stress_rmse
 
         # Log validation results (only on main process)
         if self.is_main_process:
+            stress_log_lines = ""
+            if self.c > 0:
+                stress_log_lines = f"""
+                                "Val Stress Loss (MSE)": {val_stress_loss},
+                                "Val Stress RMSE": {val_stress_rmse},
+                                "Val Stress MAE": {val_stress_mae},"""
             logging.info(f"""
                                 "Val Loss (MSE)": {val_energy_loss},
-                                "Val Force Loss (MSE)": {val_force_loss},
-                                "Val Total Loss (E+F, weighted)": {current_val_loss},
+                                "Val Force Loss (MSE)": {val_force_loss},{stress_log_lines}
+                                "Val Total Loss (E+F+S, weighted)": {current_val_loss},
                                 "Val Energy RMSE": {val_energy_rmse},
                                 "Val Energy MAE": {val_energy_mae},
                                 "Val Energy RMSE/atom": {val_energy_rmse_avg},
                                 "Val Energy MAE/atom": {val_energy_mae_avg},
                                 "Val Force RMSE":  {val_force_rmse},
                                 "Val Force MAE": {val_force_mae},
-                                "Val Metric (E_RMSE + b/a * F_RMSE)": {current_val_metric},
+                                "Val Metric (E_RMSE + b/a * F_RMSE + c/a * S_RMSE)": {current_val_metric},
                                 "Current learning rate": {self.optimizer.param_groups[0]['lr']},
                                 "a (energy weight)": {self.a},
-                                "b (force weight)": {self.b}
+                                "b (force weight)": {self.b},
+                                "c (stress weight)": {self.c}
                                 """)
 
         # Save validation results (only on main process)
@@ -1058,6 +1307,7 @@ class Trainer:
                     'e3trans_state_dict': e3trans_state_dict,
                     'a': self.a,
                     'b': self.b,
+                    'c': self.c,
                     'batch_count': self.batch_count,
                     'epoch': epoch,
                     'best_val_loss': self.best_val_loss,
@@ -1089,25 +1339,31 @@ class Trainer:
             'learning_rate': self.optimizer.param_groups[0]['lr'],
             'a': self.a,
             'b': self.b,
+            'c': self.c,
             'train_total_loss': 0,
             'train_energy_loss': 0,
             'train_force_loss': 0,
+            'train_stress_loss': 0,
             'train_energy_rmse': 0,
             'train_energy_mae': 0,
             'train_energy_rmse_avg': 0,
             'train_energy_mae_avg': 0,
             'train_force_rmse': 0,
             'train_force_mae': 0,
-            # Keep total loss for analysis (not used for early stopping / best checkpoint)
+            'train_stress_rmse': 0,
+            'train_stress_mae': 0,
             'val_total_loss': current_val_loss,
             'val_energy_loss': val_energy_loss,
             'val_force_loss': val_force_loss,
+            'val_stress_loss': val_stress_loss,
             'val_energy_rmse': val_energy_rmse,
             'val_energy_mae': val_energy_mae,
             'val_energy_rmse_avg': val_energy_rmse_avg,
             'val_energy_mae_avg': val_energy_mae_avg,
             'val_force_rmse': val_force_rmse,
             'val_force_mae': val_force_mae,
+            'val_stress_rmse': val_stress_rmse,
+            'val_stress_mae': val_stress_mae,
         }
         
         # Add training metrics if provided
@@ -1116,12 +1372,15 @@ class Trainer:
                 'train_total_loss': train_metrics.get('train_total_loss', 0),
                 'train_energy_loss': train_metrics.get('train_energy_loss', 0),
                 'train_force_loss': train_metrics.get('train_force_loss', 0),
+                'train_stress_loss': train_metrics.get('train_stress_loss', 0),
                 'train_energy_rmse': train_metrics.get('train_energy_rmse', 0),
                 'train_energy_mae': train_metrics.get('train_energy_mae', 0),
                 'train_energy_rmse_avg': train_metrics.get('train_energy_rmse_avg', 0),
                 'train_energy_mae_avg': train_metrics.get('train_energy_mae_avg', 0),
                 'train_force_rmse': train_metrics.get('train_force_rmse', 0),
                 'train_force_mae': train_metrics.get('train_force_mae', 0),
+                'train_stress_rmse': train_metrics.get('train_stress_rmse', 0),
+                'train_stress_mae': train_metrics.get('train_stress_mae', 0),
             })
         
         # Only save on main process
@@ -1145,6 +1404,7 @@ class Trainer:
                 'optimizer_lrs': [pg.get('lr', None) for pg in self.optimizer.param_groups],
                 'a': self.a,
                 'b': self.b,
+                'c': self.c,
                 'batch_count': self.batch_count,
                 'epoch': epoch,
                 'best_val_loss': self.best_val_loss,
@@ -1175,15 +1435,19 @@ class Trainer:
 
         energy_loss_sum = 0.0
         force_loss_sum = 0.0
+        stress_loss_sum = 0.0
         energy_count = 0
         force_count = 0
+        stress_count = 0
 
         energy_mse_sum = 0.0
         energy_mse_avg_sum = 0.0
         force_mse_sum = 0.0
+        stress_mse_sum = 0.0
         energy_mae_sum = 0.0
         energy_mae_avg_sum = 0.0
         force_mae_sum = 0.0
+        stress_mae_sum = 0.0
 
         # Determine if we should use sampling
         use_sampling = self.train_eval_sample_ratio < 1.0
@@ -1233,7 +1497,7 @@ class Trainer:
                 continue
 
             (pos, A, batch_idx, force_ref, target_energies,
-             edge_src, edge_dst, edge_shifts, cell) = batch
+             edge_src, edge_dst, edge_shifts, cell, stress_ref) = batch
 
             pos = pos.to(self.device)
             A = A.to(self.device)
@@ -1244,27 +1508,54 @@ class Trainer:
             edge_dst = edge_dst.to(self.device)
             edge_shifts = edge_shifts.to(self.device)
             cell = cell.to(self.device)
+            stress_ref = stress_ref.to(self.device)
 
             pos.requires_grad_(True)
+
+            compute_stress = (self.c > 0)
+            if compute_stress:
+                num_mol = cell.shape[0]
+                strain = torch.zeros((num_mol, 3, 3), dtype=pos.dtype, device=self.device, requires_grad=True)
+                symmetric_strain = 0.5 * (strain + strain.transpose(-1, -2))
+                I3 = torch.eye(3, dtype=pos.dtype, device=self.device)
+                deformation = I3 + symmetric_strain
+                deformation_per_atom = deformation[batch_idx]
+                pos_input = torch.einsum('ni,nij->nj', pos, deformation_per_atom)
+                cell_input = torch.bmm(cell, deformation)
+            else:
+                strain = None
+                pos_input = pos
+                cell_input = cell
 
             mapped_A = map_tensor_values(A, self.keys, self.values).to(self.device)
             E_offset_mol = scatter(mapped_A, batch_idx, dim=0, reduce='sum')
 
-            E_per_atom = eval_model(pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
+            E_per_atom = eval_model(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input)
             E_conv_mol = scatter(E_per_atom, batch_idx, dim=0, reduce='sum').squeeze(-1)
             E_mean = E_conv_mol + E_offset_mol
 
+            grad_targets = [pos]
+            if compute_stress:
+                grad_targets.append(strain)
+
             grads = torch.autograd.grad(
                 E_mean.sum(),
-                pos,
+                grad_targets,
                 create_graph=False,
                 retain_graph=False
-            )[0]
+            )
 
-            fx_pred = self.train_dataset.restore_force(-grads[:, 0])
-            fy_pred = self.train_dataset.restore_force(-grads[:, 1])
-            fz_pred = self.train_dataset.restore_force(-grads[:, 2])
+            force_grads = grads[0]
+            fx_pred = self.train_dataset.restore_force(-force_grads[:, 0])
+            fy_pred = self.train_dataset.restore_force(-force_grads[:, 1])
+            fz_pred = self.train_dataset.restore_force(-force_grads[:, 2])
             f_pred = torch.stack([fx_pred, fy_pred, fz_pred], dim=1)
+
+            if compute_stress:
+                stress_grads = grads[1]
+                volume = torch.abs(torch.det(cell))
+                volume = torch.clamp(volume, min=1e-10)
+                stress_pred = stress_grads / volume.view(-1, 1, 1)
 
             force_ref_scaled = force_ref * self.force_shift_value
             force_loss = self.criterion(f_pred.view(-1), force_ref_scaled.view(-1))
@@ -1290,49 +1581,62 @@ class Trainer:
             energy_mae_avg_sum += F.l1_loss(E_avg_pred, target_energy_avg, reduction='sum').item()
             force_mae_sum += F.l1_loss(f_pred.view(-1), force_ref_scaled.view(-1), reduction='sum').item()
 
+            if compute_stress:
+                num_stress_elements = int(stress_ref.numel())
+                s_loss = self.criterion(stress_pred.view(-1), stress_ref.view(-1))
+                stress_loss_sum += s_loss.item() * num_stress_elements
+                stress_count += num_stress_elements
+                stress_mse_sum += F.mse_loss(stress_pred.view(-1), stress_ref.view(-1), reduction='sum').item()
+                stress_mae_sum += F.l1_loss(stress_pred.view(-1), stress_ref.view(-1), reduction='sum').item()
+
         # Sync metrics across processes
         if self.distributed:
             stats = torch.tensor([
-                energy_loss_sum, force_loss_sum, energy_count, force_count,
-                energy_mse_sum, energy_mse_avg_sum, force_mse_sum,
-                energy_mae_sum, energy_mae_avg_sum, force_mae_sum
+                energy_loss_sum, force_loss_sum, stress_loss_sum,
+                energy_count, force_count, stress_count,
+                energy_mse_sum, energy_mse_avg_sum, force_mse_sum, stress_mse_sum,
+                energy_mae_sum, energy_mae_avg_sum, force_mae_sum, stress_mae_sum,
             ], dtype=torch.float64, device=self.device)
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
             (
-                energy_loss_sum, force_loss_sum, energy_count, force_count,
-                energy_mse_sum, energy_mse_avg_sum, force_mse_sum,
-                energy_mae_sum, energy_mae_avg_sum, force_mae_sum
+                energy_loss_sum, force_loss_sum, stress_loss_sum,
+                energy_count, force_count, stress_count,
+                energy_mse_sum, energy_mse_avg_sum, force_mse_sum, stress_mse_sum,
+                energy_mae_sum, energy_mae_avg_sum, force_mae_sum, stress_mae_sum,
             ) = stats.tolist()
 
         energy_loss_avg = energy_loss_sum / max(1, energy_count)
         force_loss_avg = force_loss_sum / max(1, force_count)
+        stress_loss_avg = stress_loss_sum / max(1, stress_count)
 
         energy_rmse = np.sqrt(energy_mse_sum / max(1, energy_count))
         energy_rmse_avg = np.sqrt(energy_mse_avg_sum / max(1, energy_count))
         force_rmse = np.sqrt(force_mse_sum / max(1, force_count))
+        stress_rmse = np.sqrt(stress_mse_sum / max(1, stress_count))
         energy_mae = energy_mae_sum / max(1, energy_count)
         energy_mae_avg = energy_mae_avg_sum / max(1, energy_count)
         force_mae = force_mae_sum / max(1, force_count)
+        stress_mae = stress_mae_sum / max(1, stress_count)
 
         energy_rmse = self.train_dataset.restore_energy(energy_rmse)
         energy_rmse_avg = self.train_dataset.restore_energy(energy_rmse_avg)
         energy_mae = self.train_dataset.restore_energy(energy_mae)
         energy_mae_avg = self.train_dataset.restore_energy(energy_mae_avg)
         
-        # Restore force units for consistency (even though force was already restored in loop)
         force_rmse = self.train_dataset.restore_force(force_rmse)
         force_mae = self.train_dataset.restore_force(force_mae)
 
-        train_total_loss = self.a * energy_loss_avg + self.b * force_loss_avg
+        train_total_loss = self.a * energy_loss_avg + self.b * force_loss_avg + self.c * stress_loss_avg
 
         if self.is_main_process:
             eval_type = "Sampled" if use_sampling else "Full"
             sample_info = f" ({self.train_eval_sample_ratio*100:.1f}% sampled)" if use_sampling else ""
+            stress_log = f" | Train Stress Loss: {stress_loss_avg:.6f}" if self.c > 0 else ""
             logging.info(
                 f"{eval_type} Train Evaluation Done{sample_info} - "
-                f"Train Loss (a*E+b*F): {train_total_loss:.6f} | "
+                f"Train Loss (a*E+b*F+c*S): {train_total_loss:.6f} | "
                 f"Train Energy Loss: {energy_loss_avg:.6f} | "
-                f"Train Force Loss: {force_loss_avg:.6f}"
+                f"Train Force Loss: {force_loss_avg:.6f}{stress_log}"
             )
 
         # Restore training mode
@@ -1343,12 +1647,15 @@ class Trainer:
             'train_total_loss': train_total_loss,
             'train_energy_loss': energy_loss_avg,
             'train_force_loss': force_loss_avg,
+            'train_stress_loss': stress_loss_avg,
             'train_energy_rmse': energy_rmse,
             'train_energy_rmse_avg': energy_rmse_avg,
             'train_energy_mae': energy_mae,
             'train_energy_mae_avg': energy_mae_avg,
             'train_force_rmse': force_rmse,
             'train_force_mae': force_mae,
+            'train_stress_rmse': stress_rmse,
+            'train_stress_mae': stress_mae,
         }
     
     def run_training(self):
@@ -1427,6 +1734,7 @@ class Trainer:
                     'e3trans_state_dict': e3trans_state_dict,
                     'a': self.a,
                     'b': self.b,
+                    'c': self.c,
                     'batch_count': self.batch_count,
                     'best_val_loss': self.best_val_loss,
                     'patience_counter': self.patience_counter,

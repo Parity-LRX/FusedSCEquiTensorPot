@@ -63,6 +63,7 @@ mff-preprocess \
 - `raw_energy_train.h5`, `raw_energy_val.h5` - 原始能量
 - `correction_energy_train.h5`, `correction_energy_val.h5` - 校正能量
 - `cell_train.h5`, `cell_val.h5` - 晶胞信息
+- `stress_train.h5`, `stress_val.h5` - 应力张量（当 XYZ 含 stress/virial 时；否则为零矩阵）
 - `processed_train.h5`, `processed_val.h5` - 预处理后的数据（如果使用--preprocess-h5）
 - `fitted_E0.csv` - 拟合的原子基准能量（默认：从训练集用最小二乘拟合得到）
 
@@ -99,6 +100,14 @@ mff-train \
     --dtype float64 \
     --num-workers 8 \
     --max-radius 5.0
+```
+
+**应力训练**（可选，用于周期性体系）：
+若 XYZ 含 stress/virial 且为 PBC 体系，可启用应力损失：
+```bash
+mff-train \
+    --data-dir data \
+    --stress-weight 0.1
 ```
 
 **自定义原子能量（E0）**（可选）：
@@ -186,7 +195,7 @@ mff-train \
 - `--no-save-val-csv`: 禁用保存验证CSV文件（与`--save-val-csv`互斥）。用于减少I/O开销
 
 **早停参数：**
-- `--patience`: 早停耐心值（默认20，单位：epoch）。如果连续N个epoch的验证损失（能量损失+力损失，未加权）没有改善，训练会自动停止。注意：早停使用的是未加权的验证损失，而不是加权损失（`a × 能量损失 + b × 力损失`）
+- `--patience`: 早停耐心值（默认20，单位：epoch）。如果连续N个epoch的验证损失（能量损失+力损失+应力损失，未加权）没有改善，训练会自动停止。注意：早停使用的是未加权的验证损失，而不是加权损失（`a × 能量损失 + b × 力损失 + c × 应力损失`）
 
 **学习率参数：**
 - `--learning-rate`: 目标学习率（默认1e-3）。这是预热后的学习率，也是训练过程中的主要学习率
@@ -197,8 +206,11 @@ mff-train \
 - `--lr-decay-factor`: 学习率衰减因子（默认0.98）。每次衰减时学习率乘以该值（0.98表示减少2%）。学习率调度策略：如果验证损失在`lr-decay-patience`个batch内没有改善，学习率会乘以此因子
 
 **损失权重参数：**
-- `--energy-weight` (或 `-a`): 能量损失的初始权重（默认1.0）。总损失 = `a × 能量损失 + b × 受力损失`。训练过程中，`a`会根据`--weight-a-growth`自动增长
+- `--energy-weight` (或 `-a`): 能量损失的初始权重（默认1.0）。总损失 = `a × 能量损失 + b × 受力损失 + c × 应力损失`。训练过程中，`a`会根据`--weight-a-growth`自动增长
 - `--force-weight` (或 `-b`): 受力损失的初始权重（默认10.0）。通常受力损失需要更大的权重，因为力的数量远多于能量（每个原子有3个力分量）。训练过程中，`b`会根据`--weight-b-decay`自动衰减
+- `--stress-weight` (或 `-c`): 应力损失的权重（默认0.0，即禁用）。设为 > 0 时启用应力训练，通过晶胞应变导数计算应力（σ = (1/V) × dE/dε）。**需要**训练 XYZ 文件中包含 stress 或 virial 数据，且为周期性体系（PBC）。应力单位：eV/Å³
+- `--c-min`: 应力权重 `c` 的最小值（默认0.0）
+- `--c-max`: 应力权重 `c` 的最大值（默认1000.0）
 - `--update-param`: 自动调整权重 `a` 和 `b` 的频率（每N个batch，默认1000）。每N个batch会根据 `--weight-a-growth` 和 `--weight-b-decay` 调整权重。调整公式：`a = a × weight_a_growth`，`b = b × weight_b_decay`
 - `--weight-a-growth`: 能量权重 `a` 的增长率（默认1.05，即每次增长5%）。建议值：1.005（慢速，适合超长时间训练）、1.01（中速，更稳定）、1.02（快速）、1.05（超快速）
 - `--weight-b-decay`: 受力权重 `b` 的衰减率（默认0.98，即每次减少2%）。建议值：0.995（慢速）、0.99（中速，更稳定）、0.98（快速）
@@ -289,7 +301,7 @@ mff-train \
 
 **日志和记录文件（保存在当前目录）：**
 - `training_YYYYMMDD_HHMMSS.log` - 训练日志（包含详细的batch级别信息，使用RotatingFileHandler，每个文件最大1GB，保留5个备份）
-- `loss.csv` - 损失记录（包含每个验证点的训练和验证指标，如loss、RMSE、MAE等）
+- `loss.csv` - 损失记录（包含每个验证点的训练和验证指标，如 loss、RMSE、MAE 等；启用应力训练时还包含 stress_loss、stress_rmse、stress_mae）
 
 ### 步骤 3: 评估模型
 
@@ -445,7 +457,7 @@ mff-evaluate \
 2. **摩擦系数**：0.01 是常用值。更小的值（0.001-0.005）适合长时间模拟，更大的值（0.05-0.1）适合快速平衡
 3. **预优化**：建议对初始结构进行优化，除非结构已经优化过
 4. **周期性边界条件**：如果输入结构包含晶胞信息，会自动使用 PBC
-5. **能量单位**：所有能量以 eV 为单位，力以 eV/Å 为单位
+5. **能量单位**：所有能量以 eV 为单位，力以 eV/Å 为单位，应力以 eV/Å³ 为单位
 
 #### 3.3 NEB（Nudged Elastic Band）计算
 
@@ -821,8 +833,8 @@ from molecular_force_field.data.preprocessing import (
     save_to_h5_parallel
 )
 
-# 提取数据块（支持解析 energy / pbc / Lattice / Properties）
-all_blocks, all_energy, all_raw_energy, all_cells, all_pbcs = extract_data_blocks('data.xyz')
+# 提取数据块（支持解析 energy / pbc / Lattice / Properties / stress / virial）
+all_blocks, all_energy, all_raw_energy, all_cells, all_pbcs, all_stresses = extract_data_blocks('data.xyz')
 
 # 拟合基准能量
 keys = np.array([1, 6, 7, 8], dtype=np.int64)
@@ -834,8 +846,8 @@ fitted_values = fit_baseline_energies(
 # 计算校正能量
 train_correction = compute_correction(train_blocks, train_raw_E, keys, fitted_values)
 
-# 保存数据（包含 pbc 信息）
-save_set('train', train_indices, train_blocks, train_raw_E, train_correction, all_cells, pbc_list=all_pbcs)
+# 保存数据（包含 pbc 和 stress 信息）
+save_set('train', train_indices, train_blocks, train_raw_E, train_correction, all_cells, pbc_list=all_pbcs, stress_list=all_stresses)
 
 # 预处理H5文件（预计算邻居列表）
 save_to_h5_parallel('train', max_radius=5.0, num_workers=8)
@@ -1189,6 +1201,104 @@ print(f"  Reaction energy:   {e_final - e_initial:.4f} eV")
 print("=" * 60)
 ```
 
+### 示例 5b: 使用 LAMMPS ML-IAP unified 接口
+
+ML-IAP unified 是 LAMMPS 的机器学习势接口，相比 `fix external` 方式速度更快（约 1.7x），且支持 GPU 加速。使用前需将 checkpoint 导出为 ML-IAP 格式。
+
+**模型限制**：仅以下四种模型支持 ML-IAP（因其支持 `precomputed_edge_vec`）：`e3nn_layers`、`e3nn_layers_channelwise`、`pure_cartesian_ictd_layers`、`pure_cartesian_ictd_layers_full`。其他模型（如 pure-cartesian、pure-cartesian-sparse）暂不支持。
+
+**步骤 1：导出模型**
+
+```bash
+python -m molecular_force_field.cli.export_mliap your_checkpoint.pth \
+    --elements H O \
+    --atomic-energy-keys 1 8 \
+    --atomic-energy-values -13.6 -75.0 \
+    --max-radius 5.0 \
+    --output model-mliap.pt
+```
+
+**步骤 2：在 Python 中驱动 LAMMPS**
+
+```python
+import torch
+import lammps
+from lammps.mliap import activate_mliappy, load_unified
+
+# 启动 LAMMPS 并激活 ML-IAP Python 模块
+lmp = lammps.lammps()
+activate_mliappy(lmp)
+
+# 加载导出的模型
+model = torch.load("model-mliap.pt", weights_only=False)
+load_unified(model)
+
+# 设置 LAMMPS 输入
+lmp.commands_string("""
+units metal
+atom_style atomic
+read_data your_system.data
+pair_style mliap unified model-mliap.pt 0
+pair_coeff * * H O
+velocity all create 300 12345
+fix 1 all nve
+thermo 100
+run 1000
+""")
+lmp.close()
+```
+
+**步骤 3：纯 LAMMPS 输入文件方式**
+
+创建 `run.py`：
+
+```python
+import torch
+import lammps
+from lammps.mliap import activate_mliappy, load_unified
+
+lmp = lammps.lammps()
+activate_mliappy(lmp)
+model = torch.load("model-mliap.pt", weights_only=False)
+load_unified(model)
+lmp.file("input.lammps")
+lmp.close()
+```
+
+`input.lammps` 内容示例：
+
+```
+units metal
+atom_style atomic
+read_data system.data
+
+pair_style mliap unified model-mliap.pt 0
+pair_coeff * * H O
+
+velocity all create 300 12345
+fix 1 all nvt temp 300 300 0.1
+thermo 100
+dump 1 all xyz 100 traj.xyz
+run 10000
+```
+
+运行：
+
+```bash
+export DYLD_LIBRARY_PATH="$HOME/.local/lib:/opt/homebrew/opt/python@3.12/Frameworks/Python.framework/Versions/3.12/lib"
+python run.py
+```
+
+**注意事项：**
+
+- `pair_coeff * * H O` 中元素顺序必须与导出时 `--elements H O` 一致
+- `pair_style mliap unified model.pt 0` 末尾的 `0` 表示不包含 ghost 邻居；若模型有多层消息传递，可改为 `1`
+- 使用 `units metal`（eV, Angstrom），与模型内部单位一致
+- macOS 上需设置 `DYLD_LIBRARY_PATH` 指向 LAMMPS 和 Python 共享库
+- LAMMPS 需编译时开启 `PKG_ML-IAP=ON`、`MLIAP_ENABLE_PYTHON=ON`，详见 `molecular_force_field/docs/INSTALL_LAMMPS_PYTHON.md`
+
+**Kokkos GPU 加速**：若 LAMMPS 已用 Kokkos+CUDA 编译，可直接运行 `lmp -k on g 1 -sf kk -pk kokkos newton on neigh half -in input.lammps`；Python 驱动时改用 `activate_mliappy_kokkos(lmp)`。详见 `LAMMPS_INTERFACE.md`。
+
 ### 示例 6: 声子谱计算（Hessian 和频率）
 
 ```python
@@ -1327,7 +1437,7 @@ mff-evaluate --help
 - ✅ Epoch 数（从中断的 epoch 继续）
 - ✅ Batch count（累计的 batch 数）
 - ✅ 损失权重 `a` 和 `b`
-- ✅ 最佳验证损失（用于早停判断，基于 `a × 能量损失 + b × 受力损失`）
+- ✅ 最佳验证损失（用于早停判断，基于 `a × 能量损失 + b × 受力损失 + c × 应力损失`）
 - ✅ 早停计数器（patience counter）
 
 **使用示例：**
@@ -1524,11 +1634,11 @@ mff-train \
 
 ### Q: 如何调整损失权重？
 
-损失函数为：`总损失 = a × 能量损失 + b × 受力损失`
+损失函数为：`总损失 = a × 能量损失 + b × 受力损失 + c × 应力损失`（当 `-c > 0` 时包含应力项）
 
 **初始权重设置：**
 ```bash
-# 默认设置（能量权重1.0，受力权重10.0）
+# 默认设置（能量权重1.0，受力权重10.0，应力权重0即禁用）
 mff-train -a 1.0 -b 10.0
 
 # 更重视能量（如果能量预测较差）
@@ -1536,6 +1646,9 @@ mff-train -a 2.0 -b 5.0
 
 # 更重视受力（如果受力预测较差）
 mff-train -a 0.5 -b 20.0
+
+# 启用应力训练（需要 XYZ 含 stress/virial，且为 PBC 体系）
+mff-train -a 1.0 -b 10.0 -c 0.1
 ```
 
 **自动调整权重：**
@@ -1562,7 +1675,7 @@ mff-train -a 1.0 -b 10.0 --weight-a-growth 1.02 --weight-b-decay 0.98
 mff-train -a 1.0 -b 10.0 --weight-a-growth 1.05 --weight-b-decay 0.98
 ```
 
-自动调整规则：每`--update-param`个batch，`a`会乘以`--weight-a-growth`（增加），`b`会乘以`--weight-b-decay`（减少），以逐渐平衡能量和受力的重要性。**注意：`a` 和 `b` 默认会被限制在 [1, 1000]，以防训练过长导致权重漂移过大。**
+自动调整规则：每`--update-param`个batch，`a`会乘以`--weight-a-growth`（增加），`b`会乘以`--weight-b-decay`（减少），以逐渐平衡能量和受力的重要性。**注意：`a` 和 `b` 默认会被限制在 [1, 1000]，以防训练过长导致权重漂移过大。** 应力权重 `c` 可通过 `--c-min` 和 `--c-max` 限制范围。
 
 **可选：为 a / b 设置范围（Clamp）**（适合长训练防止权重漂移过大）：
 ```bash
@@ -1578,6 +1691,21 @@ mff-train \
 - **中速 (1.01/0.99)**: 适合大多数训练场景（50k-200k batches），平衡稳定性和调整速度
 - **快速 (1.02/0.98)**: 适合短期训练（<50k batches），快速调整权重，但可能导致训练后期不稳定
 - **默认 (1.05/0.98)**: 调整更激进，收敛更快但更容易不稳定；如果出现震荡，建议改用中速或慢速
+
+### Q: 如何进行应力训练？
+
+应力训练用于周期性体系（PBC），通过晶胞应变导数计算应力 σ = (1/V) × dE/dε，与参考应力做 MSE 作为 stress_loss。
+
+**前提条件：**
+1. XYZ 文件为周期性体系（含 `pbc="T T T"` 和 `Lattice="..."`）
+2. XYZ comment 行含 stress 或 virial，例如：`stress="0.01 0 0 0 0.01 0 0 0 0.01"`（9 个 3×3 分量，eV/Å³）
+
+**启用应力训练：**
+```bash
+mff-train -a 1.0 -b 10.0 -c 0.1 --input-file pbc_with_stress.xyz
+```
+
+**权重建议：** 应力分量少（每结构 9 个），通常 `-c` 取 0.01～0.5。若应力预测偏差大，可适当增大 `-c`。
 
 ### Q: 如何调整优化器参数？
 
@@ -1648,6 +1776,10 @@ mff-train --dump-frequency 500
 - 力 (Fx, Fy, Fz)
 - 能量信息（在Properties行中）
 - 晶胞信息（在Lattice属性中，可选）
+- **应力/维里张量**（可选，用于周期性体系的应力训练）：在 comment 行中支持以下格式：
+  - `stress="xx yy zz yz xz xy"` — 6 个 Voigt 分量 (eV/Å³)
+  - `stress="xx xy xz yx yy yz zx zy zz"` — 9 个 3×3 分量，行优先 (eV/Å³)
+  - `virial="xx xy xz yx yy yz zx zy zz"` — 9 个维里分量 (eV)，会自动转换为 stress = -virial/V
 
 ### Q: 如何使用多卡并行训练？
 
@@ -1879,8 +2011,8 @@ mff-train \
 
 **日志文件：**
 - `training_YYYYMMDD_HHMMSS.log` - 包含所有详细信息
-  - Batch级别的训练指标（每N个batch，由`--energy-log-frequency`控制）
-  - 验证时的详细结果（包括每个batch的能量预测，无论`--log-val-batch-energy`设置如何）
+  - Batch级别的训练指标（每N个batch，由`--energy-log-frequency`控制；启用应力训练时还会输出 Stress Loss）
+  - 验证时的详细结果（包括每个batch的能量预测，无论`--log-val-batch-energy`设置如何；启用应力训练时包含 Val Stress Loss/RMSE/MAE）
   - 梯度统计信息（每N个batch，由`--grad-log-interval`控制）
 
 **CSV文件：**
@@ -2021,15 +2153,15 @@ mff-train \
    - 使用 `--dtype float32` 而不是 `float64`
    - 减小 `--max-radius`（减少邻居数量）
 
-3. **数据格式**: 确保XYZ文件格式正确，特别是能量和力的单位。能量通常以eV为单位，力以eV/Å为单位。
+3. **数据格式**: 确保XYZ文件格式正确，特别是能量、力和应力的单位。能量以 eV 为单位，力以 eV/Å 为单位，应力以 eV/Å³ 为单位。
 
 4. **检查点**: 训练过程中会定期保存检查点（频率由`--dump-frequency`控制），建议定期备份。最终模型会保存在`--checkpoint`指定的路径。
 
 5. **日志**: 训练日志保存在 `training_*.log` 文件中，包含详细的训练信息。控制台只显示验证结果和重要信息，详细日志请查看日志文件。验证阶段每个batch的能量预测默认只记录到日志文件，如需在控制台显示，请使用 `--log-val-batch-energy` 参数。
 
-6. **早停**: 如果**加权验证损失**（`a × 能量损失 + b × 受力损失`）连续`--patience`个epoch没有改善，训练会自动停止。这可以防止过拟合并节省时间。早停依据与训练时的总损失保持一致。
+6. **早停**: 如果**加权验证损失**（`a × 能量损失 + b × 受力损失 + c × 应力损失`）连续`--patience`个epoch没有改善，训练会自动停止。这可以防止过拟合并节省时间。早停依据与训练时的总损失保持一致。
 
-7. **权重自动调整**: `a`和`b`会在训练过程中自动调整（每`--update-param`个batch）。`a`会乘以`--weight-a-growth`（默认1.05，即增长5%），`b`会乘以`--weight-b-decay`（默认0.98，即减少2%），以平衡能量和受力的重要性。如果训练不稳定，可以：
+7. **权重自动调整**: `a`和`b`会在训练过程中自动调整（每`--update-param`个batch）。`a`会乘以`--weight-a-growth`（默认1.05，即增长5%），`b`会乘以`--weight-b-decay`（默认0.98，即减少2%），以平衡能量和受力的重要性。若启用应力训练（`-c > 0`），`c`参与总损失计算。如果训练不稳定，可以：
    - 增大`--update-param`（减少调整频率）
    - 使用更慢的调整速率（`--weight-a-growth 1.005 --weight-b-decay 0.995`）
    - 固定权重（设置`--update-param`为一个很大的值，如1000000）
