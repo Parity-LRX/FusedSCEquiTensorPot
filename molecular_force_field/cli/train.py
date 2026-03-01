@@ -215,6 +215,10 @@ def setup_logging():
     root_logger.addHandler(console_handler)
     root_logger.addHandler(file_handler)
 
+    # Suppress cuequivariance DEBUG logs (TensorProductUniform3x1d etc.) during training
+    for name in ("cuequivariance", "cuequivariance_torch"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
 
 def main():
     """Main training function."""
@@ -514,6 +518,12 @@ def main():
         local_rank = args.local_rank
         
         if torch.cuda.is_available():
+            n = torch.cuda.device_count()
+            if local_rank >= n:
+                raise RuntimeError(
+                    f"LOCAL_RANK={local_rank} but only {n} GPU(s) available. "
+                    f"Use fewer processes (e.g. torchrun --nproc_per_node={n}) or set CUDA_VISIBLE_DEVICES."
+                )
             device = torch.device(f'cuda:{local_rank}')
             torch.cuda.set_device(device)
         else:
@@ -558,6 +568,16 @@ def main():
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             device = torch.device(args.device)
+            # Validate CUDA device ordinal to avoid "invalid device ordinal"
+            if device.type == "cuda":
+                n = torch.cuda.device_count()
+                idx = device.index if device.index is not None else 0
+                if n == 0:
+                    logging.warning("CUDA requested but no GPU available; falling back to CPU")
+                    device = torch.device("cpu")
+                elif idx >= n:
+                    logging.warning(f"CUDA device {idx} does not exist (only {n} GPU(s)); using cuda:0")
+                    device = torch.device("cuda:0")
         
         logging.info(f"Using device: {device}")
         logging.info(f"Data directory: {args.data_dir}")

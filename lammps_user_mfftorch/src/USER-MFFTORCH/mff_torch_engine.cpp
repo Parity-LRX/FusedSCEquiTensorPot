@@ -1,23 +1,107 @@
 #include "mff_torch_engine.h"
 
+#include <c10/cuda/CUDAGuard.h>
+#include <cstdlib>
+#include <dlfcn.h>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
 namespace mfftorch {
 
+static int detect_local_gpu_index() {
+  // Try common MPI environment variables for local rank.
+  const char* env_vars[] = {
+    "OMPI_COMM_WORLD_LOCAL_RANK",  // OpenMPI
+    "MV2_COMM_WORLD_LOCAL_RANK",   // MVAPICH2
+    "MPI_LOCALRANKID",             // Intel MPI
+    "SLURM_LOCALID",               // SLURM
+    "LOCAL_RANK",                   // PyTorch convention
+    nullptr
+  };
+  for (const char** v = env_vars; *v; ++v) {
+    const char* val = std::getenv(*v);
+    if (val && val[0] != '\0') {
+      int rank = std::atoi(val);
+      int n_gpus = static_cast<int>(torch::cuda::device_count());
+      if (n_gpus > 0) return rank % n_gpus;
+    }
+  }
+  return 0;
+}
+
 static torch::Device pick_device(const std::string& device_str) {
+  if (device_str.rfind("cuda:", 0) == 0) {
+    int idx = std::atoi(device_str.c_str() + 5);
+    if (!torch::cuda::is_available()) {
+      throw std::runtime_error("requested " + device_str + " but CUDA is not available");
+    }
+    c10::cuda::set_device(idx);
+    return torch::Device(torch::kCUDA, idx);
+  }
   if (device_str == "cuda") {
     if (!torch::cuda::is_available()) {
       throw std::runtime_error("requested device=cuda but torch::cuda::is_available() is false");
     }
-    return torch::Device(torch::kCUDA);
+    int idx = detect_local_gpu_index();
+    c10::cuda::set_device(idx);
+    return torch::Device(torch::kCUDA, idx);
   }
   return torch::Device(torch::kCPU);
 }
 
+static void ensure_libpython() {
+  // CPython extension modules expect Python C API symbols (e.g. PyExc_ValueError)
+  // to be provided by the loading process. In a pure-C++ process like LAMMPS,
+  // we must dlopen libpython first with RTLD_GLOBAL so those symbols are available.
+  static bool done = false;
+  if (done) return;
+  done = true;
+
+  const char* env = std::getenv("MFF_LIBPYTHON");
+  if (env && env[0] != '\0') {
+    if (dlopen(env, RTLD_LAZY | RTLD_GLOBAL)) return;
+  }
+  // Auto-detect: try common libpython names (relies on LD_LIBRARY_PATH).
+  const char* names[] = {
+    "libpython3.12.so", "libpython3.11.so", "libpython3.10.so",
+    "libpython3.12.so.1.0", "libpython3.11.so.1.0", "libpython3.10.so.1.0",
+    "libpython3.so",
+    nullptr
+  };
+  for (const char** n = names; *n; ++n) {
+    if (dlopen(*n, RTLD_LAZY | RTLD_GLOBAL)) return;
+  }
+}
+
+static void load_custom_op_libs() {
+  const char* env = std::getenv("MFF_CUSTOM_OPS_LIB");
+  if (!env || env[0] == '\0') return;
+
+  ensure_libpython();
+
+  std::string paths(env);
+  std::string::size_type start = 0;
+  while (start < paths.size()) {
+    auto pos = paths.find(':', start);
+    std::string lib = (pos == std::string::npos)
+                          ? paths.substr(start)
+                          : paths.substr(start, pos - start);
+    start = (pos == std::string::npos) ? paths.size() : pos + 1;
+    if (lib.empty()) continue;
+    void* handle = dlopen(lib.c_str(), RTLD_LAZY | RTLD_GLOBAL);
+    if (!handle) {
+      throw std::runtime_error(
+          std::string("Failed to load custom ops library '") + lib + "': " + dlerror() +
+          "\nSet MFF_CUSTOM_OPS_LIB to the path of cuequivariance ops .so"
+          "\nIf 'undefined symbol: Py*', also set MFF_LIBPYTHON=/path/to/libpython3.XX.so");
+    }
+  }
+}
+
 void MFFTorchEngine::load_core(const std::string& core_pt_path, const std::string& device_str) {
   device_ = pick_device(device_str);
+  load_custom_op_libs();
   core_ = torch::jit::load(core_pt_path, device_);
   core_.eval();
 

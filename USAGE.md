@@ -1,7 +1,9 @@
 # 使用指南
 
-FusedSCEquiTensorPot 支持**六种等变张量积实现模式**，包括：
+FusedSCEquiTensorPot 支持**八种等变张量积实现模式**，包括：
 - `spherical`: 基于 e3nn 的球谐函数方法（默认）
+- `spherical-save`: channelwise edge conv（e3nn 后端，参数量更少）
+- `spherical-save-cue`: channelwise edge conv（cuEquivariance 后端，需可选依赖，GPU 加速）
 - `partial-cartesian`: 笛卡尔坐标 + e3nn CG 系数（严格等变，部分使用 e3nn）
 - `partial-cartesian-loose`: 近似等变（norm product 近似，部分使用 e3nn）
 - `pure-cartesian`: 纯笛卡尔 \(3^L\) 表示（严格等变，速度较慢，完全自实现）
@@ -30,7 +32,22 @@ pip install -e .
 mff-preprocess --help
 mff-train --help
 mff-evaluate --help
+mff-export-core --help   # LAMMPS LibTorch 导出
+mff-lammps --help        # LAMMPS fix external 接口
+python -m molecular_force_field.cli.export_mliap --help  # LAMMPS ML-IAP 导出
 ```
+
+### 3. LAMMPS 集成
+
+本框架支持三种 LAMMPS 集成方式，详见 [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md)：
+
+| 方式 | 速度 | 要求 | 适用场景 |
+|------|------|------|----------|
+| **USER-MFFTORCH（LibTorch 纯 C++）** | 最快，无 Python | LAMMPS 编译 KOKKOS + USER-MFFTORCH | HPC、超算、生产部署 |
+| **ML-IAP unified** | 较快（约 1.7x fix external） | LAMMPS 编译 ML-IAP | 推荐，支持 GPU |
+| **fix external / pair_style python** | 较慢 | 标准 LAMMPS + Python | 快速验证 |
+
+Python API 示例见[示例 5a：LAMMPS LibTorch 接口](#示例-5a-使用-lammps-libtorch-接口usermfftorchhpc-推荐)和[示例 5b：LAMMPS ML-IAP 接口](#示例-5b-使用-lammps-mliap-unified-接口)。
 
 ## 完整使用流程
 
@@ -246,13 +263,15 @@ mff-train \
   - `fourier`: 傅里叶基函数（适合周期性边界条件）
   - `cosine`: 余弦基函数
   - `smooth_finite`: 平滑有限支撑基函数
-- `--tensor-product-mode`: 等变张量积实现模式（默认'spherical'）。**本框架支持六种等变张量积模式**，选项：
+- `--tensor-product-mode`: 等变张量积实现模式（默认'spherical'）。**本框架支持八种等变张量积模式**，选项：
   - `spherical`: 使用 e3nn 球谐函数张量积（默认，精度高，标准实现，推荐用于大多数场景）
-  - `partial-cartesian`: 笛卡尔坐标 + e3nn CG 系数（严格等变，部分使用 e3nn 的 `wigner_3j` 和 `Irreps`，参数量减少 17.4%）
-  - `partial-cartesian-loose`: 近似等变张量积（使用 norm product 近似，部分使用 e3nn 的 `Irreps` 框架，速度较快，参数量减少 17.3%，但非严格等变）
-  - `pure-cartesian`: 纯笛卡尔张量积（\(3^L\) 表示，δ/ε 收缩，严格等变，速度极慢，参数量大，lmax≥4 时失败，主要用于研究）
-  - `pure-cartesian-sparse`: 稀疏纯笛卡尔张量积（严格等变，参数量减少 29.6%，速度稳定，需要设置`--max-rank-other`和`--k-policy`）
-  - `pure-cartesian-ictd`: ICTD irreps 内部表示（严格等变，参数量最少减少 72.1%，速度最快，CPU: 最高 4.12x，GPU: 最高 2.10x，推荐用于大规模训练）
+  - `spherical-save`: channelwise edge conv（e3nn 后端，参数量更少）
+  - `spherical-save-cue`: channelwise edge conv（cuEquivariance 后端，需 `pip install -e ".[cue]"`，GPU 加速）
+  - `partial-cartesian`: 笛卡尔坐标 + e3nn CG 系数（严格等变，参数量减少 17.4%）
+  - `partial-cartesian-loose`: 近似等变张量积（norm product 近似，速度较快，参数量减少 17.3%，非严格等变）
+  - `pure-cartesian`: 纯笛卡尔张量积（\(3^L\) 表示，严格等变，速度极慢，lmax≥4 时失败，不推荐）
+  - `pure-cartesian-sparse`: 稀疏纯笛卡尔张量积（严格等变，参数量减少 29.6%，需设置`--max-rank-other`和`--k-policy`）
+  - `pure-cartesian-ictd`: ICTD irreps 内部表示（严格等变，参数量最少减少 72.1%，速度最快，推荐用于大规模训练）
   
   详细性能对比和推荐场景见[张量积模式对比](#张量积模式对比)部分。
 
@@ -275,6 +294,12 @@ mff-train \
 - `--ema-decay`: EMA 衰减系数（默认 0.999，范围0-1）。越大越平滑，但响应越慢。典型值：0.999（非常平滑，推荐）、0.99（较快响应）
 - `--use-ema-for-validation`: 使用 EMA 模型进行验证（而非主模型）。如果启用，验证时会使用EMA权重进行前向传播，通常能获得更稳定的验证结果
 - `--save-ema-model`: 在 checkpoint 中保存 EMA 模型权重。如果启用，checkpoint会包含`e3trans_ema_state_dict`，可以从checkpoint恢复EMA模型
+
+**验证加速参数：**
+- `--compile-val`: 验证时对 e3trans 使用 `torch.compile`，`none`（默认）或 `e3trans`
+- `--compile-val-mode`: 编译模式，如 `reduce-overhead`、`max-autotune`
+- `--compile-val-fullgraph`: 强制完整图编译
+- `--compile-val-dynamic`: 动态形状
 
 **分布式训练参数：**
 - `--distributed`: 启用分布式训练（DDP模式）。需要配合`torchrun`或`torch.distributed.launch`使用。启用后，训练会自动使用多GPU并行
@@ -330,6 +355,8 @@ mff-evaluate \
 - `--output-prefix`: 输出文件前缀
 - `--use-h5`: 使用H5Dataset（如果已预处理），否则使用OnTheFlyDataset
 - `--batch-size`: 批次大小（默认1）
+- `--compile`: 推理加速，`none`（默认）或 `e3trans`（对 e3trans 层使用 `torch.compile`）
+- `--compile-mode`: 编译模式，如 `reduce-overhead`、`max-autotune`
 - `--max-atomvalue`: 必须与训练时相同
 - `--embedding-dim`: 必须与训练时相同
 - `--lmax`: 必须与训练时相同
@@ -1201,11 +1228,63 @@ print(f"  Reaction energy:   {e_final - e_initial:.4f} eV")
 print("=" * 60)
 ```
 
+### 示例 5a: 使用 LAMMPS LibTorch 接口（USER-MFFTORCH，HPC 推荐）
+
+**USER-MFFTORCH** 是自定义 LAMMPS 包，提供 `pair_style mff/torch`，在 C++ 侧用 LibTorch 加载 TorchScript 模型，**运行时完全不需要 Python**，适合超算与生产部署。
+
+**模型限制**：目前支持 `pure-cartesian-ictd` 系列和 `spherical-save-cue` 模型。元素顺序、cutoff 需与导出时一致。
+
+**步骤 1：导出 core.pt**（需 Python，一次性）：
+```bash
+mff-export-core \
+  --checkpoint model.pth \
+  --elements H O \
+  --device cuda \
+  --max-radius 5.0 \
+  --dtype float32 \
+  --embed-e0 \
+  --e0-csv fitted_E0.csv \
+  --out core.pt
+```
+
+**步骤 2：编译 LAMMPS**：启用 `PKG_KOKKOS`、`PKG_USER-MFFTORCH`，详见 [lammps_user_mfftorch/docs/BUILD_AND_RUN.md](lammps_user_mfftorch/docs/BUILD_AND_RUN.md)。
+
+**步骤 3：运行 LAMMPS**（纯 LAMMPS，无 Python）：
+```bash
+# 设置 LibTorch 动态库路径
+export LD_LIBRARY_PATH="$(python -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))'):$LD_LIBRARY_PATH"
+
+# 使用 Kokkos GPU 运行
+lmp -k on g 1 -sf kk -pk kokkos newton off neigh full -in in.mfftorch
+```
+
+**LAMMPS 输入示例**（`in.mfftorch`）：
+```lammps
+units metal
+atom_style atomic
+boundary p p p
+
+read_data system.data
+
+neighbor 1.0 bin
+pair_style mff/torch 5.0 cuda
+pair_coeff * * /path/to/core.pt H O
+
+velocity all create 300 42
+fix 1 all nve
+thermo 20
+run 200
+```
+
+**spherical-save-cue 导出说明**：默认导出为纯 PyTorch 实现（`force_naive`），`core.pt` 不依赖 cuEquivariance 自定义 ops，可在任意 LibTorch 环境运行。
+
+完整说明见 [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md)。
+
 ### 示例 5b: 使用 LAMMPS ML-IAP unified 接口
 
 ML-IAP unified 是 LAMMPS 的机器学习势接口，相比 `fix external` 方式速度更快（约 1.7x），且支持 GPU 加速。使用前需将 checkpoint 导出为 ML-IAP 格式。
 
-**模型限制**：仅以下四种模型支持 ML-IAP（因其支持 `precomputed_edge_vec`）：`e3nn_layers`、`e3nn_layers_channelwise`、`pure_cartesian_ictd_layers`、`pure_cartesian_ictd_layers_full`。其他模型（如 pure-cartesian、pure-cartesian-sparse）暂不支持。
+**模型限制**：仅以下五种模型支持 ML-IAP（因其支持 `precomputed_edge_vec`）：`e3nn_layers`、`e3nn_layers_channelwise`、`cue_layers_channelwise`（spherical-save-cue）、`pure_cartesian_ictd_layers`、`pure_cartesian_ictd_layers_full`。其他模型（如 pure-cartesian、pure-cartesian-sparse）暂不支持。
 
 **步骤 1：导出模型**
 
@@ -1298,6 +1377,23 @@ python run.py
 - LAMMPS 需编译时开启 `PKG_ML-IAP=ON`、`MLIAP_ENABLE_PYTHON=ON`，详见 `molecular_force_field/docs/INSTALL_LAMMPS_PYTHON.md`
 
 **Kokkos GPU 加速**：若 LAMMPS 已用 Kokkos+CUDA 编译，可直接运行 `lmp -k on g 1 -sf kk -pk kokkos newton on neigh half -in input.lammps`；Python 驱动时改用 `activate_mliappy_kokkos(lmp)`。详见 `LAMMPS_INTERFACE.md`。
+
+### 示例 5c: 大体系多 GPU 推理（inference_ddp）
+
+对于超大规模体系（如 10 万原子以上），可使用 DDP 推理进行多 GPU 并行计算。**仅支持 `pure-cartesian-ictd` 模式**。当前版本使用随机图进行测试；实际结构需在代码中接入。
+
+```bash
+torchrun --nproc_per_node=2 -m molecular_force_field.cli.inference_ddp \
+  --checkpoint model.pth \
+  --atoms 100000 \
+  --forces
+```
+
+**参数说明**：
+- `--atoms`: 原子数（用于生成随机测试图，默认 50000）
+- `--checkpoint`: 模型检查点路径
+- `--forces`: 同时计算并输出力
+- `--partition`: 图分区策略，`modulo`（默认）或 `spatial`
 
 ### 示例 6: 声子谱计算（Hessian 和频率）
 
@@ -1426,7 +1522,33 @@ else:
 mff-preprocess --help
 mff-train --help
 mff-evaluate --help
+mff-export-core --help   # LAMMPS LibTorch 导出
+mff-lammps --help        # LAMMPS fix external 接口
+python -m molecular_force_field.cli.export_mliap --help  # LAMMPS ML-IAP 导出
 ```
+
+### Q: 如何使用 LAMMPS LibTorch 接口？
+
+LAMMPS LibTorch 接口（USER-MFFTORCH）通过 `pair_style mff/torch` 在 C++ 侧用 LibTorch 加载 TorchScript 模型，**运行时无需 Python**，适合 HPC 与生产部署。
+
+**快速步骤**：
+1. 导出：`mff-export-core --checkpoint model.pth --elements H O --max-radius 5.0 --embed-e0 --e0-csv fitted_E0.csv --out core.pt`
+2. 编译 LAMMPS：启用 `PKG_KOKKOS`、`PKG_USER-MFFTORCH`，见 [lammps_user_mfftorch/docs/BUILD_AND_RUN.md](lammps_user_mfftorch/docs/BUILD_AND_RUN.md)
+3. 运行：`lmp -k on g 1 -sf kk -pk kokkos newton off neigh full -in in.mfftorch`
+
+**支持模型**：`pure-cartesian-ictd` 系列、`spherical-save-cue`。完整说明见 [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md)。
+
+### Q: 如何导出 ML-IAP 格式？
+
+ML-IAP 用于 LAMMPS 的 `pair_style mliap unified`，比 fix external 更快且支持 Kokkos GPU：
+
+```bash
+python -m molecular_force_field.cli.export_mliap checkpoint.pth \
+  --elements H O --atomic-energy-keys 1 8 --atomic-energy-values -13.6 -75.0 \
+  --max-radius 5.0 --output model-mliap.pt
+```
+
+支持模型：`spherical`、`spherical-save`、`spherical-save-cue`、`pure-cartesian-ictd`、`pure-cartesian-ictd-save`。详见 [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md)。
 
 ### Q: 训练时如何恢复之前的检查点？
 
@@ -1938,6 +2060,11 @@ torchrun --nproc_per_node=4 \
     --batch-size 8
 ```
 
+**9. 验证阶段使用 torch.compile（可选）：**
+```bash
+mff-train --compile-val e3trans --data-dir data
+```
+
 ### Q: 应该选择哪种张量积模式？
 
 | 场景 | 推荐模式 | 原因 |
@@ -2173,14 +2300,16 @@ mff-train \
 
 ## 张量积模式对比
 
-**FusedSCEquiTensorPot 支持六种等变张量积实现模式**，每种模式在速度、参数量和等变性方面有不同的特点：
+**FusedSCEquiTensorPot 支持八种等变张量积实现模式**，每种模式在速度、参数量和等变性方面有不同的特点：
 
 1. **`spherical`**: 基于 e3nn 的球谐函数方法（默认，标准实现）
-2. **`partial-cartesian`**: 笛卡尔坐标 + e3nn CG 系数（严格等变，部分使用 e3nn 的 `wigner_3j` 和 `Irreps`）
-3. **`partial-cartesian-loose`**: 近似等变（norm product 近似，部分使用 e3nn 的 `Irreps` 框架）
-4. **`pure-cartesian`**: 纯笛卡尔 \(3^L\) 表示（严格等变，速度极慢，完全自实现）
-5. **`pure-cartesian-sparse`**: 稀疏纯笛卡尔（严格等变，参数量优化，完全自实现）
-6. **`pure-cartesian-ictd`**: ICTD irreps 内部表示（严格等变，速度最快，参数量最少，完全自实现）
+2. **`spherical-save`**: channelwise edge conv（e3nn 后端，参数量更少）
+3. **`spherical-save-cue`**: channelwise edge conv（cuEquivariance 后端，需可选依赖，GPU 加速）
+4. **`partial-cartesian`**: 笛卡尔坐标 + e3nn CG 系数（严格等变）
+5. **`partial-cartesian-loose`**: 近似等变（norm product 近似）
+6. **`pure-cartesian`**: 纯笛卡尔 \(3^L\) 表示（严格等变，速度极慢，不推荐）
+7. **`pure-cartesian-sparse`**: 稀疏纯笛卡尔（严格等变，参数量优化）
+8. **`pure-cartesian-ictd`**: ICTD irreps 内部表示（严格等变，速度最快，参数量最少）
 
 所有模式都保持 O(3) 等变性（包括旋转和反射）。以下是对比数据：
 

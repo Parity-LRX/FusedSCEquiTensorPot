@@ -149,7 +149,6 @@ def _radial_embedding(
     Produce a radial basis embedding (E, number_of_basis).
     This is a lightweight alternative to e3nn's `soft_one_hot_linspace`.
     """
-    E = r.numel()
     nb = int(number_of_basis)
     if nb <= 0:
         raise ValueError(f"number_of_basis must be > 0, got {number_of_basis}")
@@ -157,9 +156,8 @@ def _radial_embedding(
     if r_max <= 0:
         raise ValueError(f"r_max must be > 0, got {r_max}")
 
-    # Normalize radius to [0, 1]
-    x = (r / r_max).clamp(min=0.0, max=1.0)  # (E,)
-    idx = torch.arange(nb, device=r.device, dtype=r.dtype)  # (nb,)
+    x = (r / r_max).clamp(min=0.0, max=1.0)
+    idx = torch.arange(nb, device=r.device, dtype=r.dtype)
 
     ft = str(function_type)
     if ft == "gaussian":
@@ -167,29 +165,24 @@ def _radial_embedding(
         sigma = 1.0 / max(nb - 1, 1)
         emb = torch.exp(-0.5 * ((x[:, None] - centers[None, :]) / max(sigma, 1e-6)) ** 2)
     elif ft in ("fourier", "cosine"):
-        # Cosine/Fourier features on [0, 1]
         k = idx + 1.0
         emb = torch.cos(math.pi * k[None, :] * x[:, None])
     elif ft == "bessel":
-        # Simple sine basis; avoids singularity at r=0 with safe division.
         k = idx + 1.0
         t = math.pi * k[None, :] * x[:, None]
         emb = torch.sin(t) / torch.clamp(t, min=1e-6)
     elif ft == "smooth_finite":
-        # Polynomial bumps; not identical to e3nn, but smooth and finite.
         centers = idx / max(nb - 1, 1)
         d = (x[:, None] - centers[None, :]).abs()
         emb = (1.0 - d).clamp(min=0.0) ** 2 * (1.0 + 2.0 * d)
     else:
-        # Default to gaussian
         centers = idx / max(nb - 1, 1)
         sigma = 1.0 / max(nb - 1, 1)
         emb = torch.exp(-0.5 * ((x[:, None] - centers[None, :]) / max(sigma, 1e-6)) ** 2)
 
     emb = emb * (nb**0.5)
-    # Hard cutoff at r_max to keep continuity at the boundary.
     emb = emb * (r <= r_max).to(dtype=r.dtype)[:, None]
-    return emb.reshape(E, nb)
+    return emb.reshape(-1, nb)
 
 
 def _elementwise_tp_invariants(x1: torch.Tensor, x2: torch.Tensor, segs: Sequence[_IrrepSeg]) -> torch.Tensor:
@@ -242,6 +235,31 @@ def _elementwise_tp_invariants_ir_mul(x1: torch.Tensor, x2: torch.Tensor, segs: 
     return torch.cat(out_chunks, dim=-1) if out_chunks else x1.new_zeros((N, 0))
 
 
+class _PureTorchElementwiseTP(nn.Module):
+    """Pure-PyTorch replacement for cuet.EquivariantTensorProduct(..., filter=["0e"]).
+
+    Computes per-irrep scalar invariants in ir_mul layout via CG-normalized
+    dot products: for each segment (mul, l), output[u] = sum_m(x1[m,u]*x2[m,u]) / sqrt(2l+1).
+    The 1/sqrt(2l+1) factor matches the Clebsch-Gordan coefficient for (l,l)->0.
+    """
+
+    def __init__(self, segs: List[_IrrepSeg]):
+        super().__init__()
+        self._dims: List[Tuple[int, int]] = [(seg.mul, 2 * seg.l + 1) for seg in segs]
+
+    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        N = x1.size(0)
+        out_chunks: List[torch.Tensor] = []
+        offset = 0
+        for mul, d in self._dims:
+            width = mul * d
+            a = x1[:, offset : offset + width].reshape(N, d, mul)
+            b = x2[:, offset : offset + width].reshape(N, d, mul)
+            out_chunks.append((a * b).sum(dim=1) * (d ** -0.5))
+            offset += width
+        return torch.cat(out_chunks, dim=-1) if out_chunks else x1.new_zeros((N, 0))
+
+
 class _CueChannelwiseEdgeConv(nn.Module):
     """
     Core channelwise edge convolution in cuEquivariance:
@@ -261,11 +279,12 @@ class _CueChannelwiseEdgeConv(nn.Module):
         avg_num_neighbors: float | None = None,
         device=None,
         dtype=None,
+        force_naive: bool = False,
     ):
         super().__init__()
         cue, cuet, O3_e3nn = _require_cue()
         dev = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        is_cuda = (dev.type == "cuda")
+        use_fast = (dev.type == "cuda") and not force_naive
 
         self.r_max = float(r_max)
         self.number_of_basis = int(number_of_basis)
@@ -281,7 +300,6 @@ class _CueChannelwiseEdgeConv(nn.Module):
         self.irreps_node_output = cue.Irreps(O3_e3nn, self.irreps_node_output_str)
         self.irreps_edge_attrs = cue.Irreps(O3_e3nn, self.irreps_edge_attrs_str)
 
-        # Use cuEquivariance-preferred layout for performance
         layout = cue.ir_mul
 
         self.sh = cuet.SphericalHarmonics(
@@ -289,7 +307,7 @@ class _CueChannelwiseEdgeConv(nn.Module):
             normalize=True,
             device=device,
             math_dtype=dtype,
-            method="uniform_1d" if is_cuda else "naive",
+            method="uniform_1d" if use_fast else "naive",
         )
 
         self.linear_up = cuet.Linear(
@@ -299,10 +317,9 @@ class _CueChannelwiseEdgeConv(nn.Module):
             internal_weights=True,
             device=device,
             dtype=dtype,
-            method="fused_tp" if is_cuda else "naive",
+            method="fused_tp" if use_fast else "naive",
         )
 
-        # Keep only outputs that lie in the target (node output) irreps.
         filter_irreps_out = [ir for (_mul, ir) in self.irreps_node_output]  # type: ignore[assignment]
         self.conv_tp = cuet.ChannelWiseTensorProduct(
             self.irreps_node_output,
@@ -313,7 +330,7 @@ class _CueChannelwiseEdgeConv(nn.Module):
             layout=layout,
             device=device,
             dtype=dtype,
-            method="uniform_1d" if is_cuda else "naive",
+            method="uniform_1d" if use_fast else "naive",
         )
         self.irreps_mid = self.conv_tp.irreps_out
 
@@ -330,8 +347,10 @@ class _CueChannelwiseEdgeConv(nn.Module):
             internal_weights=True,
             device=device,
             dtype=dtype,
-            method="fused_tp" if is_cuda else "naive",
+            method="fused_tp" if use_fast else "naive",
         )
+
+        self._force_naive = force_naive
 
     def forward(
         self,
@@ -342,32 +361,37 @@ class _CueChannelwiseEdgeConv(nn.Module):
         receivers: torch.Tensor,  # (E,)
         num_nodes: int,
     ) -> torch.Tensor:
-        # Spherical harmonics (edge attrs)
-        edge_attrs = self.sh(edge_vec)  # (E, irreps_edge_attrs.dim)
+        edge_attrs = self.sh(edge_vec)
 
-        # Radial embedding -> per-edge TP weights
         emb = _radial_embedding(
             edge_length,
             r_max=self.r_max,
             number_of_basis=self.number_of_basis,
             function_type=self.function_type,
         )
-        w = self.conv_tp_weights(emb)  # (E, weight_numel)
+        w = self.conv_tp_weights(emb)
 
-        # Linear-up then channelwise TP + gather/scatter inside cuet
-        x = self.linear_up(node_feats)  # (N, dim_out)
-        msg = self.conv_tp(
-            x,
-            edge_attrs,
-            w,
-            indices_1=senders,
-            indices_out=receivers,
-            size_out=int(num_nodes),
-        )
+        x = self.linear_up(node_feats)
+
+        if self._force_naive:
+            # Decompose gather-TP-scatter so that torch.jit.trace keeps
+            # the output size dynamic (node_feats.size(0) is symbolic).
+            x_src = x[senders]
+            tp_edge = self.conv_tp(x_src, edge_attrs, w)
+            msg = node_feats.new_zeros(node_feats.size(0), tp_edge.size(1))
+            msg = msg.scatter_add(0, receivers.unsqueeze(1).expand_as(tp_edge), tp_edge)
+        else:
+            msg = self.conv_tp(
+                x, edge_attrs, w,
+                indices_1=senders,
+                indices_out=receivers,
+                size_out=int(num_nodes),
+            )
         msg = self.linear(msg)
 
-        # Normalize by avg_num_neighbors (global)
-        if self.avg_num_neighbors is None:
+        if self._force_naive:
+            avg = senders.size(0) / max(node_feats.size(0), 1)
+        elif self.avg_num_neighbors is None:
             avg = float(senders.numel()) / float(max(int(num_nodes), 1))
         else:
             avg = self.avg_num_neighbors
@@ -396,6 +420,7 @@ class E3Conv(nn.Module):
         avg_num_neighbors: float | None = None,
         device=None,
         dtype=None,
+        force_naive: bool = False,
         **_unused,
     ):
         super().__init__()
@@ -426,6 +451,7 @@ class E3Conv(nn.Module):
             avg_num_neighbors=avg_num_neighbors,
             device=device,
             dtype=default_dtype,
+            force_naive=force_naive,
         )
 
     def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell, *, precomputed_edge_vec=None):
@@ -440,7 +466,7 @@ class E3Conv(nn.Module):
 
         num_nodes = pos.size(0)
         atom_embeddings = self.atom_embedding(A.long())
-        node_scalars = self.fitnet1(atom_embeddings)  # (N, output_size)
+        node_scalars = self.fitnet1(atom_embeddings)
 
         return self.conv(
             node_feats=node_scalars,
@@ -448,7 +474,7 @@ class E3Conv(nn.Module):
             edge_length=edge_length,
             senders=edge_src,
             receivers=edge_dst,
-            num_nodes=int(num_nodes),
+            num_nodes=num_nodes,
         )
 
 
@@ -470,6 +496,7 @@ class E3Conv2(nn.Module):
         avg_num_neighbors: float | None = None,
         device=None,
         dtype=None,
+        force_naive: bool = False,
         **_unused,
     ):
         super().__init__()
@@ -488,6 +515,7 @@ class E3Conv2(nn.Module):
             avg_num_neighbors=avg_num_neighbors,
             device=device,
             dtype=default_dtype,
+            force_naive=force_naive,
         )
 
     def forward(self, f_in, pos, A, batch, edge_src, edge_dst, edge_shifts, cell, *, precomputed_edge_vec=None):
@@ -507,7 +535,7 @@ class E3Conv2(nn.Module):
             edge_length=edge_length,
             senders=edge_src,
             receivers=edge_dst,
-            num_nodes=int(num_nodes),
+            num_nodes=num_nodes,
         )
 
 
@@ -546,6 +574,7 @@ class E3_TransformerLayer_multi(nn.Module):
         device=None,
         function_type_main="gaussian",
         num_interaction=2,
+        force_naive: bool = False,
     ):
         super().__init__()
         cue, cuet, O3_e3nn = _require_cue()
@@ -563,7 +592,6 @@ class E3_TransformerLayer_multi(nn.Module):
         if self.num_interaction < 2:
             raise ValueError(f"num_interaction must be >= 2, got {self.num_interaction}")
 
-        # In original code, hidden_dim is overloaded to mean the radial MLP widths.
         emb_number = [64, 64, 64] if not isinstance(hidden_dim, list) else hidden_dim
 
         self.irreps_input_str = str(irreps_input)
@@ -584,6 +612,7 @@ class E3_TransformerLayer_multi(nn.Module):
                 function_type=function_type_main,
                 edge_attrs_lmax=2,
                 device=self.device,
+                force_naive=force_naive,
             )
         )
         for _ in range(1, self.num_interaction):
@@ -597,6 +626,7 @@ class E3_TransformerLayer_multi(nn.Module):
                     function_type=function_type_main,
                     edge_attrs_lmax=2,
                     device=self.device,
+                    force_naive=force_naive,
                 )
             )
 
@@ -642,8 +672,20 @@ class E3_TransformerLayer_multi(nn.Module):
         self.proj_total = MainNet(product_5_out_dim, embed_size, 17)
         self.weighted_sum = RobustScalarWeightedSum(17, init_weights="zero")
 
-    def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell, *, precomputed_edge_vec=None):
-        # Keep the same edge sorting behavior as the e3nn channelwise file.
+    def make_torchscript_portable(self) -> "E3_TransformerLayer_multi":
+        """Replace cuet.EquivariantTensorProduct modules (product_3 / product_5)
+        with pure-PyTorch equivalents so the traced graph contains no
+        cuEquivariance custom ops.  Call *before* ``torch.jit.trace``.
+        """
+        p3_segs = _scale_irreps(self._irreps_input_segs, self.num_interaction)
+        self.product_3 = _PureTorchElementwiseTP(p3_segs).to(self.device)
+
+        p3_out_segs = [_IrrepSeg(mul=s.mul, l=0, parity="e") for s in p3_segs]
+        p5_segs = p3_segs + p3_out_segs
+        self.product_5 = _PureTorchElementwiseTP(p5_segs).to(self.device)
+        return self
+
+    def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell, *, precomputed_edge_vec=None, sync_after_scatter=None):
         sort_idx = torch.argsort(edge_dst)
         edge_src = edge_src[sort_idx]
         edge_dst = edge_dst[sort_idx]

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-DDP 并行推理：单一大结构按节点划分到多 GPU，每层 scatter 后同步 ghost 节点特征。
+DDP parallel inference: partition a single large structure by nodes across GPUs; sync ghost node features after each scatter.
 
-适用场景：单结构原子数很大、单卡显存不够时，用多卡分摊显存与计算。
-限制：仅推理；不支持 LAMMPS 导出、不支持梯度。
+Use case: when a single structure has many atoms and single-GPU memory is insufficient, use multiple GPUs to share memory and compute.
+Limitations: inference only; no LAMMPS export, no gradients.
 
-用法（在项目根目录）:
+Usage (from project root):
   torchrun --nproc_per_node=2 -m molecular_force_field.cli.inference_ddp --atoms 100000
-  torchrun --nproc_per_node=2 -m molecular_force_field.cli.inference_ddp --atoms 50000 --forces   # 输出能量与力
+  torchrun --nproc_per_node=2 -m molecular_force_field.cli.inference_ddp --atoms 50000 --forces   # output energy and forces
 
-若遇 OpenMP SHM 错误，可先设置: export OMP_NUM_THREADS=1
+If OpenMP SHM error occurs, set: export OMP_NUM_THREADS=1
 """
 
 from __future__ import annotations
@@ -46,15 +46,15 @@ def partition_graph(
     partition_mode: str = "modulo",
 ):
     """
-    按节点 id % world_size 划分：rank r 拥有 node_id % world_size == r 的节点。
-    返回本 rank 的 owned_global、ghost_global（有序）、send_list、recv_list。
-    向量化实现，避免大图上的 Python 循环和 .cpu().numpy()。
+    Partition by node_id % world_size: rank r owns nodes with node_id % world_size == r.
+    Returns this rank's owned_global, ghost_global (sorted), send_list, recv_list.
+    Vectorized impl to avoid Python loops and .cpu().numpy() on large graphs.
     """
     dev = edge_dst.device
     if partition_mode == "modulo":
         node_owner = torch.arange(num_nodes, device=dev, dtype=torch.long) % world_size
     elif partition_mode == "spatial":
-        # 基于坐标主轴做 1D 空间分块，减少跨卡边与 ghost 节点。
+        # 1D spatial partitioning along principal axis to reduce cross-rank edges and ghost nodes.
         span = pos.max(dim=0).values - pos.min(dim=0).values
         axis = int(torch.argmax(span).item())
         coord = pos[:, axis]
@@ -65,7 +65,7 @@ def partition_graph(
     else:
         raise ValueError(f"Unknown partition_mode: {partition_mode}")
 
-    # 本 rank 拥有的边：owner(edge_dst) == rank
+    # Edges owned by this rank: owner(edge_dst) == rank
     mask = (node_owner[edge_dst] == rank)
     owned_global_t = torch.where(node_owner == rank)[0]
     owned_global = owned_global_t.cpu().tolist()
@@ -77,9 +77,9 @@ def partition_graph(
     ghost_global_t = unique_ghost[~owned_mask[unique_ghost]]
     ghost_global_t = torch.sort(ghost_global_t)[0]
     ghost_global = ghost_global_t.cpu().tolist()
-    # recv_list[r] = ghost 中由 r 拥有的
+    # recv_list[r] = ghosts owned by r
     recv_list = [ghost_global_t[node_owner[ghost_global_t] == r].cpu().tolist() for r in range(world_size)]
-    # send_list[s] = 本 rank 拥有的、且是 s 的 ghost 的全局 id
+    # send_list[s] = global ids of this rank's owned nodes that are ghosts for s
     send_list = []
     for s in range(world_size):
         if s == rank:
@@ -103,7 +103,7 @@ def build_local_graph(
     device: torch.device,
     dtype: torch.dtype,
 ):
-    """构建本地图：节点顺序 [owned | ghost]，边只保留 edge_dst in owned，并重映射为本地索引。向量化实现。"""
+    """Build local graph: node order [owned | ghost], keep only edges with edge_dst in owned, remap to local indices. Vectorized."""
     num_owned = len(owned_global)
     num_ghost = len(ghost_global)
     num_local = num_owned + num_ghost
@@ -150,11 +150,11 @@ def make_sync_after_scatter(
     device: torch.device,
 ):
     """
-    返回闭包 sync_after_scatter(node_features) -> node_features。
-    node_features: (num_owned + num_ghost, C)。scatter 后只有 owned 部分正确，ghost 需从其他 rank 收。
+    Return closure sync_after_scatter(node_features) -> node_features.
+    node_features: (num_owned + num_ghost, C). After scatter only owned is correct; ghost must be received from other ranks.
     """
-    # 本 rank 的 owned 在 local 索引 0..num_owned-1；ghost 在 num_owned..num_owned+num_ghost-1
-    # send_list[s] = 要发给 s 的全局 id；转成本地 owned 索引后可直接 gather。
+    # This rank's owned at local indices 0..num_owned-1; ghost at num_owned..num_owned+num_ghost-1
+    # send_list[s] = global ids to send to s; convert to local owned indices for gather.
     global_to_local_owned = {g: i for i, g in enumerate(owned_global)}
 
     send_indices = []  # send_indices[s] = local indices (owned) to send to s
@@ -165,13 +165,13 @@ def make_sync_after_scatter(
         send_indices.append([global_to_local_owned[g] for g in send_list[s]])
     send_counts = [len(send_indices[s]) for s in range(world_size)]
     recv_counts = [len(recv_list[r]) for r in range(world_size)]
-    # 预构建索引张量，避免每层 scatter 重复构建。
+    # Prebuild index tensors to avoid rebuilding per scatter layer.
     send_indices_t = [
         torch.tensor(send_indices[s], device=device, dtype=torch.long) if send_counts[s] > 0 else None
         for s in range(world_size)
     ]
 
-    # ghost 顺序固定为 concat(recv_list[0], recv_list[1], ...)，因此写回索引可直接预计算为连续块。
+    # Ghost order fixed as concat(recv_list[0], recv_list[1], ...); write-back indices precomputed as contiguous blocks.
     recv_local_indices_t = []
     ghost_offset = 0
     for r in range(world_size):
@@ -184,7 +184,7 @@ def make_sync_after_scatter(
         else:
             recv_local_indices_t.append(None)
 
-    # 以 feat_dim 为键缓存通信缓冲区，避免每层重复分配大张量。
+    # Cache comm buffers by feat_dim to avoid per-layer allocation of large tensors.
     buf_cache: dict[tuple[torch.dtype, int], tuple[torch.Tensor, torch.Tensor, list[int], list[int]]] = {}
 
     def sync_after_scatter(node_features: torch.Tensor) -> torch.Tensor:
@@ -231,7 +231,7 @@ def make_sync_after_scatter(
             group=None,
         )
 
-        # 写回 ghost 位置
+        # Write back to ghost positions
         ro = 0
         for r in range(world_size):
             if recv_counts[r] > 0:
@@ -246,7 +246,7 @@ def make_sync_after_scatter(
 
 
 class _SyncAfterScatterBackward(torch.autograd.Function):
-    """all_to_all 同步的可微封装：backward 时梯度按转置通信回写。"""
+    """Differentiable all_to_all sync wrapper: backward gradients communicated via transpose."""
 
     @staticmethod
     def forward(ctx, node_features, send_indices_flat, recv_ghost_local_flat, send_counts_elems, recv_counts_elems, device):
@@ -302,7 +302,7 @@ def make_sync_after_scatter_diff(
     owned_global: list[int],
     device: torch.device,
 ):
-    """可微 sync 闭包，用于需要算力时。"""
+    """Differentiable sync closure for when forces are needed."""
     global_to_local_owned = {g: i for i, g in enumerate(owned_global)}
     send_indices = [[global_to_local_owned[g] for g in send_list[s]] for s in range(world_size)]
     recv_counts = [len(recv_list[r]) for r in range(world_size)]
@@ -355,10 +355,10 @@ def run_ddp_step_from_graph(
     comm_timing: dict | None = None,
 ) -> tuple[float, torch.Tensor] | tuple[None, None]:
     """
-    所有 rank 用同一份图数据执行一步 DDP 推理（分区、前向、可选力）。
-    返回 (energy, forces) 仅 rank 0 有效；其他 rank 为 (None, None)。
-    若传 cache（dict），同一 (num_nodes, num_edges) 会复用分区与 sync，仅重算 build_local_graph。
-    若 comm_timing 非 None，在 rank 0 上记录 sync_ms（每次 sync_after_scatter）、all_reduce_energy_ms、all_reduce_forces_ms。
+    All ranks run one DDP inference step on same graph (partition, forward, optional forces).
+    Returns (energy, forces) valid only on rank 0; others get (None, None).
+    If cache (dict) passed, same (num_nodes, num_edges) reuses partition and sync; only build_local_graph recomputed.
+    If comm_timing not None, rank 0 records sync_ms (per sync_after_scatter), all_reduce_energy_ms, all_reduce_forces_ms.
     """
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -478,11 +478,11 @@ def run_one_ddp_inference_from_ase_atoms(
     cache: dict | None = None,
 ) -> tuple[float | None, torch.Tensor | None]:
     """
-    从 ASE Atoms 执行一步 DDP 推理。**所有 rank 都需调用**：
-    - rank 0 传入当前 atoms，其他 rank 传入 None。
-    - rank 0 构建图并用张量 broadcast，然后所有 rank 执行 run_ddp_step_from_graph。
-    - 若 rank 0 传 None 表示 MD 结束，返回 (None, None)。
-    返回 (energy, forces)；仅 rank 0 有效；若收到退出信号则 (None, None)。
+    Run one DDP inference step from ASE Atoms. **All ranks must call**:
+    - rank 0 passes current atoms; others pass None.
+    - rank 0 builds graph and broadcasts tensors; all ranks run run_ddp_step_from_graph.
+    - If rank 0 passes None (MD end), returns (None, None).
+    Returns (energy, forces); valid only on rank 0; (None, None) on exit signal.
     """
     from molecular_force_field.utils.graph_utils import radius_graph_pbc_gpu
 
@@ -526,7 +526,7 @@ def build_and_broadcast_graph(
     dtype: torch.dtype,
     comm_timing: dict | None = None,
 ):
-    """Rank 0 建图并 broadcast，所有 rank 得到同一份图。用于 benchmark 时每个 N 只 broadcast 一次。"""
+    """Rank 0 builds graph and broadcasts; all ranks get same graph. For benchmark, broadcast once per N."""
     rank = dist.get_rank()
     if rank == 0:
         torch.manual_seed(seed)
@@ -567,9 +567,9 @@ def run_ddp_forward_timed(
     comm_timing: dict | None = None,
 ) -> tuple[float, float]:
     """
-    对已 broadcast 的图只做分区+前向并计时（不含建图/broadcast）。
-    传 cache 时同一图尺寸会复用分区与 sync。返回 (time_ms, energy)，仅 rank 0 有效。
-    若 comm_timing 非 None，会填入 sync_ms、all_reduce_energy_ms、all_reduce_forces_ms（见 run_ddp_step_from_graph）。
+    Partition + forward only on already-broadcast graph, with timing (no build/broadcast).
+    With cache, same graph size reuses partition and sync. Returns (time_ms, energy), valid only on rank 0.
+    If comm_timing not None, fills sync_ms, all_reduce_energy_ms, all_reduce_forces_ms (see run_ddp_step_from_graph).
     """
     dist.barrier()
     if device.type == "cuda":
@@ -601,9 +601,9 @@ def run_one_ddp_inference(
     partition_mode: str = "modulo",
 ) -> tuple[float, float] | tuple[float, float, torch.Tensor]:
     """
-    执行一次 DDP 推理并计时。要求 dist 已初始化，且 model 已在各 rank 上建好。
-    返回 (time_ms, total_energy) 或 return_forces=True 时 (time_ms, total_energy, forces)；
-    仅 rank 0 返回有效值，其他 rank 为 (0.0, 0.0) 或 (0.0, 0.0, None)。
+    Run one DDP inference with timing. Requires dist initialized and model built on all ranks.
+    Returns (time_ms, total_energy) or (time_ms, total_energy, forces) if return_forces=True;
+    only rank 0 returns valid values; others get (0.0, 0.0) or (0.0, 0.0, None).
     """
     import time
     rank = dist.get_rank()
@@ -708,7 +708,7 @@ def run_one_ddp_inference(
 
 def _broadcast_tensor(tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
     """In-place broadcast: root has data, others receive into pre-allocated tensor.
-    NCCL 要求张量 contiguous；root 侧若非连续会先 .contiguous() 再 broadcast，并返回该张量供调用方使用。
+    NCCL requires contiguous tensors; root side .contiguous() if needed before broadcast, returns tensor for caller.
     """
     rank = dist.get_rank()
     if rank == src and not tensor.is_contiguous():
@@ -722,10 +722,10 @@ def broadcast_graph_from_rank0(
     comm_timing: dict | None = None,
 ):
     """
-    Rank 0 提供图或退出信号；张量 broadcast（无 pickle）。
-    - rank 0 传 (pos, A, ...) 则广播图；传 (None, None, ...) 则广播退出，所有 rank 返回 None。
-    - 其他 rank 传 (None, None, ...)，接收图或 None。
-    - 若 comm_timing 非 None，在 rank 0 上记录 comm_timing['broadcast_ms']。
+    Rank 0 provides graph or exit signal; tensor broadcast (no pickle).
+    - rank 0 passes (pos, A, ...) to broadcast graph; (None, None, ...) to broadcast exit, all ranks return None.
+    - Other ranks pass (None, None, ...), receive graph or None.
+    - If comm_timing not None, rank 0 records comm_timing['broadcast_ms'].
     """
     rank = dist.get_rank()
     sizes = torch.empty(2, device=device, dtype=torch.long)
@@ -768,20 +768,20 @@ def broadcast_graph_from_rank0(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="DDP 并行推理：单大结构按节点划分，多卡分摊显存与计算"
+        description="DDP parallel inference: partition large structure by nodes, multi-GPU memory and compute"
     )
-    parser.add_argument("--atoms", type=int, default=50000, help="原子数（用于生成 dummy 图）")
-    parser.add_argument("--checkpoint", type=str, default=None, help="模型 checkpoint（.pt）；不提供则用随机权重")
+    parser.add_argument("--atoms", type=int, default=50000, help="Number of atoms (for dummy graph)")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Model checkpoint (.pt); random weights if not provided")
     parser.add_argument("--avg-degree", type=int, default=24)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--forces", action="store_true", help="同时计算并输出力 F=-dE/dpos")
+    parser.add_argument("--forces", action="store_true", help="Compute and output forces F=-dE/dpos")
     parser.add_argument("--backend", type=str, default=None,
-                        help="dist 后端: nccl (多 GPU) 或 gloo (CPU/单机多进程)；默认按 CUDA 是否可用自动选")
+                        help="dist backend: nccl (multi-GPU) or gloo (CPU/single-node); default auto by CUDA availability")
     parser.add_argument("--partition", type=str, default="modulo", choices=["modulo", "spatial"],
-                        help="图分区方式：modulo（原始按节点ID）或 spatial（按坐标主轴分块）")
+                        help="Graph partition: modulo (by node ID) or spatial (by coordinate principal axis)")
     args = parser.parse_args()
 
-    # NCCL 要求在 init_process_group 之前设置当前进程使用的 GPU（避免 device unknown 警告/潜在 hang）
+    # NCCL requires setting GPU before init_process_group (avoid device unknown warning / potential hang)
     if torch.cuda.is_available():
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
@@ -789,7 +789,7 @@ def main():
     try:
         dist.init_process_group(backend=backend)
     except Exception as e:
-        print("DDP 需要 torchrun 启动，例如: torchrun --nproc_per_node=2 -m molecular_force_field.cli.inference_ddp --atoms 100000")
+        print("DDP requires torchrun, e.g.: torchrun --nproc_per_node=2 -m molecular_force_field.cli.inference_ddp --atoms 100000")
         raise SystemExit(1) from e
 
     rank = dist.get_rank()
@@ -799,7 +799,7 @@ def main():
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
 
-    # 配置与模型（与 train/evaluate 对齐）
+    # Config and model (aligned with train/evaluate)
     cfg = dict(
         max_embed_radius=5.0,
         main_max_radius=5.0,

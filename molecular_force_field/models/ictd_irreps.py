@@ -360,11 +360,57 @@ def direction_harmonics_all(n: torch.Tensor, lmax: int) -> List[torch.Tensor]:
     return [direction_harmonics_fast(n, l) for l in range(int(lmax) + 1)]
 
 
+def ictd_l2_to_rank2(c: torch.Tensor) -> torch.Tensor:
+    """
+    Convert ICTD l=2 (5D) harmonic coordinates to 3x3 symmetric traceless tensor.
+
+    The ICTD basis is built from monomials (x^a y^b z^c) with a+b+c=2.
+    Monomial order: z^2, yz, y^2, xz, xy, x^2 (from _counts_list).
+    Output T satisfies T(R·n) = R @ T(n) @ R.T under rotation R.
+
+    Args:
+        c: (..., 5) ICTD l=2 coordinates
+    Returns:
+        T: (..., 3, 3) symmetric traceless matrix
+    """
+    B = _harmonic_basis_t(2, device=c.device, dtype=c.dtype)  # (6, 5)
+    t = torch.einsum("dm,...m->...d", B, c)  # (..., 6) monomial coeffs
+    # t order: [zz, yz, yy, xz, xy, xx]. Multinomial: xy,xz,yz have factor 2.
+    # T_ij from polynomial: T[0,1]=coef_xy/2, etc.
+    T = torch.zeros(*c.shape[:-1], 3, 3, device=c.device, dtype=c.dtype)
+    T[..., 0, 0] = t[..., 5]
+    T[..., 0, 1] = T[..., 1, 0] = t[..., 4] * 0.5
+    T[..., 0, 2] = T[..., 2, 0] = t[..., 3] * 0.5
+    T[..., 1, 1] = t[..., 2]
+    T[..., 1, 2] = T[..., 2, 1] = t[..., 1] * 0.5
+    T[..., 2, 2] = t[..., 0]
+    return T
+
+
 @dataclass(frozen=True)
 class CGKey:
     l1: int
     l2: int
     l3: int
+
+
+@lru_cache(maxsize=None)
+def _build_poly_mult_matrix(l1: int, l2: int, L: int) -> torch.Tensor:
+    """
+    Precompute M_poly: (DL, D1*D2) sparse-ish matrix for polynomial multiplication.
+    tL = M_poly @ (t1.outer(t2).flatten()) maps monomial product to Sym^L.
+    """
+    counts1 = _counts_list(l1)
+    counts2 = _counts_list(l2)
+    countsL = _counts_list(L)
+    idxL = {t: i for i, t in enumerate(countsL)}
+    D1, D2, DL = len(counts1), len(counts2), len(countsL)
+    M = torch.zeros(DL, D1 * D2, dtype=torch.float64)
+    for i, c1 in enumerate(counts1):
+        for j, c2 in enumerate(counts2):
+            k = idxL[(c1[0] + c2[0], c1[1] + c2[1], c1[2] + c2[2])]
+            M[k, i * D2 + j] = 1.0
+    return M.contiguous()
 
 
 @lru_cache(maxsize=None)
@@ -379,46 +425,25 @@ def build_cg_tensor(l1: int, l2: int, l3: int) -> torch.Tensor:
         c[m3] = sum_{m1,m2} a[m1] b[m2] C[m1,m2,m3]
 
     This is an SO(3)-equivariant intertwiner by construction.
+    Uses vectorized matrix ops instead of Python loops for speed.
     """
     L = l1 + l2
     if not (abs(l1 - l2) <= l3 <= l1 + l2) or ((l1 + l2 + l3) % 2 == 1):
-        # parity selection for harmonic products: l1+l2-l3 must be even (k integer).
         return torch.zeros(2 * l1 + 1, 2 * l2 + 1, 2 * l3 + 1, dtype=torch.float64)
 
     proj = build_harmonic_projectors(Lmax=L)
-    P_L_l3 = proj.P[(L, l3)]  # (2l3+1, Dsym(L))
-
-    # Bases in t-coords
+    P_L_l3 = proj.P[(L, l3)]  # (2l3+1, DL)
     B1 = _harmonic_basis_t(l1, dtype=torch.float64)  # (D1, 2l1+1)
     B2 = _harmonic_basis_t(l2, dtype=torch.float64)  # (D2, 2l2+1)
+    M_poly = _build_poly_mult_matrix(l1, l2, L)  # (DL, D1*D2)
 
-    counts1 = _counts_list(l1)
-    counts2 = _counts_list(l2)
-    countsL = _counts_list(L)
-    idxL = {t: i for i, t in enumerate(countsL)}
-    D1, D2, DL = len(counts1), len(counts2), len(countsL)
+    m1_dim, m2_dim = 2 * l1 + 1, 2 * l2 + 1
 
-    C = torch.zeros(2 * l1 + 1, 2 * l2 + 1, 2 * l3 + 1, dtype=torch.float64)
-
-    # For each basis vector e_{m1}, e_{m2} produce t_L via convolution in (a,b,c) counts
-    for m1 in range(2 * l1 + 1):
-        t1 = B1[:, m1]  # (D1,)
-        for m2 in range(2 * l2 + 1):
-            t2 = B2[:, m2]  # (D2,)
-            tL = torch.zeros(DL, dtype=torch.float64)
-            for i, (a, b, c) in enumerate(counts1):
-                if t1[i] == 0:
-                    continue
-                for j, (a2, b2, c2) in enumerate(counts2):
-                    v = t1[i] * t2[j]
-                    if v == 0:
-                        continue
-                    k = idxL[(a + a2, b + b2, c + c2)]
-                    tL[k] += v
-            # project to l3 coeffs
-            c3 = (P_L_l3 @ tL)  # (2l3+1,)
-            C[m1, m2, :] = c3
-
+    outer = torch.einsum("im,jn->ijmn", B1, B2)  # (D1, D2, m1_dim, m2_dim)
+    outer_flat = outer.reshape(B1.shape[0] * B2.shape[0], m1_dim * m2_dim)
+    tL = M_poly @ outer_flat  # (DL, m1*m2)
+    c3 = P_L_l3 @ tL  # (2l3+1, m1*m2)
+    C = c3.T.reshape(m1_dim, m2_dim, 2 * l3 + 1)
     return C.contiguous()
 
 

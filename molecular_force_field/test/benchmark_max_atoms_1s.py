@@ -119,7 +119,7 @@ def main():
     parser.add_argument("--num-interaction", type=int, default=2, help="num_interaction (default: 2)")
     parser.add_argument("--avg-degree", type=int, default=24,
                         help="Average edges per atom (default: 24)")
-    parser.add_argument("--model", type=str, default="pure-cartesian-ictd-save", choices=['spherical', 'spherical-save', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-ictd', 'pure-cartesian-ictd-save', 'mace'], help="Select the model architecture to benchmark.")
+    parser.add_argument("--model", type=str, default="pure-cartesian-ictd-save", choices=['spherical', 'spherical-cue', 'spherical-save', 'spherical-save-cue', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-ictd', 'pure-cartesian-ictd-save', 'mace'], help="Select the model architecture to benchmark.")
     parser.add_argument("--correction", type=int, default=3, help="MACE correlation / many-body order (default: 3)")
     parser.add_argument("--backward", action="store_true", help="Measure forward + backward pass time")
     parser.add_argument("--compile", action="store_true",
@@ -130,12 +130,14 @@ def main():
                         help="Repeat count per N when measuring")
     parser.add_argument("--max-atoms-cap", type=int, default=200_000,
                         help="Upper bound for binary search (default: 200000)")
+    parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "float64"],
+                        help="Compute dtype (default: float32)")
     args = parser.parse_args()
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    dtype = torch.float32
-
-    if device.type == "cuda":
+    dtype = torch.float64 if args.dtype == "float64" else torch.float32
+    torch.set_default_dtype(dtype)  # Required for cuequivariance Fused TP math_dtype
+    if device.type == "cuda" and dtype == torch.float32:
         torch.set_float32_matmul_precision("high")
 
     cfg = dict(
@@ -155,7 +157,7 @@ def main():
         internal_compute_dtype=dtype,
     )
 
-    print(f"Config: lmax={args.lmax}, channels={args.channels}, num_interaction={args.num_interaction}, float32")
+    print(f"Config: lmax={args.lmax}, channels={args.channels}, num_interaction={args.num_interaction}, {args.dtype}")
     print(f"Target: inference <= {args.target_ms:.0f} ms ({args.target_ms/1000:.2f} s)")
     print(f"Device: {device}, avg_degree: {args.avg_degree}, compile: {args.compile}")
     print()
@@ -185,8 +187,32 @@ def main():
     else:
         if args.model == 'spherical':
             ModelClass = E3_TransformerLayer_multi
+        elif args.model == 'spherical-cue':
+            try:
+                import cuequivariance_torch  # noqa: F401
+                from molecular_force_field.models.cue_layers import (
+                    E3_TransformerLayer_multi as E3_TransformerLayer_multi_cue_full,
+                )
+                ModelClass = E3_TransformerLayer_multi_cue_full
+            except Exception as e:
+                raise ImportError(
+                    f"spherical-cue requires cuEquivariance: {e}\n"
+                    "Install: pip install cuequivariance-torch cuequivariance-ops-torch-cu12"
+                ) from e
         elif args.model == 'spherical-save':
             ModelClass = E3_TransformerLayer_multi_channelwise
+        elif args.model == 'spherical-save-cue':
+            try:
+                import cuequivariance_torch  # noqa: F401
+                from molecular_force_field.models.cue_layers_channelwise import (
+                    E3_TransformerLayer_multi as E3_TransformerLayer_multi_cue,
+                )
+                ModelClass = E3_TransformerLayer_multi_cue
+            except Exception as e:
+                raise ImportError(
+                    f"spherical-save-cue requires cuEquivariance: {e}\n"
+                    "Install: pip install cuequivariance-torch cuequivariance-ops-torch-cu12"
+                ) from e
         elif args.model == 'partial-cartesian':
             ModelClass = CartesianTransformerLayer
         elif args.model == 'partial-cartesian-loose':

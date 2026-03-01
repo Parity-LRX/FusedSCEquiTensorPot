@@ -203,7 +203,7 @@ def main():
         torch.set_default_dtype(torch.float32)
         logging.info("Using dtype: float32")
     
-    # Device setup（MD + torchrun 时提前 init dist，保证各 rank 用对应 GPU）
+    # Device setup (MD + torchrun: init dist early so each rank uses its GPU)
     use_ddp_md = args.md_sim and os.environ.get("RANK") is not None
     if use_ddp_md:
         import torch.distributed as dist
@@ -791,7 +791,7 @@ def main():
             k.item(): v.item()
             for k, v in zip(config.atomic_energy_keys, config.atomic_energy_values)
         }
-        # DDP MD：非 rank0 进入 worker 循环并退出；rank0 用 DDPCalculator 跑 MD
+        # DDP MD: non-rank0 enter worker loop and exit; rank0 runs MD with DDPCalculator
         if args.md_sim and use_ddp_md and world_size > 1:
             if rank != 0:
                 from molecular_force_field.cli.inference_ddp import run_one_ddp_inference_from_ase_atoms

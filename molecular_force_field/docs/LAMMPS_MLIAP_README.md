@@ -2,17 +2,23 @@
 
 ## 0. 模型限制
 
-**仅以下四种模型支持 ML-IAP**，因其 forward 支持 `precomputed_edge_vec`：
+**仅以下五种模型支持 ML-IAP**，因其 forward 支持 `precomputed_edge_vec`：
 
 | 模型文件 | tensor_product_mode |
 |----------|---------------------|
 | `e3nn_layers.py` | spherical |
 | `e3nn_layers_channelwise.py` | spherical-save |
-| `cue_layers_channelwise.py` | spherical-save-cue（cuEquivariance GPU 加速） |
+| `cue_layers_channelwise.py` | **spherical-save-cue**（cuEquivariance GPU 加速） |
 | `pure_cartesian_ictd_layers.py` | pure-cartesian-ictd-save |
 | `pure_cartesian_ictd_layers_full.py` | pure-cartesian-ictd |
 
 其他模型（如 pure-cartesian、pure-cartesian-sparse、partial-cartesian 等）暂不支持 ML-IAP 导出。
+
+### spherical-save-cue 的 ML-IAP 说明
+
+- **依赖**：需安装 cuEquivariance（`pip install cuequivariance-torch cuequivariance-ops-torch-cu12`）
+- **导出**：`python -m molecular_force_field.cli.export_mliap checkpoint.pth --elements H O --tensor-product-mode spherical-save-cue`
+- **序列化限制**：cuEquivariance 内部模块可能无法 pickle，若 `torch.save` 失败，ML-IAP 无法使用该模型；可改用 `pure-cartesian-ictd` 或 `spherical-save` 作为替代
 
 ## 1. 模型接口
 

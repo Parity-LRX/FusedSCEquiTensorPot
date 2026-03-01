@@ -1,9 +1,9 @@
 """Export a checkpoint to LAMMPS ML-IAP unified format.
 
-仅以下五种模型支持 ML-IAP（因其支持 precomputed_edge_vec / edge forces）：
+Only the following five models support ML-IAP (precomputed_edge_vec / edge forces):
 - e3nn_layers.py (spherical)
 - e3nn_layers_channelwise.py (spherical-save)
-- cue_layers_channelwise.py (spherical-save-cue, cuEquivariance GPU 加速)
+- cue_layers_channelwise.py (spherical-save-cue, cuEquivariance GPU acceleration)
 - pure_cartesian_ictd_layers.py (pure-cartesian-ictd-save)
 - pure_cartesian_ictd_layers_full.py (pure-cartesian-ictd)
 
@@ -49,7 +49,7 @@ def main():
     parser.add_argument("--num-interaction", type=int, default=2,
                         help="num_interaction (applies to all tensor-product-mode)")
     parser.add_argument("--torchscript", action="store_true",
-                        help="Trace model to TorchScript before export (only for pure-cartesian-ictd modes).")
+                        help="Trace model to TorchScript before export (pure-cartesian-ictd, pure-cartesian-ictd-save, spherical-save-cue).")
     args = parser.parse_args()
 
     from molecular_force_field.interfaces.lammps_mliap import LAMMPS_MLIAP_MFF

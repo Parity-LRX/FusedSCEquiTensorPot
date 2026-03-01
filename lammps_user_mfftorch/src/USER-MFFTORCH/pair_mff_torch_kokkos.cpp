@@ -4,6 +4,7 @@
 
 #include "atom_kokkos.h"
 #include "atom_masks.h"
+#include "comm.h"
 #include "error.h"
 #include "force.h"
 #include "kokkos.h"
@@ -29,7 +30,10 @@ PairMFFTorchKokkos<DeviceType>::PairMFFTorchKokkos(LAMMPS *lmp) : PairMFFTorch(l
 
 template <class DeviceType>
 void PairMFFTorchKokkos<DeviceType>::init_style() {
-  PairMFFTorch::init_style();
+  if (core_pt_path_.empty()) error->all(FLERR, "pair_coeff for mff/torch must specify core.pt path");
+
+  // Request a full neighbor list (same as base class).
+  neighbor->add_request(this, NeighConst::REQ_FULL);
 
   neighflag = lmp->kokkos->neighflag;
   auto request = neighbor->find_request(this);
@@ -39,8 +43,18 @@ void PairMFFTorchKokkos<DeviceType>::init_style() {
 
   if (!engine_) engine_ = std::make_unique<mfftorch::MFFTorchEngine>();
   if (!engine_loaded_) {
+    // Each MPI rank uses its own GPU: gpu_id = local_rank % num_gpus.
+    std::string dev = device_str_;
+    if (dev == "cuda") {
+      int ngpus = lmp->kokkos->ngpus;
+      int gpu_id = 0;
+      if (ngpus > 0) {
+        gpu_id = comm->me % ngpus;
+      }
+      dev = "cuda:" + std::to_string(gpu_id);
+    }
     try {
-      engine_->load_core(core_pt_path_, device_str_);
+      engine_->load_core(core_pt_path_, dev);
       engine_loaded_ = true;
     } catch (const std::exception &e) {
       error->all(FLERR, (std::string("Failed to load TorchScript core: ") + e.what()).c_str());
@@ -51,7 +65,7 @@ void PairMFFTorchKokkos<DeviceType>::init_style() {
     auto t = torch::from_blob(type2Z_.data(), {(int64_t)type2Z_.size()},
                               torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU))
                  .clone();
-    type2Z_cuda_ = t.to(torch::kCUDA);
+    type2Z_cuda_ = t.to(engine_->device());
 
     engine_->warmup(32, 256);
   }
@@ -114,14 +128,15 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
   // Reuse CUDA tensor buffers when edge count / atom count unchanged.
   using Unmanaged = Kokkos::MemoryTraits<Kokkos::Unmanaged>;
 
+  auto dev = engine_->device();
   if (cached_Etotal_ != Etotal) {
-    buf_edge_src_ = torch::empty({Etotal}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
-    buf_edge_dst_ = torch::empty({Etotal}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
-    buf_rij_ = torch::empty({Etotal, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    buf_edge_src_ = torch::empty({Etotal}, torch::TensorOptions().dtype(torch::kInt64).device(dev));
+    buf_edge_dst_ = torch::empty({Etotal}, torch::TensorOptions().dtype(torch::kInt64).device(dev));
+    buf_rij_ = torch::empty({Etotal, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
     cached_Etotal_ = Etotal;
   }
   if (cached_ntotal_ != static_cast<int64_t>(ntotal)) {
-    buf_type_idx_ = torch::empty({ntotal}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
+    buf_type_idx_ = torch::empty({ntotal}, torch::TensorOptions().dtype(torch::kInt64).device(dev));
     cached_ntotal_ = ntotal;
   }
 
@@ -178,11 +193,30 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
       });
   Kokkos::fence();
 
-  if (vflag_fdotr) {
-    atomKK->modified(execution_space, F_MASK);
-    atomKK->sync(Host, X_MASK | F_MASK);
-    virial_fdotr_compute();
+#ifdef MFF_ENABLE_VIRIAL
+  if (vflag_global) {
+    // fdotr virial entirely on GPU — one reduce kernel, no GPU→CPU sync.
+    // Uses Kokkos::View<double[6]> as reduction target for a single kernel launch.
+    Kokkos::View<double[6], DeviceType> d_virial("mfftorch::d_virial");
+    Kokkos::deep_copy(d_virial, 0.0);
+
+    Kokkos::parallel_for(
+        "mfftorch::virial_fdotr", nlocal, KOKKOS_LAMBDA(const int i) {
+          const double xi = x(i, 0), yi = x(i, 1), zi = x(i, 2);
+          const double fx = f(i, 0), fy = f(i, 1), fz = f(i, 2);
+          Kokkos::atomic_add(&d_virial(0), fx * xi);  // xx
+          Kokkos::atomic_add(&d_virial(1), fy * yi);  // yy
+          Kokkos::atomic_add(&d_virial(2), fz * zi);  // zz
+          Kokkos::atomic_add(&d_virial(3), fy * xi);  // xy
+          Kokkos::atomic_add(&d_virial(4), fz * xi);  // xz
+          Kokkos::atomic_add(&d_virial(5), fz * yi);  // yz
+        });
+    Kokkos::fence();
+
+    auto h_virial = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), d_virial);
+    for (int n = 0; n < 6; n++) virial[n] += h_virial(n);
   }
+#endif
 }
 
 namespace LAMMPS_NS {

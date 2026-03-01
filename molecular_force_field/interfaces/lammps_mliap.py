@@ -414,6 +414,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         ictd_tp_path_policy: Optional[str] = None,
         ictd_tp_max_rank_other: Optional[int] = None,
         torchscript: bool = False,
+        force_naive: bool = False,
     ) -> "LAMMPS_MLIAP_MFF":
         """Create LAMMPS_MLIAP_MFF from a checkpoint file.
 
@@ -433,7 +434,11 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
             dtype = dtype_raw
 
         mode = tensor_product_mode or ckpt.get("tensor_product_mode", "spherical")
-        config = ModelConfig(dtype=dtype, embed_size=embed_size, output_size=output_size)
+        # Use max_radius from checkpoint if saved (mff-train saves it), else from argument.
+        radius = float(ckpt.get("max_radius", max_radius))
+        if "max_radius" in ckpt:
+            print(f"[LAMMPS_MLIAP_MFF] 使用 checkpoint 中的 max_radius: {radius:.2f} Å")
+        config = ModelConfig(dtype=dtype, embed_size=embed_size, output_size=output_size, max_radius=radius, max_radius_main=radius)
 
         if atomic_energy_keys is not None and atomic_energy_values is not None:
             aek = torch.tensor(atomic_energy_keys, dtype=torch.long)
@@ -523,6 +528,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 num_interaction=num_interaction,
                 function_type_main=config.function_type,
                 device=torch.device(device),
+                force_naive=force_naive,
             ).to(device)
         elif mode == "spherical-save":
             model = E3_TransformerLayer_multi_channelwise(
@@ -571,13 +577,39 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 function_type_main=config.function_type,
                 device=torch.device(device),
             ).to(device)
-        model.load_state_dict(ckpt["e3trans_state_dict"], strict=True)
+        if mode == "spherical-save-cue":
+            load_result = model.load_state_dict(ckpt["e3trans_state_dict"], strict=False)
+            if load_result.unexpected_keys or load_result.missing_keys:
+                import warnings
+                if load_result.unexpected_keys:
+                    warnings.warn(
+                        f"spherical-save-cue: {len(load_result.unexpected_keys)} unexpected keys in checkpoint "
+                        "(cuEquivariance 版本差异?), 已忽略"
+                    )
+                if load_result.missing_keys:
+                    # cuEquivariance auto-generated CG coefficient buffers (e.g. .graphs.0.graph.cN)
+                    # are not stored in older checkpoints but get recomputed at init. Safe to skip.
+                    cue_auto_buffers = [k for k in load_result.missing_keys if ".graphs." in k and ".graph.c" in k]
+                    real_missing = [k for k in load_result.missing_keys if k not in cue_auto_buffers]
+                    if cue_auto_buffers:
+                        warnings.warn(
+                            f"spherical-save-cue: {len(cue_auto_buffers)} auto-generated CG buffers 未在 checkpoint 中"
+                            "（cuEquivariance 版本差异），已由模型自动初始化"
+                        )
+                    if real_missing:
+                        raise RuntimeError(
+                            f"spherical-save-cue: {len(real_missing)} missing learned keys: "
+                            f"{real_missing[:10]}... checkpoint 与模型结构不匹配."
+                        )
+        else:
+            model.load_state_dict(ckpt["e3trans_state_dict"], strict=True)
 
-        # Optional TorchScript tracing (recommended only for pure-cartesian-ictd modes)
+        # Optional TorchScript tracing
         use_ts = bool(torchscript) or (os.environ.get("MLIAP_USE_TORCHSCRIPT", "").lower() in ("1", "true", "yes"))
         if use_ts:
-            if mode not in ("pure-cartesian-ictd", "pure-cartesian-ictd-save"):
-                raise ValueError(f"TorchScript export is only supported for pure-cartesian-ictd modes, got {mode!r}")
+            _ts_supported = ("pure-cartesian-ictd", "pure-cartesian-ictd-save", "spherical-save-cue")
+            if mode not in _ts_supported:
+                raise ValueError(f"TorchScript export is only supported for {_ts_supported}, got {mode!r}")
             model = _maybe_torchscript_trace_model(
                 model,
                 device=torch.device(device),

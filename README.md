@@ -22,10 +22,18 @@
   
 - **Complete Workflow**:
   - Data preprocessing from Extended XYZ format with PBC support
-  - Training with dynamic loss weight adjustment, SWA, EMA support
-  - Evaluation with detailed metrics
-  - Molecular dynamics (MD) simulation via ASE
-  - Nudged Elastic Band (NEB) calculations
+  - Training with dynamic loss weight adjustment, SWA, EMA, stress training
+  - Evaluation: static metrics, MD, NEB, phonon spectrum
+  - LAMMPS integration: LibTorch (USER-MFFTORCH), ML-IAP, fix external
+  
+- **CLI Commands**:
+  - `mff-preprocess` - Data preprocessing
+  - `mff-train` - Training
+  - `mff-evaluate` - Evaluation (static/MD/NEB/phonon)
+  - `mff-export-core` - Export LibTorch core.pt (USER-MFFTORCH)
+  - `mff-lammps` - Generate LAMMPS fix external script
+  - `python -m molecular_force_field.cli.export_mliap` - Export ML-IAP format
+  - `torchrun -m molecular_force_field.cli.inference_ddp` - Large-scale multi-GPU inference (pure-cartesian-ictd only)
   
 - **Easy to Use**:
   - Simple command-line interface
@@ -78,6 +86,14 @@ pip install -r requirements-cue.txt
 Notes:
 - `cuequivariance-ops-torch-cu12` (CUDA kernels) is **Linux CUDA only**. On macOS you can still install `cuequivariance-torch` for CPU fallback.
 - If you select `--tensor-product-mode spherical-save-cue` without the dependency installed, the CLI will raise a clear ImportError with install instructions.
+
+### Optional: PyG (torch-scatter, torch-cluster)
+
+Faster neighbor list and scatter operations. Install via extras:
+
+```bash
+pip install -e ".[pyg]"
+```
 
 ## Quick Start
 
@@ -174,6 +190,8 @@ Outputs include:
 - `test_energy.csv`
 - `test_force.csv`
 
+Optional: use `--compile e3trans` to accelerate evaluation with `torch.compile`.
+
 For molecular dynamics simulation:
 
 ```bash
@@ -186,9 +204,69 @@ For NEB (Nudged Elastic Band) calculations:
 mff-evaluate --checkpoint combined_model.pth --neb
 ```
 
+For phonon spectrum (Hessian, vibrational frequencies):
+
+```bash
+mff-evaluate --checkpoint combined_model.pth --phonon --phonon-input structure.xyz
+```
+
+Optional: stress training (PBC with stress/virial in XYZ):
+
+```bash
+mff-train --data-dir data -c 0.1 --input-file pbc_with_stress.xyz
+```
+
+## LAMMPS Integration
+
+FusedSCEquiTensorPot supports three LAMMPS integration methods:
+
+| Method | Speed | Requirements | Use Case |
+|--------|-------|---------------|----------|
+| **USER-MFFTORCH (LibTorch pure C++)** | Fastest, no Python/GIL | LAMMPS built with KOKKOS + USER-MFFTORCH | HPC, clusters, production |
+| **ML-IAP unified** | Faster (~1.7x vs fix external) | LAMMPS built with ML-IAP | Recommended, GPU support |
+| **fix external / pair_style python** | Slower | Standard LAMMPS + Python | Quick validation, no ML-IAP |
+
+### LibTorch Interface (USER-MFFTORCH, HPC Recommended)
+
+**USER-MFFTORCH** loads TorchScript models via LibTorch C++ API directly. **No Python at runtime**, suitable for HPC and production deployment.
+
+1. **Export core.pt** (one-time, requires Python):
+   ```bash
+   mff-export-core --checkpoint model.pth --elements H O --device cuda \
+     --max-radius 5.0 --embed-e0 --e0-csv fitted_E0.csv --out core.pt
+   ```
+
+2. **Build LAMMPS**: Enable `PKG_KOKKOS` and `PKG_USER-MFFTORCH`. See [lammps_user_mfftorch/docs/BUILD_AND_RUN.md](lammps_user_mfftorch/docs/BUILD_AND_RUN.md).
+
+3. **Run** (pure LAMMPS, no Python):
+   ```bash
+   lmp -k on g 1 -sf kk -pk kokkos newton off neigh full -in in.mfftorch
+   ```
+
+**LAMMPS input example**:
+```lammps
+pair_style mff/torch 5.0 cuda
+pair_coeff * * /path/to/core.pt H O
+```
+
+**Model support**: `pure-cartesian-ictd` series and `spherical-save-cue` only.
+
+### ML-IAP Interface
+
+Export ML-IAP format (requires LAMMPS built with ML-IAP):
+
+```bash
+python -m molecular_force_field.cli.export_mliap checkpoint.pth --elements H O \
+  --atomic-energy-keys 1 8 --atomic-energy-values -13.6 -75.0 --max-radius 5.0 --output model-mliap.pt
+```
+
+Supported models: `spherical`, `spherical-save`, `spherical-save-cue`, `pure-cartesian-ictd`, `pure-cartesian-ictd-save`.
+
+See [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md) for full documentation.
+
 ## Python API
 
-The library supports **six tensor product modes**. Here's how to use them in Python:
+The library supports **eight tensor product modes**. Here's how to use them in Python:
 
 ### Basic Usage (Spherical Mode - Default)
 
@@ -280,9 +358,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 config = ModelConfig()
 
 # Choose tensor product mode
-tensor_product_mode = "pure-cartesian-ictd"  # Options: spherical, partial-cartesian, 
-                                              # partial-cartesian-loose, pure-cartesian,
-                                              # pure-cartesian-sparse, pure-cartesian-ictd
+tensor_product_mode = "pure-cartesian-ictd"  # Options: spherical, spherical-save, spherical-save-cue,
+                                              # partial-cartesian, partial-cartesian-loose,
+                                              # pure-cartesian, pure-cartesian-sparse,
+                                              # pure-cartesian-ictd, pure-cartesian-ictd-save
 
 if tensor_product_mode == 'spherical':
     e3trans = E3_TransformerLayer_multi(
@@ -420,40 +499,30 @@ model = MainNet(
 ## Project Structure
 
 ```
-molecular_force_field/
-├── models/                        # Model definitions (six tensor product modes)
-│   ├── e3nn_layers.py            # Spherical mode (e3nn-based)
-│   ├── cartesian_e3_layers.py    # Partial-cartesian modes (uses e3nn CG coefficients)
-│   ├── pure_cartesian.py         # Core pure Cartesian tensor operations
-│   ├── pure_cartesian_layers.py  # Pure-cartesian mode
-│   ├── pure_cartesian_sparse_layers.py  # Pure-cartesian-sparse mode
-│   ├── pure_cartesian_ictd_layers.py    # Pure-cartesian-ictd mode
-│   ├── ictd_irreps.py            # ICTD irreps implementation (harmonic polynomials)
-│   ├── ictd_fast.py              # ICTD fast implementation (precomputed)
-│   ├── mlp.py                    # MLP networks
-│   └── losses.py                 # Loss functions
-├── data/                          # Dataset and preprocessing
-│   ├── datasets.py               # Dataset classes
-│   ├── collate.py                # Collate functions
-│   └── preprocessing.py          # Data preprocessing
-├── utils/                        # Utility functions
-│   ├── graph_utils.py            # Graph operations
-│   ├── tensor_utils.py           # Tensor utilities
-│   └── config.py                 # Configuration management
-├── training/                     # Training utilities
-│   ├── trainer.py                # Trainer class
-│   └── schedulers.py             # Learning rate schedulers
-├── evaluation/                   # Evaluation utilities
-│   ├── evaluator.py              # Static evaluation
-│   └── calculator.py             # ASE Calculator wrapper
-├── interfaces/                   # External interfaces
-│   ├── lammps_potential.py      # LAMMPS potential interface
-│   └── self_test_lammps_potential.py  # LAMMPS self-test
-└── cli/                          # Command-line interfaces
-    ├── train.py                  # Training CLI
-    ├── evaluate.py               # Evaluation CLI
-    ├── preprocess.py             # Preprocessing CLI
-    └── lammps_interface.py       # LAMMPS interface CLI
+rebuild/
+├── molecular_force_field/         # Main package
+│   ├── models/                    # Model definitions (eight tensor product modes)
+│   │   ├── e3nn_layers.py        # Spherical mode (e3nn-based)
+│   │   ├── cartesian_e3_layers.py    # Partial-cartesian modes
+│   │   ├── pure_cartesian*.py    # Pure-cartesian modes
+│   │   ├── mlp.py, losses.py
+│   │   └── ...
+│   ├── data/                      # Dataset and preprocessing
+│   ├── utils/                     # Configuration, graph utilities
+│   ├── training/                  # Trainer
+│   ├── evaluation/                # Evaluator, ASE Calculator
+│   ├── interfaces/                # LAMMPS potential, ML-IAP
+│   │   ├── lammps_potential.py   # fix external / pair_style python
+│   │   └── lammps_mliap.py      # ML-IAP unified
+│   └── cli/                       # Command-line interfaces
+│       ├── train.py, evaluate.py, preprocess.py
+│       ├── lammps_interface.py   # fix external interface
+│       ├── export_libtorch_core.py  # Export LibTorch core.pt
+│       ├── export_mliap.py        # Export ML-IAP format
+│       └── inference_ddp.py      # Large-scale multi-GPU inference
+└── lammps_user_mfftorch/          # LAMMPS LibTorch package (USER-MFFTORCH)
+    ├── src/USER-MFFTORCH/         # pair_style mff/torch source
+    └── docs/BUILD_AND_RUN.md      # Build and run guide
 ```
 
 ## Requirements
@@ -466,14 +535,16 @@ molecular_force_field/
 
 ## 🎯 Choosing Tensor Product Mode
 
-The library supports **six equivariant tensor product modes**, each optimized for different use cases:
+The library supports **eight equivariant tensor product modes**, each optimized for different use cases:
 
 1. **`spherical`**: e3nn-based spherical harmonics (default, standard implementation)
-2. **`partial-cartesian`**: Cartesian coordinates + CG coefficients (strictly equivariant)
-3. **`partial-cartesian-loose`**: Approximate equivariant (norm product approximation)
-4. **`pure-cartesian`**: Pure Cartesian \(3^L\) representation (strictly equivariant, very slow)
-5. **`pure-cartesian-sparse`**: Sparse pure Cartesian (strictly equivariant, parameter-optimized)
-6. **`pure-cartesian-ictd`**: ICTD irreps internal representation (strictly equivariant, fastest, fewest parameters)
+2. **`spherical-save`**: channelwise edge conv (e3nn backend; fewer params)
+3. **`spherical-save-cue`**: channelwise edge conv (cuEquivariance backend; optional, GPU accelerated)
+4. **`partial-cartesian`**: Cartesian coordinates + CG coefficients (strictly equivariant)
+5. **`partial-cartesian-loose`**: Approximate equivariant (norm product approximation)
+6. **`pure-cartesian`**: Pure Cartesian \(3^L\) representation (strictly equivariant, very slow)
+7. **`pure-cartesian-sparse`**: Sparse pure Cartesian (strictly equivariant, parameter-optimized)
+8. **`pure-cartesian-ictd`**: ICTD irreps internal representation (strictly equivariant, fastest, fewest parameters)
 
 All modes maintain O(3) equivariance (including rotation and reflection). Performance comparison:
 
@@ -575,7 +646,10 @@ For detailed performance comparison and recommendations, see [USAGE.md](USAGE.md
 
 ## 📚 Documentation
 
-For full CLI and hyperparameter documentation, see [USAGE.md](USAGE.md).
+- [USAGE.md](USAGE.md) - Full CLI and hyperparameter reference (Chinese)
+- [USAGE_EN.md](USAGE_EN.md) - Full CLI and hyperparameter reference (English)
+- [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md) - LAMMPS integration guide (LibTorch, ML-IAP, fix external)
+- [lammps_user_mfftorch/docs/BUILD_AND_RUN.md](lammps_user_mfftorch/docs/BUILD_AND_RUN.md) - LibTorch interface build and run
 
 
 ## 📄 License
@@ -584,10 +658,11 @@ MIT License
 
 ## 🙏 Acknowledgments
 
-This framework implements **six equivariant tensor product modes**:
-- **`spherical` mode**: Built on [e3nn](https://github.com/e3nn/e3nn) for spherical harmonics-based tensor products
-- **`partial-cartesian` and `partial-cartesian-loose` modes**: Partially use e3nn's Clebsch-Gordan coefficients (`e3nn.o3.wigner_3j`) and irreducible representation framework (`e3nn.o3.Irreps`) for tensor product operations
-- **Three fully self-implemented Cartesian modes**: `pure-cartesian`, `pure-cartesian-sparse`, and `pure-cartesian-ictd` are independently implemented Cartesian tensor product methods without e3nn dependencies
+This framework implements **eight equivariant tensor product modes**:
+- **`spherical` and `spherical-save` modes**: Built on [e3nn](https://github.com/e3nn/e3nn) for spherical harmonics-based tensor products
+- **`spherical-save-cue` mode**: Uses [cuEquivariance](https://github.com/NVIDIA/cuEquivariance) for GPU-accelerated channelwise spherical convolution
+- **`partial-cartesian` and `partial-cartesian-loose` modes**: Partially use e3nn's Clebsch-Gordan coefficients and Irreps framework
+- **Self-implemented Cartesian modes**: `pure-cartesian`, `pure-cartesian-sparse`, `pure-cartesian-ictd` are independently implemented without e3nn dependencies
 
 Other dependencies and inspirations:
 - Uses [ASE](https://wiki.fysik.dtu.dk/ase/) for molecular simulations

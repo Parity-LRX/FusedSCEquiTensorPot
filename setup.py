@@ -69,6 +69,7 @@ setup(
             "mff-evaluate=molecular_force_field.cli.evaluate:main",
             "mff-preprocess=molecular_force_field.cli.preprocess:main",
             "mff-lammps=molecular_force_field.cli.lammps_interface:main",
+            "mff-export-core=molecular_force_field.cli.export_libtorch_core:main",
         ],
     },
 )

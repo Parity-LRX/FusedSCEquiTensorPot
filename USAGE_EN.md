@@ -1,12 +1,14 @@
 # Usage Guide
 
-FusedSCEquiTensorPot supports **six equivariant tensor product implementation modes**, including:
+FusedSCEquiTensorPot supports **eight equivariant tensor product implementation modes**, including:
 - `spherical`: e3nn-based spherical harmonics method (default)
-- `partial-cartesian`: Cartesian coordinates + e3nn CG coefficients (strictly equivariant, partially uses e3nn)
-- `partial-cartesian-loose`: Approximate equivariant (norm product approximation, partially uses e3nn)
-- `pure-cartesian`: Pure Cartesian \(3^L\) representation (strictly equivariant, slower, fully self-implemented)
-- `pure-cartesian-sparse`: Sparse pure Cartesian (strictly equivariant, parameter-optimized, fully self-implemented)
-- `pure-cartesian-ictd`: ICTD irreps internal representation (strictly equivariant, fastest, fewest parameters, fully self-implemented)
+- `spherical-save`: channelwise edge conv (e3nn backend, fewer params)
+- `spherical-save-cue`: channelwise edge conv (cuEquivariance backend, optional dependency, GPU accelerated)
+- `partial-cartesian`: Cartesian coordinates + e3nn CG coefficients (strictly equivariant)
+- `partial-cartesian-loose`: Approximate equivariant (norm product approximation)
+- `pure-cartesian`: Pure Cartesian \(3^L\) representation (strictly equivariant, very slow, not recommended)
+- `pure-cartesian-sparse`: Sparse pure Cartesian (strictly equivariant, parameter-optimized)
+- `pure-cartesian-ictd`: ICTD irreps internal representation (strictly equivariant, fastest, fewest parameters)
 
 All modes maintain O(3) equivariance (including rotation and reflection). For detailed performance comparison, see the [Tensor Product Mode Comparison](#tensor-product-mode-comparison) section.
 
@@ -30,7 +32,22 @@ After installation, you can verify that the CLI is available using the following
 mff-preprocess --help
 mff-train --help
 mff-evaluate --help
+mff-export-core --help   # LAMMPS LibTorch export
+mff-lammps --help        # LAMMPS fix external interface
+python -m molecular_force_field.cli.export_mliap --help  # LAMMPS ML-IAP export
 ```
+
+### 3. LAMMPS Integration
+
+This framework supports three LAMMPS integration methods. See [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md) for details:
+
+| Method | Speed | Requirements | Use Case |
+|--------|-------|--------------|----------|
+| **USER-MFFTORCH (LibTorch pure C++)** | Fastest, no Python | LAMMPS built with KOKKOS + USER-MFFTORCH | HPC, clusters, production |
+| **ML-IAP unified** | Faster (~1.7x vs fix external) | LAMMPS built with ML-IAP | Recommended, GPU support |
+| **fix external / pair_style python** | Slower | Standard LAMMPS + Python | Quick validation |
+
+Python API examples: [Example 5a: LAMMPS LibTorch](#example-5a-lammps-libtorch-interface-usermfftorch-hpc-recommended) and [Example 5b: LAMMPS ML-IAP](#example-5b-lammps-mliap-unified-interface).
 
 ## Complete Workflow
 
@@ -99,6 +116,14 @@ mff-train \
     --dtype float64 \
     --num-workers 8 \
     --max-radius 5.0
+```
+
+**Stress Training** (Optional, for periodic systems):
+If XYZ contains stress/virial and is a PBC system, enable stress loss:
+```bash
+mff-train \
+    --data-dir data \
+    --stress-weight 0.1
 ```
 
 **Custom Atomic Energies (E0)** (Optional):
@@ -186,7 +211,7 @@ mff-train \
 - `--no-save-val-csv`: Disable saving validation CSV files (mutually exclusive with `--save-val-csv`). Used to reduce I/O overhead
 
 **Early Stopping Parameters:**
-- `--patience`: Early stopping patience value (default 20, unit: epochs). If validation loss (energy loss + force loss, unweighted) does not improve for N consecutive epochs, training will automatically stop. Note: early stopping uses unweighted validation loss, not weighted loss (`a × energy loss + b × force loss`)
+- `--patience`: Early stopping patience value (default 20, unit: epochs). If validation loss (energy + force + stress, unweighted) does not improve for N consecutive epochs, training will automatically stop. Note: early stopping uses unweighted validation loss, not weighted loss (`a × energy + b × force + c × stress`)
 
 **Learning Rate Parameters:**
 - `--learning-rate`: Target learning rate (default 1e-3). This is the learning rate after warmup and the main learning rate during training
@@ -197,8 +222,9 @@ mff-train \
 - `--lr-decay-factor`: Learning rate decay factor (default 0.98). Learning rate is multiplied by this value each time it decays (0.98 means 2% reduction). Learning rate scheduling: if validation loss does not improve within `lr-decay-patience` batches, learning rate is multiplied by this factor
 
 **Loss Weight Parameters:**
-- `--energy-weight` (or `-a`): Initial weight for energy loss (default 1.0). Total loss = `a × energy loss + b × force loss`. During training, `a` will automatically increase according to `--weight-a-growth`
+- `--energy-weight` (or `-a`): Initial weight for energy loss (default 1.0). Total loss = `a × energy loss + b × force loss + c × stress loss`. During training, `a` will automatically increase according to `--weight-a-growth`
 - `--force-weight` (or `-b`): Initial weight for force loss (default 10.0). Force loss typically needs larger weight because there are far more forces than energies (each atom has 3 force components). During training, `b` will automatically decay according to `--weight-b-decay`
+- `--stress-weight` (or `-c`): Weight for stress loss (default 0.0, disabled). Set > 0 to enable stress training. Requires XYZ with stress/virial and PBC. Stress unit: eV/Å³
 - `--update-param`: Frequency of automatic adjustment of weights `a` and `b` (every N batches, default 1000). Every N batches, weights will be adjusted according to `--weight-a-growth` and `--weight-b-decay`. Adjustment formula: `a = a × weight_a_growth`, `b = b × weight_b_decay`
 - `--weight-a-growth`: Growth rate of energy weight `a` (default 1.05, i.e., 5% increase each time). Recommended values: 1.005 (slow, suitable for very long training), 1.01 (medium, more stable), 1.02 (fast), 1.05 (very fast)
 - `--weight-b-decay`: Decay rate of force weight `b` (default 0.98, i.e., 2% decrease each time). Recommended values: 0.995 (slow), 0.99 (medium, more stable), 0.98 (fast)
@@ -234,13 +260,15 @@ mff-train \
   - `fourier`: Fourier basis functions (suitable for periodic boundary conditions)
   - `cosine`: Cosine basis functions
   - `smooth_finite`: Smooth finite support basis functions
-- `--tensor-product-mode`: Equivariant tensor product implementation mode (default 'spherical'). **This framework supports six equivariant tensor product modes**, options:
-  - `spherical`: Use e3nn spherical harmonics tensor product (default, high precision, standard implementation, recommended for most scenarios)
-  - `partial-cartesian`: Cartesian coordinates + e3nn CG coefficients (strictly equivariant, partially uses e3nn's `wigner_3j` and `Irreps`, 17.4% parameter reduction)
-  - `partial-cartesian-loose`: Approximate equivariant tensor product (uses norm product approximation, partially uses e3nn's `Irreps` framework, faster, 17.3% parameter reduction, but not strictly equivariant)
-  - `pure-cartesian`: Pure Cartesian tensor product (\(3^L\) representation, δ/ε contractions, strictly equivariant, very slow, large parameters, fails at lmax≥4, mainly for research)
-  - `pure-cartesian-sparse`: Sparse pure Cartesian tensor product (strictly equivariant, 29.6% parameter reduction, stable speed, requires `--max-rank-other` and `--k-policy`)
-  - `pure-cartesian-ictd`: ICTD irreps internal representation (strictly equivariant, 72.1% parameter reduction, fastest, CPU: up to 4.12x, GPU: up to 2.10x, recommended for large-scale training)
+- `--tensor-product-mode`: Equivariant tensor product implementation mode (default 'spherical'). **This framework supports eight equivariant tensor product modes**, options:
+  - `spherical`: Use e3nn spherical harmonics tensor product (default, high precision, standard implementation)
+  - `spherical-save`: channelwise edge conv (e3nn backend, fewer params)
+  - `spherical-save-cue`: channelwise edge conv (cuEquivariance backend, requires `pip install -e ".[cue]"`, GPU accelerated)
+  - `partial-cartesian`: Cartesian coordinates + e3nn CG coefficients (strictly equivariant, 17.4% parameter reduction)
+  - `partial-cartesian-loose`: Approximate equivariant tensor product (norm product approximation, faster, 17.3% parameter reduction, not strictly equivariant)
+  - `pure-cartesian`: Pure Cartesian tensor product (\(3^L\) representation, strictly equivariant, very slow, fails at lmax≥4, not recommended)
+  - `pure-cartesian-sparse`: Sparse pure Cartesian tensor product (strictly equivariant, 29.6% parameter reduction, requires `--max-rank-other` and `--k-policy`)
+  - `pure-cartesian-ictd`: ICTD irreps internal representation (strictly equivariant, 72.1% parameter reduction, fastest, recommended for large-scale training)
   
   For detailed performance comparison and recommended scenarios, see the [Tensor Product Mode Comparison](#tensor-product-mode-comparison) section.
 
@@ -263,6 +291,12 @@ mff-train \
 - `--ema-decay`: EMA decay coefficient (default 0.999, range 0-1). Larger values are smoother but respond slower. Typical values: 0.999 (very smooth, recommended), 0.99 (faster response)
 - `--use-ema-for-validation`: Use EMA model for validation (instead of main model). If enabled, validation will use EMA weights for forward propagation, typically resulting in more stable validation results
 - `--save-ema-model`: Save EMA model weights in checkpoint. If enabled, checkpoint will contain `e3trans_ema_state_dict`, allowing EMA model recovery from checkpoint
+
+**Validation Acceleration Parameters:**
+- `--compile-val`: Use `torch.compile` on e3trans during validation, `none` (default) or `e3trans`
+- `--compile-val-mode`: Compilation mode, e.g., `reduce-overhead`, `max-autotune`
+- `--compile-val-fullgraph`: Force full graph compilation
+- `--compile-val-dynamic`: Dynamic shapes
 
 **Distributed Training Parameters:**
 - `--distributed`: Enable distributed training (DDP mode). Requires `torchrun` or `torch.distributed.launch`. When enabled, training will automatically use multi-GPU parallelization
@@ -318,12 +352,14 @@ mff-evaluate \
 - `--output-prefix`: Output file prefix
 - `--use-h5`: Use H5Dataset (if preprocessed), otherwise use OnTheFlyDataset
 - `--batch-size`: Batch size (default 1)
+- `--compile`: Inference acceleration, `none` (default) or `e3trans` (use `torch.compile` on e3trans layer)
+- `--compile-mode`: Compilation mode, e.g., `reduce-overhead`, `max-autotune`
 - `--max-atomvalue`: Must be the same as training
 - `--embedding-dim`: Must be the same as training
 - `--lmax`: Must be the same as training
 - `--irreps-output-conv-channels`: Must be the same as training (if set during training)
 - `--function-type`: Must be the same as training
-- `--tensor-product-mode`: Must be the same as training (supports six modes: `spherical`, `partial-cartesian`, `partial-cartesian-loose`, `pure-cartesian`, `pure-cartesian-sparse`, `pure-cartesian-ictd`)
+- `--tensor-product-mode`: Must be the same as training (supports eight modes: `spherical`, `spherical-save`, `spherical-save-cue`, `partial-cartesian`, `partial-cartesian-loose`, `pure-cartesian`, `pure-cartesian-sparse`, `pure-cartesian-ictd`)
 
 **Output Files:**
 - `test_loss.csv` - Test set loss metrics
@@ -1191,6 +1227,159 @@ print(f"  Reaction energy:   {e_final - e_initial:.4f} eV")
 print("=" * 60)
 ```
 
+### Example 5a: LAMMPS LibTorch Interface (USER-MFFTORCH, HPC Recommended)
+
+**USER-MFFTORCH** is a custom LAMMPS package providing `pair_style mff/torch`, loading TorchScript models via LibTorch C++ API. **No Python at runtime**, suitable for HPC and production deployment.
+
+**Model support**: `pure-cartesian-ictd` series and `spherical-save-cue` only. Element order and cutoff must match export.
+
+**Step 1: Export core.pt** (one-time, requires Python):
+```bash
+mff-export-core \
+  --checkpoint model.pth \
+  --elements H O \
+  --device cuda \
+  --max-radius 5.0 \
+  --dtype float32 \
+  --embed-e0 \
+  --e0-csv fitted_E0.csv \
+  --out core.pt
+```
+
+**Step 2: Build LAMMPS**: Enable `PKG_KOKKOS` and `PKG_USER-MFFTORCH`. See [lammps_user_mfftorch/docs/BUILD_AND_RUN.md](lammps_user_mfftorch/docs/BUILD_AND_RUN.md).
+
+**Step 3: Run LAMMPS** (pure LAMMPS, no Python):
+```bash
+# Set LibTorch dynamic library path
+export LD_LIBRARY_PATH="$(python -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))'):$LD_LIBRARY_PATH"
+
+# Run with Kokkos GPU
+lmp -k on g 1 -sf kk -pk kokkos newton off neigh full -in in.mfftorch
+```
+
+**LAMMPS input example** (`in.mfftorch`):
+```lammps
+units metal
+atom_style atomic
+boundary p p p
+
+read_data system.data
+
+neighbor 1.0 bin
+pair_style mff/torch 5.0 cuda
+pair_coeff * * /path/to/core.pt H O
+
+velocity all create 300 42
+fix 1 all nve
+thermo 20
+run 200
+```
+
+**spherical-save-cue export note**: Default export uses pure PyTorch implementation (`force_naive`); `core.pt` does not depend on cuEquivariance custom ops and runs in any LibTorch environment.
+
+See [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md) for full documentation.
+
+### Example 5b: LAMMPS ML-IAP Unified Interface
+
+ML-IAP unified is LAMMPS's machine learning potential interface, ~1.7x faster than fix external and supports GPU acceleration. Export checkpoint to ML-IAP format first.
+
+**Model support**: Only these five models support ML-IAP (support `precomputed_edge_vec`): `e3nn_layers`, `e3nn_layers_channelwise`, `cue_layers_channelwise` (spherical-save-cue), `pure_cartesian_ictd_layers`, `pure_cartesian_ictd_layers_full`. Others (e.g., pure-cartesian, pure-cartesian-sparse) are not supported.
+
+**Step 1: Export model**
+```bash
+python -m molecular_force_field.cli.export_mliap your_checkpoint.pth \
+    --elements H O \
+    --atomic-energy-keys 1 8 \
+    --atomic-energy-values -13.6 -75.0 \
+    --max-radius 5.0 \
+    --output model-mliap.pt
+```
+
+**Step 2: Drive LAMMPS from Python**
+```python
+import torch
+import lammps
+from lammps.mliap import activate_mliappy, load_unified
+
+lmp = lammps.lammps()
+activate_mliappy(lmp)
+
+model = torch.load("model-mliap.pt", weights_only=False)
+load_unified(model)
+
+lmp.commands_string("""
+units metal
+atom_style atomic
+read_data your_system.data
+pair_style mliap unified model-mliap.pt 0
+pair_coeff * * H O
+velocity all create 300 12345
+fix 1 all nve
+thermo 100
+run 1000
+""")
+lmp.close()
+```
+
+**Step 3: Pure LAMMPS input file**
+
+Create `run.py`:
+```python
+import torch
+import lammps
+from lammps.mliap import activate_mliappy, load_unified
+
+lmp = lammps.lammps()
+activate_mliappy(lmp)
+model = torch.load("model-mliap.pt", weights_only=False)
+load_unified(model)
+lmp.file("input.lammps")
+lmp.close()
+```
+
+`input.lammps` example:
+```
+units metal
+atom_style atomic
+read_data system.data
+
+pair_style mliap unified model-mliap.pt 0
+pair_coeff * * H O
+
+velocity all create 300 12345
+fix 1 all nvt temp 300 300 0.1
+thermo 100
+dump 1 all xyz 100 traj.xyz
+run 10000
+```
+
+Run:
+```bash
+export DYLD_LIBRARY_PATH="$HOME/.local/lib:/opt/homebrew/opt/python@3.12/Frameworks/Python.framework/Versions/3.12/lib"
+python run.py
+```
+
+**Notes**: Element order in `pair_coeff * * H O` must match `--elements`; `pair_style mliap unified model.pt 0` trailing `0` means no ghost neighbors (use `1` for multi-layer message passing); use `units metal` (eV, Angstrom). On macOS set `DYLD_LIBRARY_PATH`. LAMMPS must be built with `PKG_ML-IAP=ON`, `MLIAP_ENABLE_PYTHON=ON`. See `molecular_force_field/docs/INSTALL_LAMMPS_PYTHON.md`.
+
+**Kokkos GPU**: If LAMMPS is built with Kokkos+CUDA, run `lmp -k on g 1 -sf kk -pk kokkos newton on neigh half -in input.lammps`; use `activate_mliappy_kokkos(lmp)` when driving from Python. See `LAMMPS_INTERFACE.md`.
+
+### Example 5c: Large-Scale Multi-GPU Inference (inference_ddp)
+
+For very large systems (e.g., 100k+ atoms), use DDP inference for multi-GPU parallel computation. **Only supports `pure-cartesian-ictd` mode**. Current version uses random graph for testing; real structures need to be wired in code.
+
+```bash
+torchrun --nproc_per_node=2 -m molecular_force_field.cli.inference_ddp \
+  --checkpoint model.pth \
+  --atoms 100000 \
+  --forces
+```
+
+**Parameters**:
+- `--atoms`: Number of atoms (for random test graph, default 50000)
+- `--checkpoint`: Model checkpoint path
+- `--forces`: Also compute and output forces
+- `--partition`: Graph partition strategy, `modulo` (default) or `spatial`
+
 ### Example 6: Phonon Spectrum Calculation (Hessian and Frequencies)
 
 ```python
@@ -1318,7 +1507,33 @@ else:
 mff-preprocess --help
 mff-train --help
 mff-evaluate --help
+mff-export-core --help   # LAMMPS LibTorch export
+mff-lammps --help        # LAMMPS fix external interface
+python -m molecular_force_field.cli.export_mliap --help  # LAMMPS ML-IAP export
 ```
+
+### Q: How to use LAMMPS LibTorch interface?
+
+LAMMPS LibTorch interface (USER-MFFTORCH) loads TorchScript models via `pair_style mff/torch` in C++ with LibTorch. **No Python at runtime**, suitable for HPC and production.
+
+**Quick steps**:
+1. Export: `mff-export-core --checkpoint model.pth --elements H O --max-radius 5.0 --embed-e0 --e0-csv fitted_E0.csv --out core.pt`
+2. Build LAMMPS: Enable `PKG_KOKKOS`, `PKG_USER-MFFTORCH`. See [lammps_user_mfftorch/docs/BUILD_AND_RUN.md](lammps_user_mfftorch/docs/BUILD_AND_RUN.md)
+3. Run: `lmp -k on g 1 -sf kk -pk kokkos newton off neigh full -in in.mfftorch`
+
+**Supported models**: `pure-cartesian-ictd` series, `spherical-save-cue`. See [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md) for full documentation.
+
+### Q: How to export ML-IAP format?
+
+ML-IAP is used for LAMMPS `pair_style mliap unified`, faster than fix external and supports Kokkos GPU:
+
+```bash
+python -m molecular_force_field.cli.export_mliap checkpoint.pth \
+  --elements H O --atomic-energy-keys 1 8 --atomic-energy-values -13.6 -75.0 \
+  --max-radius 5.0 --output model-mliap.pt
+```
+
+Supported models: `spherical`, `spherical-save`, `spherical-save-cue`, `pure-cartesian-ictd`, `pure-cartesian-ictd-save`. See [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md).
 
 ### Q: How to resume training from a previous checkpoint?
 
@@ -1652,8 +1867,7 @@ Input XYZ files need to contain:
 - Forces (Fx, Fy, Fz)
 - Energy information (in Properties line)
 - Cell information (in Lattice attribute, optional)
-
-
+- **Stress/virial** (optional, for periodic stress training): In comment line, `stress="..."` or `virial="..."` (6 or 9 components)
 
 ### Q: How to use multi-GPU parallel training?
 
@@ -1765,6 +1979,11 @@ torchrun --nproc_per_node=4 \
     --distributed \
     --data-dir data \
     --batch-size 8
+```
+
+**9. Use torch.compile during validation (optional):**
+```bash
+mff-train --compile-val e3trans --data-dir data
 ```
 
 ### Q: Which tensor product mode should I choose?
@@ -2005,14 +2224,16 @@ mff-train \
 
 ## Tensor Product Mode Comparison
 
-**FusedSCEquiTensorPot supports six equivariant tensor product implementation modes**, each with different characteristics in speed, parameter count, and equivariance:
+**FusedSCEquiTensorPot supports eight equivariant tensor product implementation modes**, each with different characteristics in speed, parameter count, and equivariance:
 
 1. **`spherical`**: e3nn-based spherical harmonics method (default, standard implementation)
-2. **`partial-cartesian`**: Cartesian coordinates + e3nn CG coefficients (strictly equivariant, partially uses e3nn's `wigner_3j` and `Irreps`)
-3. **`partial-cartesian-loose`**: Approximate equivariant (norm product approximation, partially uses e3nn's `Irreps` framework)
-4. **`pure-cartesian`**: Pure Cartesian \(3^L\) representation (strictly equivariant, very slow, fully self-implemented)
-5. **`pure-cartesian-sparse`**: Sparse pure Cartesian (strictly equivariant, parameter-optimized, fully self-implemented)
-6. **`pure-cartesian-ictd`**: ICTD irreps internal representation (strictly equivariant, fastest, fewest parameters, fully self-implemented)
+2. **`spherical-save`**: channelwise edge conv (e3nn backend, fewer params)
+3. **`spherical-save-cue`**: channelwise edge conv (cuEquivariance backend, optional, GPU accelerated)
+4. **`partial-cartesian`**: Cartesian coordinates + e3nn CG coefficients (strictly equivariant)
+5. **`partial-cartesian-loose`**: Approximate equivariant (norm product approximation)
+6. **`pure-cartesian`**: Pure Cartesian \(3^L\) representation (strictly equivariant, very slow, not recommended)
+7. **`pure-cartesian-sparse`**: Sparse pure Cartesian (strictly equivariant, parameter-optimized)
+8. **`pure-cartesian-ictd`**: ICTD irreps internal representation (strictly equivariant, fastest, fewest parameters)
 
 All modes maintain O(3) equivariance (including rotation and reflection). Comparison data below:
 

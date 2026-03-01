@@ -27,7 +27,7 @@ FusedEquiTensorPot 提供三种 LAMMPS 集成方式：
 
 1. **导出 core.pt**（需 Python，一次性）：
    ```bash
-   python molecular_force_field/scripts/export_libtorch_core.py \
+   python -m molecular_force_field.cli.export_libtorch_core \
      --checkpoint model.pth --elements H O --device cuda \
      --max-radius 5.0 --embed-e0 --e0-csv fitted_E0.csv --out core.pt
    ```
@@ -45,7 +45,21 @@ pair_style mff/torch 5.0 cuda
 pair_coeff * * /path/to/core.pt H O
 ```
 
-**模型限制**：目前支持 `pure-cartesian-ictd` 系列模型。元素顺序、cutoff 需与导出时一致。
+**模型限制**：目前支持 `pure-cartesian-ictd` 系列和 `spherical-save-cue` 模型。元素顺序、cutoff 需与导出时一致。
+
+**spherical-save-cue 导出说明**（方案 A，便携版）：
+- 默认导出为**纯 PyTorch 实现**（`force_naive`），`core.pt` 不依赖 cuEquivariance 自定义 ops，可在任意 LibTorch 环境运行。
+- 导出命令示例：
+  ```bash
+  python -m molecular_force_field.cli.export_libtorch_core \
+    --checkpoint model.pth --elements H O --max-radius 5.0 \
+    --embed-e0 --e0-csv fitted_E0.csv --out core.pt
+  ```
+- 一键测试（dummy 模型）：
+  ```bash
+  bash molecular_force_field/test/run_gpu_lammps_with_corept.sh \
+    --lmp /path/to/lmp --dummy-cue --elements H O --cutoff 5.0 --steps 200
+  ```
 
 ---
 
@@ -57,13 +71,19 @@ ML-IAP 是 LAMMPS 的机器学习势接口，比 fix external 更快，且支持
 梯度存储从 O(npairs) 降至 O(natoms)。Per-atom forces 直接写入 LAMMPS force buffer，
 全局 virial 由 LAMMPS 的 `virial_fdotr_compute()` 自动处理。
 
-**模型限制**：仅以下四种模型支持 ML-IAP（因其支持 `precomputed_edge_vec`）：
+**模型限制**：仅以下五种模型支持 ML-IAP（因其支持 `precomputed_edge_vec`）：
 - `e3nn_layers.py`（spherical）
 - `e3nn_layers_channelwise.py`（spherical-save）
+- `cue_layers_channelwise.py`（**spherical-save-cue**，cuEquivariance GPU 加速）
 - `pure_cartesian_ictd_layers.py`（pure-cartesian-ictd-save）
 - `pure_cartesian_ictd_layers_full.py`（pure-cartesian-ictd）
 
 其他模型（如 pure-cartesian、pure-cartesian-sparse 等）暂不支持 ML-IAP 导出。
+
+**spherical-save-cue 的 ML-IAP 说明**：
+- 需安装 cuEquivariance：`pip install cuequivariance-torch cuequivariance-ops-torch-cu12`
+- 导出时使用 `--tensor-product-mode spherical-save-cue`（或 checkpoint 中已保存该模式）
+- 注意：cuEquivariance 内部模块可能无法 pickle，若 `torch.save` 失败，可改用 `pure-cartesian-ictd` 或 `spherical-save` 作为 ML-IAP 替代
 
 ### 步骤 1：导出模型
 
@@ -448,7 +468,9 @@ KeyError: atomic number not found in energy mapping
 ```bash
 bash lammps_user_mfftorch/examples/run_smoke_mfftorch.sh /path/to/lmp cuda
 # 或完整 GPU 测试（含 dummy 模型）：
-bash molecular_force_field/scripts/run_gpu_lammps_with_corept.sh --lmp /path/to/lmp --dummy-ictd --elements H O
+bash molecular_force_field/test/run_gpu_lammps_with_corept.sh --lmp /path/to/lmp --dummy-ictd --elements H O
+# spherical-save-cue dummy 测试：
+bash molecular_force_field/test/run_gpu_lammps_with_corept.sh --lmp /path/to/lmp --dummy-cue --elements H O --cutoff 5.0 --steps 200
 ```
 
 **fix external 接口：**

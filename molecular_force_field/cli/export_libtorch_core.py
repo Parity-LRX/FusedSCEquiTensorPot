@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-导出可被 LibTorch(C++) 直接加载的 TorchScript core 模型（torch.jit.save）。
+Export TorchScript core model loadable by LibTorch (C++) via torch.jit.save.
 
-与 `torch.save(obj)` 的区别：
-- `torch.save()` 保存的是 Python pickle 对象（包含自定义类），C++ 侧不能直接加载。
-- 纯 C++ 链路需要 `torch.jit.save(ScriptModule, path)` 导出的 TorchScript 文件。
+Difference from torch.save(obj):
+- torch.save() saves Python pickle objects (including custom classes), not directly loadable from C++.
+- Pure C++ pipeline requires TorchScript files exported via torch.jit.save(ScriptModule, path).
 
-本脚本导出的 `core.pt`：
-- forward 签名：
+This script exports core.pt with:
+- forward signature:
     (pos, A, batch, edge_src, edge_dst, edge_shifts, cell, edge_vec) -> atom_energies
-- **可选内置 E0**（方案B）：把预处理/拟合得到的 per-element 常数能（E0）写进 TorchScript，
-  导出后的 `core.pt` 输出的就是 “网络能量 + E0(Z)” 的 per-atom 能量。
-  注意：E0 不影响力（常数对坐标梯度为 0）。
+- **Optional embedded E0** (option B): embed per-element constant energy (E0) from preprocessing/fitting
+  into TorchScript; exported core.pt outputs per-atom energy as "network energy + E0(Z)".
+  Note: E0 does not affect forces (constant gradient w.r.t. coordinates is zero).
 """
 
 from __future__ import annotations
@@ -32,8 +32,11 @@ if _repo_root not in sys.path:
 
 def _pick_device(req: str) -> str:
     if req == "cuda" and not torch.cuda.is_available():
-        print("CUDA 不可用，改用 CPU")
+        print("CUDA not available, falling back to CPU")
         return "cpu"
+    if req == "cuda":
+        torch.cuda.set_device(0)
+        return "cuda:0"
     return req
 
 
@@ -46,7 +49,7 @@ def _parse_dtype(s: Optional[str]) -> Optional[torch.dtype]:
     }
     dt = mapping.get(s.lower().strip())
     if dt is None:
-        raise ValueError(f"不支持的 dtype: {s!r}，可选: float32, float64")
+        raise ValueError(f"Unsupported dtype: {s!r}, options: float32, float64")
     return dt
 
 
@@ -108,12 +111,35 @@ def export_core(
     max_radius: float,
     num_interaction: int,
     out_pt: str,
+    tensor_product_mode: Optional[str] = None,
     force_dtype: Optional[torch.dtype] = None,
     embed_e0: bool = True,
     e0_csv: Optional[str] = None,
+    native_ops: bool = False,
 ) -> None:
     from molecular_force_field.interfaces.lammps_mliap import LAMMPS_MLIAP_MFF, _maybe_torchscript_trace_model
     from molecular_force_field.utils.config import ModelConfig
+
+    _ts_supported = ("pure-cartesian-ictd", "pure-cartesian-ictd-save", "spherical-save-cue")
+
+    # Resolve mode: explicit arg > checkpoint > error
+    if tensor_product_mode is not None:
+        mode = tensor_product_mode
+    else:
+        ckpt_peek = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        mode = ckpt_peek.get("tensor_product_mode", None)
+        del ckpt_peek
+        if mode is None:
+            raise ValueError(
+                f"tensor_product_mode not saved in checkpoint; specify via --mode."
+                f"\nTorchScript-supported modes: {_ts_supported}"
+            )
+        print(f"[export_core] Read tensor_product_mode={mode!r} from checkpoint")
+    if mode not in _ts_supported:
+        raise ValueError(
+            f"Mode {mode!r} does not support TorchScript export."
+            f"\nSupported modes: {_ts_supported}"
+        )
 
     # Load atomic E0 from preprocessing output if requested.
     atomic_energy_keys = None
@@ -124,17 +150,35 @@ def export_core(
         atomic_energy_keys = cfg.atomic_energy_keys.tolist()
         atomic_energy_values = [float(x) for x in cfg.atomic_energy_values.tolist()]
 
-    # Build eager model first so we can (optionally) wrap E0 and/or cast dtype before tracing.
+    # spherical-save-cue uses cuEquivariance custom ops on CUDA.
+    # --native-ops: keep those ops in core.pt (requires MFF_CUSTOM_OPS_LIB at LAMMPS runtime).
+    # default:      build on CUDA with force_naive (pure-PyTorch ops, correct device constants).
+    force_naive = False
+    if mode == "spherical-save-cue" and not native_ops:
+        build_device = device
+        trace_device = device
+        force_naive = True
+        print("[export_core] spherical-save-cue: built with CUDA + force_naive, core.pt needs no cuEquivariance runtime")
+    elif mode == "spherical-save-cue" and native_ops:
+        build_device = device
+        trace_device = device
+        print("[export_core] spherical-save-cue --native-ops: using native cuEquivariance CUDA ops")
+        print("[export_core]   LAMMPS runtime must set MFF_CUSTOM_OPS_LIB to cuequivariance ops .so")
+    else:
+        build_device = device
+        trace_device = device
+
     obj = LAMMPS_MLIAP_MFF.from_checkpoint(
         checkpoint_path=checkpoint,
         element_types=elements,
         max_radius=max_radius,
         atomic_energy_keys=atomic_energy_keys,
         atomic_energy_values=atomic_energy_values,
-        device=device,
-        tensor_product_mode="pure-cartesian-ictd",
+        device=build_device,
+        tensor_product_mode=mode,
         num_interaction=num_interaction,
         torchscript=False,
+        force_naive=force_naive,
     )
 
     actual_dtype = obj.dtype
@@ -145,31 +189,37 @@ def export_core(
 
     model_eager = obj.wrapper.model
 
+    if mode == "spherical-save-cue" and not native_ops:
+        if hasattr(model_eager, "make_torchscript_portable"):
+            model_eager.make_torchscript_portable()
+            print("[export_core] Replaced product_3/product_5 with pure PyTorch impl (no cuequivariance custom ops)")
+
     # Optional: embed E0(Z) into per-atom energies before tracing.
     if embed_e0:
         aek = obj.wrapper.atomic_energy_keys.detach().cpu()
         aev = obj.wrapper.atomic_energy_values.detach().cpu()
-        lut = _e0_lut_from_keys_values(aek, aev, dtype=actual_dtype, device=torch.device(device))
-        model_eager = _E0WrappedModel(model_eager, lut).to(device=torch.device(device))
+        lut = _e0_lut_from_keys_values(aek, aev, dtype=actual_dtype, device=torch.device(trace_device))
+        model_eager = _E0WrappedModel(model_eager, lut).to(device=torch.device(trace_device))
 
     # Trace to TorchScript core (edge_vec positional arg) and export its ScriptModule.
     ts_model = _maybe_torchscript_trace_model(
         model_eager,
-        device=torch.device(device),
+        device=torch.device(trace_device),
         dtype=actual_dtype,
         enable=True,
     )
     core = getattr(ts_model, "core", None)
     if core is None or not isinstance(core, torch.jit.ScriptModule):
-        raise RuntimeError("未拿到 TorchScript core 模块（trace 失败）")
+        raise RuntimeError("Failed to obtain TorchScript core module (trace failed)")
 
     os.makedirs(os.path.dirname(os.path.abspath(out_pt)), exist_ok=True)
     core.eval()
     torch.jit.save(core, out_pt)
-    print(f"已导出 LibTorch 可加载的 TorchScript core: {out_pt}")
+    print(f"Exported LibTorch-loadable TorchScript core: {out_pt}")
 
     meta = {
         "elements": elements,
+        "tensor_product_mode": mode,
         "device_exported_from": device,
         "max_radius": float(max_radius),
         "num_interaction": int(num_interaction),
@@ -187,31 +237,38 @@ def export_core(
             "edge_vec(E,3)",
         ],
         "notes": [
-            "这是 core 模型：输出每原子能量。",
-            "若 embed_e0=true：输出已包含 E0(Z) 常数偏置（来自预处理拟合或提供的 e0_csv）。",
-            "力通过 dE/d(pos) 在 C++ 侧用 autograd 求得。",
-            "本文件可用 C++: torch::jit::load(path) 直接加载。",
+            "Core model: outputs per-atom energy.",
+            "If embed_e0=true: output includes E0(Z) constant bias (from preprocessing fit or e0_csv).",
+            "Forces: dE/d(pos) computed via autograd on C++ side.",
+            "Loadable: C++ torch::jit::load(path).",
         ],
     }
     meta_path = out_pt + ".json"
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
-    print(f"已写出元数据: {meta_path}")
+    print(f"Wrote metadata: {meta_path}")
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="导出 LibTorch 可加载的 TorchScript core 模型")
+    p = argparse.ArgumentParser(description="Export LibTorch-loadable TorchScript core model")
     p.add_argument("--checkpoint", type=str, required=True, help="checkpoint (.pth)")
-    p.add_argument("--elements", nargs="+", default=["H", "O"], help="元素顺序（LAMMPS type 顺序）")
+    p.add_argument("--elements", nargs="+", default=["H", "O"], help="Element order (LAMMPS type order)")
     p.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
-    p.add_argument("--max-radius", type=float, default=3.0)
+    p.add_argument("--mode", type=str, default=None,
+                   help="Model mode. If not set, read from checkpoint. "
+                        "Supported: pure-cartesian-ictd, pure-cartesian-ictd-save, spherical-save-cue")
+    p.add_argument("--max-radius", type=float, default=5.0,
+                   help="Cutoff radius (Å). Auto-read from checkpoint if saved; else use this. Must match training and LAMMPS pair_style cutoff.")
     p.add_argument("--num-interaction", type=int, default=2)
     p.add_argument("--dtype", type=str, default=None,
-                   help="强制导出精度: float32 或 float64。不指定则跟随 checkpoint。")
-    p.add_argument("--embed-e0", action="store_true", help="将 per-element E0(Z) 常数偏置写入 TorchScript（方案B）")
-    p.add_argument("--no-embed-e0", action="store_true", help="不把 E0 写入 TorchScript（仅导出网络能量）")
-    p.add_argument("--e0-csv", type=str, default=None, help="E0 CSV 路径（包含 Atom,E0 列）。提供则优先使用。")
-    p.add_argument("--out", type=str, default="core.pt", help="输出 TorchScript 文件路径")
+                   help="Force export precision: float32 or float64. If not set, follow checkpoint.")
+    p.add_argument("--embed-e0", action="store_true", help="Embed per-element E0(Z) constant bias into TorchScript (option B)")
+    p.add_argument("--no-embed-e0", action="store_true", help="Do not embed E0 into TorchScript (export network energy only)")
+    p.add_argument("--e0-csv", type=str, default=None, help="E0 CSV path (Atom,E0 columns). Takes precedence if provided.")
+    p.add_argument("--native-ops", action="store_true",
+                   help="spherical-save-cue: keep native cuEquivariance CUDA ops (faster, but LAMMPS requires MFF_CUSTOM_OPS_LIB). "
+                        "Default: pure PyTorch ops (portable, no extra deps).")
+    p.add_argument("--out", type=str, default="core.pt", help="Output TorchScript file path")
     args = p.parse_args()
 
     device = _pick_device(args.device)
@@ -224,9 +281,11 @@ def main() -> None:
         max_radius=float(args.max_radius),
         num_interaction=int(args.num_interaction),
         out_pt=str(args.out),
+        tensor_product_mode=args.mode,
         force_dtype=force_dtype,
         embed_e0=embed_e0,
         e0_csv=args.e0_csv,
+        native_ops=bool(args.native_ops),
     )
 
 

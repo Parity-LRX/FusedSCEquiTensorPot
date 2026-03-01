@@ -162,7 +162,8 @@ class Trainer:
             use_checkpoint_loss_weights: Whether to use loss weights (a, b) from checkpoint when loading.
                 If True (default), use checkpoint values. If False, use the values passed to __init__.
             tensor_product_mode: Tensor product mode used (default: 'spherical').
-                Options: 'spherical', 'partial-cartesian', 'partial-cartesian-loose',
+                Options: 'spherical', 'spherical-save', 'spherical-save-cue',
+                'partial-cartesian', 'partial-cartesian-loose',
                 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-ictd', 'pure-cartesian-ictd-save'
         """
         self.distributed = distributed
@@ -188,6 +189,7 @@ class Trainer:
         mode_suffix_map = {
             'spherical': '_spherical',
             'spherical-save': '_spherical_save',
+            'spherical-save-cue': '_spherical_save_cue',
             'partial-cartesian': '_partial_cartesian',
             'partial-cartesian-loose': '_partial_cartesian_loose',
             'pure-cartesian': '_pure_cartesian',
@@ -1314,7 +1316,10 @@ class Trainer:
                     'patience_counter': self.patience_counter,
                     'swa_applied': self.swa_applied,
                     'ema_enabled': self.ema_enabled,
+                    'tensor_product_mode': self.tensor_product_mode,
                 }
+                if self.config is not None:
+                    best_checkpoint_dict['max_radius'] = getattr(self.config, 'max_radius', 5.0)
                 
                 if self.save_ema_model and self.ema_enabled and self.e3trans_ema is not None:
                     best_checkpoint_dict['e3trans_ema_state_dict'] = self.e3trans_ema.state_dict()
@@ -1411,7 +1416,10 @@ class Trainer:
                 'patience_counter': self.patience_counter,
                 'swa_applied': self.swa_applied,
                 'ema_enabled': self.ema_enabled,
+                'tensor_product_mode': self.tensor_product_mode,
             }
+            if self.config is not None:
+                checkpoint_dict['max_radius'] = getattr(self.config, 'max_radius', 5.0)
 
             if self.save_ema_model and self.ema_enabled and self.e3trans_ema is not None:
                 checkpoint_dict['e3trans_ema_state_dict'] = self.e3trans_ema.state_dict()
@@ -1740,7 +1748,10 @@ class Trainer:
                     'patience_counter': self.patience_counter,
                     'swa_applied': self.swa_applied,
                     'ema_enabled': self.ema_enabled,
+                    'tensor_product_mode': self.tensor_product_mode,
                 }
+                if self.config is not None:
+                    checkpoint_dict['max_radius'] = getattr(self.config, 'max_radius', 5.0)
                 if self.save_ema_model and self.ema_enabled and self.e3trans_ema is not None:
                     checkpoint_dict['e3trans_ema_state_dict'] = self.e3trans_ema.state_dict()
 

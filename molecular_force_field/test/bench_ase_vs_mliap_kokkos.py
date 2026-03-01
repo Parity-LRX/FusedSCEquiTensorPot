@@ -172,7 +172,8 @@ def bench_ase(ckpt_path: str, n_atoms: int, n_steps: int, device: str, mode_over
             function_type_main=config.function_type,
             device=torch.device(device),
         ).to(device)
-    model.load_state_dict(ckpt["e3trans_state_dict"], strict=True)
+    is_cue = (mode == "spherical-save-cue")
+    model.load_state_dict(ckpt["e3trans_state_dict"], strict=not is_cue)
     model.eval()
 
     atomic_energies_dict = {1: -13.6, 8: -75.0}
@@ -323,15 +324,18 @@ def main():
         ckpt_path = os.path.join(td, "dummy.pth")
         _make_dummy_checkpoint_for_mode(args.mode, ckpt_path, torch.device("cpu"))
         model_pt = os.path.join(td, "model-mliap.pt")
+        mliap_device = "cuda" if torch.cuda.is_available() else "cpu"
         obj = LAMMPS_MLIAP_MFF.from_checkpoint(
             ckpt_path, element_types=["H", "O"], max_radius=3.0,
             atomic_energy_keys=[1, 8], atomic_energy_values=[-13.6, -75.0],
+            device=mliap_device,
         )
         try:
             torch.save(obj, model_pt)
             mliap_available = True
-        except (AttributeError, TypeError) as e:
-            if "pickle" in str(e).lower() or "Can't pickle" in str(e):
+        except (AttributeError, TypeError, RuntimeError) as e:
+            err_str = str(e).lower()
+            if "pickle" in err_str or "can't pickle" in err_str or "cannot pickle" in err_str:
                 print(f"注意: {args.mode} 模型无法序列化（cuEquivariance 内部限制），仅运行 ASE 测试")
                 mliap_available = False
             else:

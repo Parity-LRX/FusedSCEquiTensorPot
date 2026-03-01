@@ -8,6 +8,11 @@
 
 find_package(Torch REQUIRED)
 
+option(MFF_ENABLE_VIRIAL "Enable virial/stress calculation in mff/torch Kokkos pair style" OFF)
+if(MFF_ENABLE_VIRIAL)
+  target_compile_definitions(lammps PRIVATE MFF_ENABLE_VIRIAL)
+endif()
+
 if(TARGET Torch::Torch)
   target_link_libraries(lammps PRIVATE Torch::Torch)
 else()
