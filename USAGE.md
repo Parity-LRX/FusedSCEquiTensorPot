@@ -34,6 +34,7 @@ mff-train --help
 mff-evaluate --help
 mff-export-core --help   # LAMMPS LibTorch 导出
 mff-lammps --help        # LAMMPS fix external 接口
+mff-active-learn --help  # 主动学习工作流
 python -m molecular_force_field.cli.export_mliap --help  # LAMMPS ML-IAP 导出
 ```
 
@@ -883,6 +884,307 @@ plt.close()
 pip install scipy  # 声子谱计算需要（用于矩阵对角化）
 pip install ase    # 结构处理和邻居列表（通常已安装）
 ```
+
+## 主动学习 (mff-active-learn)
+
+主动学习模块实现 DPGen2 风格的工作流：**训练集成 → 探索（MD/NEB）→ 按力偏差筛选 → DFT 标注 → 合并数据 → 重复**，用于在势能面尚未覆盖的区域自动采点并扩充训练集。支持**单节点**（本机多进程并发标注）和**超算**（SLURM 按结构提交作业）；同一套 DFT 脚本模板可同时用于本地测试（`local-script`）和集群（`slurm`）。
+
+### 基本用法
+
+必选参数：`--explore-type`（`ase` 或 `lammps`）、`--label-type`（见下表）。单阶段模式示例：
+
+```bash
+mff-active-learn --explore-type ase --explore-mode md --label-type pyscf \
+    --pyscf-method b3lyp --pyscf-basis 6-31g* \
+    --md-steps 500 --n-iterations 5
+```
+
+查看全部参数：
+
+```bash
+mff-active-learn --help
+```
+
+### 核心参数
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--work-dir` | `al_work` | 主动学习工作目录 |
+| `--data-dir` | `data` | 训练数据目录（需含 processed_train.h5 或 train.xyz） |
+| `--init-structure` | 从 data-dir 自动提取 | 初始结构 XYZ 路径 |
+| `--n-models` | 4 | 集成模型数量 |
+| `--n-iterations` | 20 | 单阶段最大迭代次数（未用 --stages 时） |
+| `--explore-type` | 必选 | 探索后端：`ase` 或 `lammps` |
+| `--explore-mode` | `md` | 探索方式：`md`（分子动力学）或 `neb`（弹性带） |
+| `--label-type` | 必选 | 标注方式，见下表 |
+| `--md-temperature` | 300 | MD 温度 (K) |
+| `--md-steps` | 10000 | MD 步数 |
+| `--md-timestep` | 1.0 | MD 时间步长 (fs) |
+| `--md-friction` | 0.01 | Langevin 摩擦系数 |
+| `--md-relax-fmax` | 0.05 | 预优化力收敛阈值 (eV/Å) |
+| `--md-log-interval` | 10 | 轨迹记录间隔 |
+| `--level-f-lo` / `--level-f-hi` | 0.05 / 0.5 | 力偏差筛选阈值 (eV/Å) |
+| `--conv-accuracy` | 0.9 | 收敛判定比例 |
+| `--epochs` | 由 mff-train 默认 | 每轮每个模型的训练 epoch 数 |
+| `--stages` | 无 | 多阶段 JSON 文件路径 |
+| `--device` | `cuda` | 推理设备 |
+| `--max-radius` | 5.0 | 邻居搜索最大半径 (Å) |
+| `--atomic-energy-file` | `data/fitted_E0.csv` | 原子参考能量 CSV |
+| `--neb-initial` / `--neb-final` | 无 | NEB 模式下的初/末结构 |
+
+### 标注类型 (--label-type)
+
+| 类型 | 说明 | 典型用途 |
+|------|------|----------|
+| `identity` | 用当前 ML 模型预测（不跑 DFT） | 调试、快速测试流程 |
+| `pyscf` | PySCF 计算（无需外部二进制） | 小分子、本地验证 |
+| `vasp` | VASP（ASE 接口） | 平面波 DFT，单节点或脚本内 MPI |
+| `cp2k` | CP2K（ASE 接口） | 高斯+平面波，单节点 |
+| `espresso` | Quantum Espresso pw.x（ASE 接口） | 单节点 QE |
+| `gaussian` | Gaussian g16/g09（ASE 接口） | 单节点 |
+| `orca` | ORCA（ASE 接口） | 单节点 |
+| `script` | 用户脚本：`脚本路径 input.xyz output.xyz` | 任意 DFT/程序 |
+| `local-script` | 与 SLURM 同格式的脚本模板，**本地执行** | 单节点 + 同一套脚本 |
+| `slurm` | 与 local-script 同格式的脚本模板，**每结构提交一个 sbatch 作业** | 超算多节点 |
+
+### CLI 命令示例
+
+**快速测试（不跑 DFT，用 ML 自举）：**
+
+```bash
+mff-active-learn --explore-type ase --explore-mode md --label-type identity \
+    --md-temperature 300 --md-steps 200 --n-iterations 2 --epochs 5 --n-models 2
+```
+
+**PySCF（本地，无需外部 DFT 二进制）：**
+
+```bash
+mff-active-learn --explore-type ase --explore-mode md --label-type pyscf \
+    --pyscf-method b3lyp --pyscf-basis 6-31g* \
+    --label-n-workers 8 --md-steps 500 --n-iterations 5
+```
+
+**VASP（单节点，ASE 接口）：**
+
+```bash
+export ASE_VASP_COMMAND="mpirun -np 4 vasp_std"
+export VASP_PP_PATH=/path/to/potpaw_PBE
+
+mff-active-learn --explore-type ase --label-type vasp \
+    --vasp-xc PBE --vasp-encut 500 --vasp-kpts 4 4 4 \
+    --label-n-workers 8 --label-threads-per-worker 4 \
+    --md-steps 1000 --n-iterations 10
+```
+
+**CP2K：**
+
+```bash
+mff-active-learn --explore-type ase --label-type cp2k \
+    --cp2k-xc PBE --cp2k-cutoff 600 --md-steps 500 --n-iterations 5
+```
+
+**Quantum Espresso：**
+
+```bash
+mff-active-learn --explore-type ase --label-type espresso \
+    --qe-pseudo-dir /path/to/pseudos \
+    --qe-pseudopotentials '{"H":"H.pbe.UPF","O":"O.pbe.UPF"}' \
+    --qe-ecutwfc 60 --md-steps 500 --n-iterations 5
+```
+
+**Gaussian：**
+
+```bash
+mff-active-learn --explore-type ase --label-type gaussian \
+    --gaussian-method b3lyp --gaussian-basis 6-31+G* --gaussian-nproc 8 \
+    --md-steps 500 --n-iterations 5
+```
+
+**ORCA：**
+
+```bash
+mff-active-learn --explore-type ase --label-type orca \
+    --orca-simpleinput "B3LYP def2-TZVP TightSCF" --orca-nproc 8 \
+    --md-steps 500 --n-iterations 5
+```
+
+**用户脚本（任意 DFT）：**
+
+```bash
+mff-active-learn --explore-type ase --label-type script --label-script ./my_dft.sh \
+    --md-steps 500 --n-iterations 5
+```
+
+**local-script（本地执行脚本模板）：**
+
+```bash
+mff-active-learn --explore-type ase --label-type local-script \
+    --local-script-template dft_job.sh \
+    --label-n-workers 4 --md-steps 500 --n-iterations 3
+```
+
+**SLURM（超算，每结构一个作业）：**
+
+```bash
+mff-active-learn --explore-type ase --label-type slurm \
+    --slurm-template dft_job.sh --slurm-partition cpu \
+    --slurm-nodes 1 --slurm-ntasks 32 --slurm-time 04:00:00
+```
+
+**多阶段 JSON（如先 300K 再 600K）：**
+
+```bash
+mff-active-learn --explore-type ase --label-type pyscf --stages stages.json
+```
+
+**NEB 探索：**
+
+```bash
+mff-active-learn --explore-type ase --explore-mode neb \
+    --neb-initial reactant.xyz --neb-final product.xyz \
+    --label-type pyscf --pyscf-method b3lyp --n-iterations 5
+```
+
+### 并发与错误处理
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--label-n-workers` | 1 | 同时跑多少个结构（进程数） |
+| `--label-threads-per-worker` | 1（n_workers>1 时）或自动 | 每个结构内部线程数（如 PySCF/VASP 的 OpenMP） |
+| `--label-error-handling` | `raise` | `raise`（任一失败即退出）或 `skip`（跳过失败结构继续） |
+
+建议：`n_workers × threads_per_worker ≤ 总核数`。
+
+### 工作流说明（每轮迭代做什么）
+
+每一轮（iteration）大致执行以下步骤，直到达到该阶段的 `max_iters` 或收敛：
+
+1. **训练集成**：用当前 `data_dir` 中的训练数据训练 `n_models` 个模型（不同随机种子）， checkpoint 写入 `work_dir/checkpoint/`。
+2. **探索**：用其中一个模型对初始结构跑 MD（或 NEB），得到轨迹 `work_dir/iterations/iter_<i>/explore_traj.xyz`。
+3. **筛选**：计算轨迹上各帧的模型力偏差（集成预测的力与平均力的偏差），按 `level_f_lo` / `level_f_hi` 筛选出“不确定”的构型。
+4. **标注**：对筛选出的构型调用 DFT（或 identity/script），生成带能量、力的 extended XYZ，写入 `iterations/iter_<i>/labeled/`。
+5. **合并**：将新标注的数据合并回 `data_dir`（更新 processed_train.h5 / train.xyz 等），作为下一轮训练的输入。
+
+使用 `--stages` 时，会按 JSON 中定义的阶段顺序执行；每个阶段内重复上述迭代，阶段之间数据累积。
+
+### 工作目录结构 (--work-dir)
+
+典型布局（默认 `al_work`）：
+
+```
+al_work/
+├── checkpoint/           # 集成模型 checkpoint（model_0_*.pth, model_1_*.pth, ...）
+├── init.xyz              # 若未指定 --init-structure，从此处或 data_dir 提取
+└── iterations/
+    ├── iter_0/
+    │   ├── explore_traj.xyz   # 本轮探索轨迹
+    │   └── labeled/           # 本轮 DFT 标注结果（extended XYZ）
+    ├── iter_1/
+    │   └── ...
+    └── ...
+```
+
+### DFT 后端参数摘要
+
+**PySCF**（`--label-type pyscf`）：
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--pyscf-method` | `b3lyp` | 方法：b3lyp, pbe, hf, mp2 等 |
+| `--pyscf-basis` | `sto-3g` | 基组：sto-3g, 6-31g*, def2-svp 等 |
+| `--pyscf-charge` | 0 | 总电荷 |
+| `--pyscf-spin` | 0 | 2S（未配对电子数） |
+| `--pyscf-max-memory` | 4000 | 最大内存 (MB) |
+| `--pyscf-conv-tol` | 1e-9 | SCF 收敛阈值 |
+
+**VASP**（`--label-type vasp`）：
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--vasp-xc` | `PBE` | XC 泛函：PBE, LDA, HSE06 等 |
+| `--vasp-encut` | 无 | 平面波截断 (eV) |
+| `--vasp-kpts` | `1 1 1` | k 点网格 |
+| `--vasp-ediff` | 1e-6 | SCF 收敛阈值 (eV) |
+| `--vasp-ismear` | 0 | 展宽类型：0=Gaussian, -5=tetrahedron |
+| `--vasp-sigma` | 0.05 | 展宽宽度 (eV) |
+| `--vasp-command` | 覆盖 ASE_VASP_COMMAND | 运行命令 |
+| `--vasp-cleanup` | False | 成功后删除运行目录 |
+
+**CP2K**：`--cp2k-xc`、`--cp2k-basis-set`、`--cp2k-cutoff`、`--cp2k-max-scf`、`--cp2k-charge`、`--cp2k-command`、`--cp2k-cleanup`。  
+**Quantum Espresso**：`--qe-pseudo-dir`（必选）、`--qe-pseudopotentials`（必选，JSON）、`--qe-ecutwfc`、`--qe-kpts`、`--qe-command`、`--qe-cleanup`。  
+**Gaussian**：`--gaussian-method`、`--gaussian-basis`、`--gaussian-charge`、`--gaussian-mult`、`--gaussian-nproc`、`--gaussian-mem`、`--gaussian-command`、`--gaussian-cleanup`。  
+**ORCA**：`--orca-simpleinput`、`--orca-nproc`、`--orca-charge`、`--orca-mult`、`--orca-command`、`--orca-cleanup`。
+
+### 脚本模板占位符（local-script / slurm）
+
+`--local-script-template` 与 `--slurm-template` 使用相同占位符，在脚本中可写：
+
+| 占位符 | 说明 |
+|--------|------|
+| `{run_dir}` | 当前结构的运行目录 |
+| `{input_xyz}` | 输入 XYZ 路径 |
+| `{output_xyz}` | 输出 extended XYZ 路径（脚本需写入此文件） |
+| `{job_name}` | 作业/任务名称 |
+| `{partition}` | SLURM 分区（仅 slurm） |
+| `{nodes}` | 节点数（仅 slurm） |
+| `{ntasks}` | 任务数（仅 slurm） |
+| `{time}` | 时间限制（仅 slurm） |
+| `{mem}` | 内存（仅 slurm） |
+
+脚本需保证：执行结束后 `{output_xyz}` 存在且为 extended XYZ（含 `Properties=species:S:1:pos:R:3:energy:R:1:forces:R:3`，能量 eV，力 eV/Å）。
+
+### SLURM 参数（--label-type slurm）
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--slurm-template` | 必选 | 作业脚本模板路径 |
+| `--slurm-partition` | `cpu` | 队列/分区名 |
+| `--slurm-nodes` | 1 | 每作业节点数 |
+| `--slurm-ntasks` | 32 | 每作业任务数 |
+| `--slurm-time` | `02:00:00` | 墙钟时间限制 |
+| `--slurm-mem` | `64G` | 每作业内存 |
+| `--slurm-max-concurrent` | 200 | 队列中最大并发作业数 |
+| `--slurm-poll-interval` | 30 | 轮询 squeue 间隔（秒） |
+| `--slurm-extra` | 无 | 额外 sbatch 参数，如 `--account=myproject` |
+| `--slurm-cleanup` | False | 成功后删除运行目录 |
+
+若某结构的 `output.xyz` 已存在（如上次中断后重跑），会自动跳过该结构的提交（resume）。
+
+### 环境变量
+
+| 变量 | 说明 |
+|------|------|
+| `ASE_VASP_COMMAND` | VASP 运行命令，如 `mpirun -np 4 vasp_std` |
+| `VASP_PP_PATH` | VASP 赝势目录 |
+| `ASE_CP2K_COMMAND` | CP2K 运行命令 |
+| `CP2K_DATA_DIR` | CP2K 数据目录 |
+| `ASE_GAUSSIAN_COMMAND` | Gaussian 命令，如 `g16 < PREFIX.com > PREFIX.log` |
+
+ORCA 和 QE 可通过 `--orca-command`、`--qe-command` 指定，或确保可执行文件在 PATH 中。
+
+### 常见问题（FAQ）
+
+- **初始结构从哪里来？** 未指定 `--init-structure` 时，从 `--data-dir` 的 `train.xyz` 或 `processed_train.h5` 取第一个结构。
+- **如何从上次中断处继续？** SLURM 模式下，若某结构的 `output.xyz` 已存在会自动跳过；本地模式可用 `--label-error-handling skip` 跳过失败结构继续。
+- **输出 XYZ 格式要求？** 标注器输出的 XYZ 需包含 `Properties=species:S:1:pos:R:3:energy:R:1:forces:R:3`，能量 eV，力 eV/Å。
+- **训练超参数？** `--epochs` 会传给内部 `mff-train`；当前 CLI 仅暴露 `--epochs`，其余见训练章节。
+
+### 多阶段 JSON (--stages)
+
+使用 `--stages stages.json` 时，命令行中的 `--md-*`、`--n-iterations` 等单阶段参数会被忽略。JSON 格式示例：
+
+```json
+[
+  {"name": "300K", "temperature": 300, "nsteps": 500, "max_iters": 3,
+   "level_f_lo": 0.05, "level_f_hi": 0.5, "conv_accuracy": 0.9},
+  {"name": "600K", "temperature": 600, "nsteps": 1000, "max_iters": 3,
+   "level_f_lo": 0.05, "level_f_hi": 0.5, "conv_accuracy": 0.9}
+]
+```
+
+### 更多说明
+
+更完整的示例、多阶段字段说明及进阶用法见 [ACTIVE_LEARNING.md](ACTIVE_LEARNING.md)。
 
 ## Python API 使用
 

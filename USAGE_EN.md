@@ -34,6 +34,7 @@ mff-train --help
 mff-evaluate --help
 mff-export-core --help   # LAMMPS LibTorch export
 mff-lammps --help        # LAMMPS fix external interface
+mff-active-learn --help  # Active learning workflow
 python -m molecular_force_field.cli.export_mliap --help  # LAMMPS ML-IAP export
 ```
 
@@ -881,6 +882,307 @@ plt.close()
 pip install scipy  # Required for phonon spectrum calculation (for matrix diagonalization)
 pip install ase    # Structure processing and neighbor lists (usually already installed)
 ```
+
+## Active Learning (mff-active-learn)
+
+The active learning module implements a DPGen2-style workflow: **Train ensemble → Explore (MD/NEB) → Select by force deviation → Label (DFT) → Merge data → Repeat**, to automatically sample under-sampled regions of the potential energy surface and expand the training set. It supports **single-node** (parallel labeling with multiple workers) and **HPC** (SLURM: one job per structure). The same DFT script template can be used for local runs (`local-script`) and cluster runs (`slurm`).
+
+### Basic usage
+
+Required arguments: `--explore-type` (`ase` or `lammps`), `--label-type` (see table below). Single-stage example:
+
+```bash
+mff-active-learn --explore-type ase --explore-mode md --label-type pyscf \
+    --pyscf-method b3lyp --pyscf-basis 6-31g* \
+    --md-steps 500 --n-iterations 5
+```
+
+View all options:
+
+```bash
+mff-active-learn --help
+```
+
+### Core parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--work-dir` | `al_work` | Active learning working directory |
+| `--data-dir` | `data` | Training data directory (must contain processed_train.h5 or train.xyz) |
+| `--init-structure` | Auto from data-dir | Path to initial structure XYZ |
+| `--n-models` | 4 | Number of ensemble models |
+| `--n-iterations` | 20 | Max iterations per stage (when not using --stages) |
+| `--explore-type` | Required | Exploration backend: `ase` or `lammps` |
+| `--explore-mode` | `md` | Exploration mode: `md` (molecular dynamics) or `neb` (elastic band) |
+| `--label-type` | Required | Labeling method, see table below |
+| `--md-temperature` | 300 | MD temperature (K) |
+| `--md-steps` | 10000 | MD steps |
+| `--md-timestep` | 1.0 | MD timestep (fs) |
+| `--md-friction` | 0.01 | Langevin friction |
+| `--md-relax-fmax` | 0.05 | Pre-relax force convergence (eV/Å) |
+| `--md-log-interval` | 10 | Trajectory log interval |
+| `--level-f-lo` / `--level-f-hi` | 0.05 / 0.5 | Force deviation selection thresholds (eV/Å) |
+| `--conv-accuracy` | 0.9 | Convergence criterion ratio |
+| `--epochs` | mff-train default | Training epochs per model per iteration |
+| `--stages` | None | Path to multi-stage JSON file |
+| `--device` | `cuda` | Inference device |
+| `--max-radius` | 5.0 | Neighbor search cutoff (Å) |
+| `--atomic-energy-file` | `data/fitted_E0.csv` | Atomic reference energy CSV |
+| `--neb-initial` / `--neb-final` | None | Initial/final structures for NEB mode |
+
+### Label types (--label-type)
+
+| Type | Description | Typical use |
+|------|-------------|-------------|
+| `identity` | Use current ML model (no DFT) | Debug, quick pipeline test |
+| `pyscf` | PySCF (no external binary) | Small molecules, local validation |
+| `vasp` | VASP (ASE interface) | Plane-wave DFT, single-node or in-script MPI |
+| `cp2k` | CP2K (ASE interface) | Gaussian+plane-wave, single-node |
+| `espresso` | Quantum Espresso pw.x (ASE interface) | Single-node QE |
+| `gaussian` | Gaussian g16/g09 (ASE interface) | Single-node |
+| `orca` | ORCA (ASE interface) | Single-node |
+| `script` | User script: `script_path input.xyz output.xyz` | Any DFT/code |
+| `local-script` | Same template as SLURM, **run locally** | Single-node, same script |
+| `slurm` | Same template as local-script, **one sbatch job per structure** | HPC multi-node |
+
+### CLI command examples
+
+**Quick test (no DFT, ML bootstrap):**
+
+```bash
+mff-active-learn --explore-type ase --explore-mode md --label-type identity \
+    --md-temperature 300 --md-steps 200 --n-iterations 2 --epochs 5 --n-models 2
+```
+
+**PySCF (local, no external DFT binary):**
+
+```bash
+mff-active-learn --explore-type ase --explore-mode md --label-type pyscf \
+    --pyscf-method b3lyp --pyscf-basis 6-31g* \
+    --label-n-workers 8 --md-steps 500 --n-iterations 5
+```
+
+**VASP (single-node, ASE interface):**
+
+```bash
+export ASE_VASP_COMMAND="mpirun -np 4 vasp_std"
+export VASP_PP_PATH=/path/to/potpaw_PBE
+
+mff-active-learn --explore-type ase --label-type vasp \
+    --vasp-xc PBE --vasp-encut 500 --vasp-kpts 4 4 4 \
+    --label-n-workers 8 --label-threads-per-worker 4 \
+    --md-steps 1000 --n-iterations 10
+```
+
+**CP2K:**
+
+```bash
+mff-active-learn --explore-type ase --label-type cp2k \
+    --cp2k-xc PBE --cp2k-cutoff 600 --md-steps 500 --n-iterations 5
+```
+
+**Quantum Espresso:**
+
+```bash
+mff-active-learn --explore-type ase --label-type espresso \
+    --qe-pseudo-dir /path/to/pseudos \
+    --qe-pseudopotentials '{"H":"H.pbe.UPF","O":"O.pbe.UPF"}' \
+    --qe-ecutwfc 60 --md-steps 500 --n-iterations 5
+```
+
+**Gaussian:**
+
+```bash
+mff-active-learn --explore-type ase --label-type gaussian \
+    --gaussian-method b3lyp --gaussian-basis 6-31+G* --gaussian-nproc 8 \
+    --md-steps 500 --n-iterations 5
+```
+
+**ORCA:**
+
+```bash
+mff-active-learn --explore-type ase --label-type orca \
+    --orca-simpleinput "B3LYP def2-TZVP TightSCF" --orca-nproc 8 \
+    --md-steps 500 --n-iterations 5
+```
+
+**User script (any DFT):**
+
+```bash
+mff-active-learn --explore-type ase --label-type script --label-script ./my_dft.sh \
+    --md-steps 500 --n-iterations 5
+```
+
+**local-script (run script template locally):**
+
+```bash
+mff-active-learn --explore-type ase --label-type local-script \
+    --local-script-template dft_job.sh \
+    --label-n-workers 4 --md-steps 500 --n-iterations 3
+```
+
+**SLURM (HPC, one job per structure):**
+
+```bash
+mff-active-learn --explore-type ase --label-type slurm \
+    --slurm-template dft_job.sh --slurm-partition cpu \
+    --slurm-nodes 1 --slurm-ntasks 32 --slurm-time 04:00:00
+```
+
+**Multi-stage JSON (e.g. 300K then 600K):**
+
+```bash
+mff-active-learn --explore-type ase --label-type pyscf --stages stages.json
+```
+
+**NEB exploration:**
+
+```bash
+mff-active-learn --explore-type ase --explore-mode neb \
+    --neb-initial reactant.xyz --neb-final product.xyz \
+    --label-type pyscf --pyscf-method b3lyp --n-iterations 5
+```
+
+### Concurrency and error handling
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--label-n-workers` | 1 | Number of structures to run in parallel (processes) |
+| `--label-threads-per-worker` | 1 (when n_workers>1) or auto | Threads per structure (e.g. PySCF/VASP OpenMP) |
+| `--label-error-handling` | `raise` | `raise` (stop on first failure) or `skip` (skip failed structures) |
+
+Recommendation: `n_workers × threads_per_worker ≤ total CPU cores`.
+
+### Workflow (what each iteration does)
+
+Each iteration (until the stage’s `max_iters` or convergence) roughly does:
+
+1. **Train ensemble**: Train `n_models` models (different seeds) on current `data_dir`, save checkpoints to `work_dir/checkpoint/`.
+2. **Explore**: Run MD (or NEB) from the initial structure using one model; trajectory written to `work_dir/iterations/iter_<i>/explore_traj.xyz`.
+3. **Select**: Compute force deviation (ensemble vs mean) on trajectory frames; select “uncertain” configurations between `level_f_lo` and `level_f_hi`.
+4. **Label**: Run DFT (or identity/script) on selected configs; write extended XYZ (energy, forces) to `iterations/iter_<i>/labeled/`.
+5. **Merge**: Merge new labeled data into `data_dir` (update processed_train.h5 / train.xyz) for the next round.
+
+With `--stages`, stages run in order; iterations repeat within each stage and data accumulates across stages.
+
+### Working directory layout (--work-dir)
+
+Typical layout (default `al_work`):
+
+```
+al_work/
+├── checkpoint/           # Ensemble checkpoints (model_0_*.pth, model_1_*.pth, ...)
+├── init.xyz              # Initial structure (from --init-structure or data_dir)
+└── iterations/
+    ├── iter_0/
+    │   ├── explore_traj.xyz   # This iteration’s trajectory
+    │   └── labeled/           # This iteration’s DFT-labeled extended XYZs
+    ├── iter_1/
+    │   └── ...
+    └── ...
+```
+
+### DFT backend parameters (summary)
+
+**PySCF** (`--label-type pyscf`):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--pyscf-method` | `b3lyp` | Method: b3lyp, pbe, hf, mp2, etc. |
+| `--pyscf-basis` | `sto-3g` | Basis: sto-3g, 6-31g*, def2-svp, etc. |
+| `--pyscf-charge` | 0 | Total charge |
+| `--pyscf-spin` | 0 | 2S (unpaired electrons) |
+| `--pyscf-max-memory` | 4000 | Max memory (MB) |
+| `--pyscf-conv-tol` | 1e-9 | SCF convergence threshold |
+
+**VASP** (`--label-type vasp`):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--vasp-xc` | `PBE` | XC functional: PBE, LDA, HSE06, etc. |
+| `--vasp-encut` | None | Plane-wave cutoff (eV) |
+| `--vasp-kpts` | `1 1 1` | k-point mesh |
+| `--vasp-ediff` | 1e-6 | SCF convergence (eV) |
+| `--vasp-ismear` | 0 | Smearing: 0=Gaussian, -5=tetrahedron |
+| `--vasp-sigma` | 0.05 | Smearing width (eV) |
+| `--vasp-command` | Override ASE_VASP_COMMAND | Run command |
+| `--vasp-cleanup` | False | Remove run dirs after success |
+
+**CP2K**: `--cp2k-xc`, `--cp2k-basis-set`, `--cp2k-cutoff`, `--cp2k-max-scf`, `--cp2k-charge`, `--cp2k-command`, `--cp2k-cleanup`.  
+**Quantum Espresso**: `--qe-pseudo-dir` (required), `--qe-pseudopotentials` (required, JSON), `--qe-ecutwfc`, `--qe-kpts`, `--qe-command`, `--qe-cleanup`.  
+**Gaussian**: `--gaussian-method`, `--gaussian-basis`, `--gaussian-charge`, `--gaussian-mult`, `--gaussian-nproc`, `--gaussian-mem`, `--gaussian-command`, `--gaussian-cleanup`.  
+**ORCA**: `--orca-simpleinput`, `--orca-nproc`, `--orca-charge`, `--orca-mult`, `--orca-command`, `--orca-cleanup`.
+
+### Script template placeholders (local-script / slurm)
+
+`--local-script-template` and `--slurm-template` use the same placeholders:
+
+| Placeholder | Description |
+|-------------|-------------|
+| `{run_dir}` | Run directory for current structure |
+| `{input_xyz}` | Input XYZ path |
+| `{output_xyz}` | Output extended XYZ path (script must write here) |
+| `{job_name}` | Job/task name |
+| `{partition}` | SLURM partition (slurm only) |
+| `{nodes}` | Node count (slurm only) |
+| `{ntasks}` | Task count (slurm only) |
+| `{time}` | Time limit (slurm only) |
+| `{mem}` | Memory (slurm only) |
+
+The script must produce `{output_xyz}` as extended XYZ with `Properties=species:S:1:pos:R:3:energy:R:1:forces:R:3`, energy in eV, forces in eV/Å.
+
+### SLURM parameters (--label-type slurm)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--slurm-template` | Required | Path to job script template |
+| `--slurm-partition` | `cpu` | Partition/queue name |
+| `--slurm-nodes` | 1 | Nodes per job |
+| `--slurm-ntasks` | 32 | Tasks per job |
+| `--slurm-time` | `02:00:00` | Wall-clock limit |
+| `--slurm-mem` | `64G` | Memory per job |
+| `--slurm-max-concurrent` | 200 | Max concurrent jobs in queue |
+| `--slurm-poll-interval` | 30 | Seconds between squeue polls |
+| `--slurm-extra` | None | Extra sbatch args, e.g. `--account=myproject` |
+| `--slurm-cleanup` | False | Remove run dirs after success |
+
+If a structure’s `output.xyz` already exists (e.g. after resume), that structure is skipped.
+
+### Environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `ASE_VASP_COMMAND` | VASP run command, e.g. `mpirun -np 4 vasp_std` |
+| `VASP_PP_PATH` | VASP pseudopotential directory |
+| `ASE_CP2K_COMMAND` | CP2K run command |
+| `CP2K_DATA_DIR` | CP2K data directory |
+| `ASE_GAUSSIAN_COMMAND` | Gaussian command, e.g. `g16 < PREFIX.com > PREFIX.log` |
+
+ORCA and QE can use `--orca-command` / `--qe-command` or have executables on PATH.
+
+### FAQ
+
+- **Where does the initial structure come from?** If `--init-structure` is not set, the first structure is taken from `train.xyz` or `processed_train.h5` in `--data-dir`.
+- **How to resume after interruption?** In SLURM mode, structures with existing `output.xyz` are skipped. Locally, use `--label-error-handling skip` to skip failed structures and continue.
+- **Output XYZ format?** Labeler output must be extended XYZ with `Properties=species:S:1:pos:R:3:energy:R:1:forces:R:3`, energy in eV, forces in eV/Å.
+- **Training hyperparameters?** `--epochs` is passed to the internal `mff-train`; the CLI currently only exposes `--epochs` (see training section for others).
+
+### Multi-stage JSON (--stages)
+
+When using `--stages stages.json`, single-stage flags like `--md-*` and `--n-iterations` are ignored. Example JSON:
+
+```json
+[
+  {"name": "300K", "temperature": 300, "nsteps": 500, "max_iters": 3,
+   "level_f_lo": 0.05, "level_f_hi": 0.5, "conv_accuracy": 0.9},
+  {"name": "600K", "temperature": 600, "nsteps": 1000, "max_iters": 3,
+   "level_f_lo": 0.05, "level_f_hi": 0.5, "conv_accuracy": 0.9}
+]
+```
+
+### More information
+
+For **DFT backend options** (PySCF/VASP/CP2K/QE/Gaussian/ORCA), **script template placeholders**, **SLURM parameters**, **environment variables**, and **FAQ**, see [ACTIVE_LEARNING.md](ACTIVE_LEARNING.md).
 
 ## Python API Usage
 

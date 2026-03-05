@@ -31,10 +31,18 @@
   - Evaluation: static metrics, MD, NEB, phonon spectrum
   - LAMMPS integration: LibTorch (USER-MFFTORCH), ML-IAP, fix external
   
+- **🔄 Active Learning (DPGen2-style)** — *automatically grow your training set where the model is uncertain*:
+  - **One command** runs the full loop: **Train (ensemble) → Explore (MD/NEB) → Select (force deviation) → Label (DFT) → Merge → repeat**.
+  - **10+ label backends**: PySCF (no binary), VASP / CP2K / QE / Gaussian / ORCA via ASE; user script; **one script template for both local and SLURM**.
+  - **Single-node**: `--label-n-workers 8` for parallel DFT; **HPC**: one sbatch job per structure, throttle & resume.
+  - **Multi-stage**: JSON config (e.g. 300K → 600K); optional PES coverage (SOAP).
+  - **Docs**: [USAGE](USAGE.md#主动学习-mff-active-learn) (中文) · [USAGE_EN](USAGE_EN.md#active-learning-mff-active-learn) (English) · [ACTIVE_LEARNING.md](ACTIVE_LEARNING.md) (FAQ & backends).
+  
 - **CLI Commands**:
   - `mff-preprocess` - Data preprocessing
   - `mff-train` - Training
   - `mff-evaluate` - Evaluation (static/MD/NEB/phonon)
+  - `mff-active-learn` - Active learning loop (explore, select, label, merge)
   - `mff-export-core` - Export LibTorch core.pt (USER-MFFTORCH)
   - `mff-lammps` - Generate LAMMPS fix external script
   - `python -m molecular_force_field.cli.export_mliap` - Export ML-IAP format
@@ -231,6 +239,24 @@ Optional: stress training (PBC with stress/virial in XYZ):
 ```bash
 mff-train --data-dir data -c 0.1 --input-file pbc_with_stress.xyz
 ```
+
+### 4. Active Learning (Optional) 🔄
+
+> **Grow your training set automatically** where the potential is under-sampled: one CLI runs the full **train → explore → select → label (DFT) → merge** loop. Works on a single machine (PySCF, VASP, …) or on HPC (SLURM, one job per structure).
+
+```bash
+# Local: PySCF, 8 parallel workers
+mff-active-learn --explore-type ase --explore-mode md --label-type pyscf \
+    --pyscf-method b3lyp --pyscf-basis 6-31g* \
+    --label-n-workers 8 --md-steps 500 --n-iterations 5
+
+# HPC: SLURM, one job per structure
+mff-active-learn --explore-type ase --label-type slurm \
+    --slurm-template dft_job.sh --slurm-partition cpu \
+    --slurm-nodes 1 --slurm-ntasks 32 --slurm-time 04:00:00
+```
+
+📖 **Full CLI & options**: [USAGE.md](USAGE.md#主动学习-mff-active-learn) (中文) · [USAGE_EN.md](USAGE_EN.md#active-learning-mff-active-learn) (English) · [ACTIVE_LEARNING.md](ACTIVE_LEARNING.md) (backends, multi-stage, FAQ).
 
 ## LAMMPS Integration
 
