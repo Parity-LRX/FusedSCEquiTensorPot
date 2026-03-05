@@ -19,6 +19,7 @@ from molecular_force_field.models import E3_TransformerLayer_multi, MainNet
 from molecular_force_field.models.losses import RMSELoss
 from molecular_force_field.utils.tensor_utils import map_tensor_values
 from molecular_force_field.utils.config import ModelConfig
+from molecular_force_field.models.pure_cartesian_ictd_layers import PhysicalTensorICTDEmbedding
 
 
 def log_gradient_statistics(networks, batch_idx, logger):
@@ -112,6 +113,10 @@ class Trainer:
         compile_val_fullgraph: bool = False,
         compile_val_dynamic: bool = False,
         compile_val_precache: bool = False,
+        # 推理模式：保存到 checkpoint，evaluate/inference_ddp 可读取；TorchScript/LAMMPS 导出始终只输出能量和力
+        inference_output_physical_tensors: bool = False,
+        # 物理张量 loss 系数：{"charge": 1.0, "dipole": 2.0, ...}，未指定则 1.0；charge_per_atom 用 charge
+        physical_tensor_weights: dict[str, float] | None = None,
     ):
         """
         Initialize trainer.
@@ -173,6 +178,8 @@ class Trainer:
         self.val_sampler = val_sampler
         self.is_main_process = (rank == 0)
         self.tensor_product_mode = tensor_product_mode
+        self.inference_output_physical_tensors = inference_output_physical_tensors
+        self.physical_tensor_weights = physical_tensor_weights or {}
 
         # Validation-only compile settings
         self.compile_val = str(compile_val)
@@ -201,6 +208,7 @@ class Trainer:
         
         self.model = model
         self.e3trans = e3trans
+        self.e3_arch_metadata = self._collect_e3_arch_metadata()
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.train_dataset = train_dataset
@@ -514,6 +522,128 @@ class Trainer:
         if self.c_max is not None:
             self.c = min(self.c, self.c_max)
 
+    def _collect_e3_arch_metadata(self):
+        """
+        Collect minimal architecture metadata required to rebuild optional heads at inference.
+        Kept best-effort for backward compatibility.
+        """
+        base = self.e3trans.module if (self.distributed and hasattr(self.e3trans, "module")) else self.e3trans
+        meta = {}
+
+        phys_specs = getattr(base, "_physical_tensor_specs", None)
+        if phys_specs:
+            meta["physical_tensor_outputs"] = copy.deepcopy(phys_specs)
+
+        e3_conv_emb = getattr(base, "e3_conv_emb", None)
+        ext_rank = getattr(e3_conv_emb, "external_tensor_rank", None) if e3_conv_emb is not None else None
+        if ext_rank is not None:
+            meta["external_tensor_rank"] = int(ext_rank)
+
+        return meta
+
+    def _compute_physical_tensor_loss(self, extras, phys_pred, batch_idx, base_e3):
+        """Compute weighted physical tensor supervised loss from extras and predicted heads."""
+        if phys_pred is None or not isinstance(phys_pred, dict):
+            return torch.tensor(0.0, device=self.device)
+        if not hasattr(self, "_phys_label_embedders"):
+            self._phys_label_embedders = {}
+        emb_cache = self._phys_label_embedders
+        phys_weights = self.physical_tensor_weights
+        phys_loss = torch.tensor(0.0, device=self.device)
+        lmax_model = int(getattr(base_e3, "lmax", 2))
+        num_graphs = int(batch_idx.max().item()) + 1 if batch_idx.numel() else 0
+
+        def _phys_weight(name: str) -> float:
+            base = name.replace("_per_atom", "")
+            return phys_weights.get(name, phys_weights.get(base, 1.0))
+
+        def _get_embed(rank: int, *, include_trace_chain: bool):
+            key = (rank, include_trace_chain, lmax_model)
+            m = emb_cache.get(key)
+            if m is None:
+                m = PhysicalTensorICTDEmbedding(
+                    rank=rank,
+                    lmax_out=lmax_model,
+                    channels_in=1,
+                    channels_out=1,
+                    input_repr="cartesian",
+                    include_trace_chain=include_trace_chain,
+                ).to(self.device)
+                emb_cache[key] = m
+            return m
+
+        # charge / charge_per_atom: scalar l=0
+        for name in ("charge", "charge_per_atom"):
+            if name in extras and name in phys_pred:
+                w = _phys_weight(name)
+                mask = extras.get(f"{name}_mask", None)
+                mask = mask.to(dtype=torch.bool) if torch.is_tensor(mask) else None
+                y = extras[name].view(-1)
+                p0 = phys_pred[name].get(0) if isinstance(phys_pred[name], dict) else None
+                if p0 is None:
+                    continue
+                if name.endswith("_per_atom"):
+                    p = p0.view(y.shape[0], -1).mean(dim=1) if p0.shape[0] == y.shape[0] else None
+                else:
+                    p = p0.view(num_graphs, -1).mean(dim=1) if p0.shape[0] == num_graphs else None
+                if p is None:
+                    continue
+                if mask is not None and mask.numel() == p.numel():
+                    phys_loss = phys_loss + w * self.criterion(p[mask], y[mask])
+                else:
+                    phys_loss = phys_loss + w * self.criterion(p, y)
+
+        # dipole / dipole_per_atom: rank1 -> l=1
+        for name in ("dipole", "dipole_per_atom"):
+            if name in extras and name in phys_pred:
+                w = _phys_weight(name)
+                mask = extras.get(f"{name}_mask", None)
+                mask = mask.to(dtype=torch.bool) if torch.is_tensor(mask) else None
+                y_cart = extras[name]
+                y_blocks = _get_embed(1, include_trace_chain=False)(y_cart, return_blocks=True)
+                p1 = phys_pred[name].get(1) if isinstance(phys_pred[name], dict) else None
+                if p1 is None or 1 not in y_blocks:
+                    continue
+                if mask is not None and mask.shape[0] == p1.shape[0]:
+                    phys_loss = phys_loss + w * self.criterion(p1[mask].view(-1), y_blocks[1][mask].view(-1))
+                else:
+                    phys_loss = phys_loss + w * self.criterion(p1.view(-1), y_blocks[1].view(-1))
+
+        # polarizability / per_atom: rank2 -> l=0 + l=2
+        for name in ("polarizability", "polarizability_per_atom"):
+            if name in extras and name in phys_pred:
+                w = _phys_weight(name)
+                mask = extras.get(f"{name}_mask", None)
+                mask = mask.to(dtype=torch.bool) if torch.is_tensor(mask) else None
+                y_cart = extras[name]
+                y_blocks = _get_embed(2, include_trace_chain=True)(y_cart, return_blocks=True)
+                for l in (0, 2):
+                    pl = phys_pred[name].get(l) if isinstance(phys_pred[name], dict) else None
+                    if pl is None or l not in y_blocks:
+                        continue
+                    if mask is not None and mask.shape[0] == pl.shape[0]:
+                        phys_loss = phys_loss + w * self.criterion(pl[mask].view(-1), y_blocks[l][mask].view(-1))
+                    else:
+                        phys_loss = phys_loss + w * self.criterion(pl.view(-1), y_blocks[l].view(-1))
+
+        # quadrupole / per_atom: rank2 compare STF l=2
+        for name in ("quadrupole", "quadrupole_per_atom"):
+            if name in extras and name in phys_pred:
+                w = _phys_weight(name)
+                mask = extras.get(f"{name}_mask", None)
+                mask = mask.to(dtype=torch.bool) if torch.is_tensor(mask) else None
+                y_cart = extras[name]
+                y_blocks = _get_embed(2, include_trace_chain=True)(y_cart, return_blocks=True)
+                p2 = phys_pred[name].get(2) if isinstance(phys_pred[name], dict) else None
+                if p2 is None or 2 not in y_blocks:
+                    continue
+                if mask is not None and mask.shape[0] == p2.shape[0]:
+                    phys_loss = phys_loss + w * self.criterion(p2[mask].view(-1), y_blocks[2][mask].view(-1))
+                else:
+                    phys_loss = phys_loss + w * self.criterion(p2.view(-1), y_blocks[2].view(-1))
+
+        return phys_loss
+
     def load_checkpoint(self, checkpoint_path):
         """Load checkpoint and restore training state."""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -585,6 +715,8 @@ class Trainer:
             self.best_val_loss = checkpoint['best_val_loss']
         if 'patience_counter' in checkpoint:
             self.patience_counter = checkpoint['patience_counter']
+        if 'physical_tensor_weights' in checkpoint:
+            self.physical_tensor_weights = checkpoint['physical_tensor_weights']
         
         self.resumed_from_checkpoint = True
         
@@ -626,6 +758,7 @@ class Trainer:
         total_batch_force_rmse = []
         total_batch_stress_loss = []
         total_batch_stress_rmse = []
+        total_batch_phys_loss = []
         
         all_nets = [self.e3trans, self.model]
         all_parameters = [param for net in all_nets for param in net.parameters()]
@@ -645,8 +778,13 @@ class Trainer:
             if batch_data is None:
                 continue
             
-            (pos, A, batch_idx, force_ref, target_energies,
-             edge_src, edge_dst, edge_shifts, cell, stress_ref) = batch_data
+            extras = {}
+            if isinstance(batch_data, (list, tuple)) and len(batch_data) == 11:
+                (pos, A, batch_idx, force_ref, target_energies,
+                 edge_src, edge_dst, edge_shifts, cell, stress_ref, extras) = batch_data
+            else:
+                (pos, A, batch_idx, force_ref, target_energies,
+                 edge_src, edge_dst, edge_shifts, cell, stress_ref) = batch_data
             
             # Move to device
             pos = pos.to(self.device)
@@ -659,6 +797,7 @@ class Trainer:
             edge_shifts = edge_shifts.to(self.device)
             cell = cell.to(self.device)
             stress_ref = stress_ref.to(self.device)
+            extras = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in (extras or {}).items()}
             
             pos.requires_grad_(True)
             
@@ -760,8 +899,38 @@ class Trainer:
                 pos_input = pos
                 cell_input = cell
 
-            # Forward pass
-            E_per_atom = self.e3trans(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input)
+            # Forward pass (optional external field + optional physical tensor heads)
+            forward_kwargs = {}
+            if "external_field" in extras:
+                forward_kwargs["external_tensor"] = extras["external_field"]
+
+            want_phys = any(
+                k in extras for k in (
+                    "charge", "dipole", "polarizability", "quadrupole",
+                    "charge_per_atom", "dipole_per_atom", "polarizability_per_atom", "quadrupole_per_atom",
+                )
+            )
+            base_e3 = self.e3trans.module if (self.distributed and hasattr(self.e3trans, "module")) else self.e3trans
+            supports_phys = hasattr(base_e3, "physical_tensor_heads") and base_e3.physical_tensor_heads is not None
+
+            phys_pred = None
+            if want_phys and supports_phys:
+                try:
+                    E_per_atom, phys_pred = self.e3trans(
+                        pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input,
+                        return_physical_tensors=True,
+                        **forward_kwargs,
+                    )
+                except TypeError:
+                    E_per_atom, phys_pred = self.e3trans(
+                        pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input,
+                        return_physical_tensors=True,
+                    )
+            else:
+                try:
+                    E_per_atom = self.e3trans(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input, **forward_kwargs)
+                except TypeError:
+                    E_per_atom = self.e3trans(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input)
             E_conv_mol = scatter(E_per_atom, batch_idx, dim=0, reduce='sum').squeeze(-1)
             E_mean = E_conv_mol + E_offset_mol
             
@@ -848,6 +1017,12 @@ class Trainer:
             
             # Total loss
             total_loss = self.a * energy_loss + self.b * force_loss + self.c * stress_loss
+
+            # Optional: physical tensor supervised loss (Cartesian label -> ICTD irreps)
+            phys_loss = torch.tensor(0.0, device=self.device)
+            if want_phys and supports_phys and phys_pred is not None:
+                phys_loss = self._compute_physical_tensor_loss(extras, phys_pred, batch_idx, base_e3)
+                total_loss = total_loss + phys_loss
             total_loss.backward()
             
             # Gradient clipping
@@ -888,6 +1063,7 @@ class Trainer:
             total_batch_force_rmse.append(force_rmse.item())
             total_batch_stress_loss.append(stress_loss.item())
             total_batch_stress_rmse.append(stress_rmse.item())
+            total_batch_phys_loss.append(phys_loss.item())
             
             # Record batch time
             batch_end_time = time.time()
@@ -901,6 +1077,7 @@ class Trainer:
                     current_energy_loss = np.mean(total_batch_energy_loss[-10:]) if len(total_batch_energy_loss) >= 10 else total_batch_energy_loss[-1] if total_batch_energy_loss else 0
                     current_force_loss = np.mean(total_batch_force_loss[-10:]) if len(total_batch_force_loss) >= 10 else total_batch_force_loss[-1] if total_batch_force_loss else 0
                     current_stress_loss = np.mean(total_batch_stress_loss[-10:]) if len(total_batch_stress_loss) >= 10 else total_batch_stress_loss[-1] if total_batch_stress_loss else 0
+                    current_phys_loss = np.mean(total_batch_phys_loss[-10:]) if len(total_batch_phys_loss) >= 10 else total_batch_phys_loss[-1] if total_batch_phys_loss else 0
                     current_lr = self.optimizer.param_groups[0]['lr']
                     avg_batch_time = np.mean(batch_times[-10:]) if len(batch_times) >= 10 else np.mean(batch_times)
                     elapsed_time = batch_end_time - epoch_start_time
@@ -909,9 +1086,10 @@ class Trainer:
                     eta = remaining_batches * avg_batch_time
                     # Log to file only
                     stress_log = f" | Stress Loss: {current_stress_loss:.6f}" if self.c > 0 else ""
+                    phys_log = f" | Phys Loss: {current_phys_loss:.6f}" if current_phys_loss > 0 else ""
                     logging.info(
                         f"Epoch {epoch} | Batch {batch_idx_loader + 1}/{total_batches} | "
-                        f"Energy Loss: {current_energy_loss:.6f} | Force Loss: {current_force_loss:.6f}{stress_log} | "
+                        f"Energy Loss: {current_energy_loss:.6f} | Force Loss: {current_force_loss:.6f}{stress_log}{phys_log} | "
                         f"LR: {current_lr:.2e} | Batch Count: {self.batch_count} | "
                         f"Batch Time: {batch_time:.3f}s | Avg: {avg_batch_time:.3f}s | "
                         f"Elapsed: {elapsed_time:.1f}s | ETA: {eta:.1f}s"
@@ -940,6 +1118,7 @@ class Trainer:
             'force_rmse': np.mean(total_batch_force_rmse) if total_batch_force_rmse else 0,
             'stress_loss': np.mean(total_batch_stress_loss) if total_batch_stress_loss else 0,
             'stress_rmse': np.mean(total_batch_stress_rmse) if total_batch_stress_rmse else 0,
+            'phys_loss': np.mean(total_batch_phys_loss) if total_batch_phys_loss else 0,
             'epoch_time': epoch_time,
             'avg_batch_time': avg_batch_time,
         }
@@ -1010,6 +1189,7 @@ class Trainer:
         val_F_targets = []
         val_S_preds = []
         val_S_targets = []
+        val_phys_loss_list = []
         
         total_batches = len(self.val_loader)
         if self.is_main_process:
@@ -1021,8 +1201,13 @@ class Trainer:
             if batch is None:
                 continue
             
-            (pos, A, batch_idx, force_ref, target_energies,
-             edge_src, edge_dst, edge_shifts, cell, stress_ref) = batch
+            extras = {}
+            if isinstance(batch, (list, tuple)) and len(batch) == 11:
+                (pos, A, batch_idx, force_ref, target_energies,
+                 edge_src, edge_dst, edge_shifts, cell, stress_ref, extras) = batch
+            else:
+                (pos, A, batch_idx, force_ref, target_energies,
+                 edge_src, edge_dst, edge_shifts, cell, stress_ref) = batch
             
             pos = pos.to(self.device)
             A = A.to(self.device)
@@ -1034,6 +1219,7 @@ class Trainer:
             edge_shifts = edge_shifts.to(self.device)
             cell = cell.to(self.device)
             stress_ref = stress_ref.to(self.device)
+            extras = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in (extras or {}).items()}
             
             pos.requires_grad = True
             
@@ -1073,7 +1259,34 @@ class Trainer:
                 pos_input = pos
                 cell_input = cell
 
-            E_per_atom = eval_model(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input)
+            forward_kwargs = {}
+            if "external_field" in extras:
+                forward_kwargs["external_tensor"] = extras["external_field"]
+            want_phys = any(
+                k in extras for k in (
+                    "charge", "dipole", "polarizability", "quadrupole",
+                    "charge_per_atom", "dipole_per_atom", "polarizability_per_atom", "quadrupole_per_atom",
+                )
+            )
+            supports_phys = hasattr(eval_model, "physical_tensor_heads") and eval_model.physical_tensor_heads is not None
+            phys_pred = None
+            if want_phys and supports_phys:
+                try:
+                    out = eval_model(
+                        pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input,
+                        return_physical_tensors=True,
+                        **forward_kwargs,
+                    )
+                except TypeError:
+                    out = eval_model(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input)
+            else:
+                try:
+                    out = eval_model(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input, **forward_kwargs)
+                except TypeError:
+                    out = eval_model(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input)
+            E_per_atom = out[0] if isinstance(out, tuple) else out
+            if isinstance(out, tuple) and len(out) >= 2:
+                phys_pred = out[1]
             E_conv_val = scatter(E_per_atom, batch_idx, dim=0, reduce='sum')
             E_mean_val = E_conv_val.view(-1) + E_offset_val
             
@@ -1118,6 +1331,10 @@ class Trainer:
                 if compute_stress:
                     val_S_preds.append(stress_pred.detach().cpu())
                     val_S_targets.append(stress_ref.detach().cpu())
+                if want_phys and supports_phys and phys_pred is not None:
+                    val_phys_loss_list.append(
+                        self._compute_physical_tensor_loss(extras, phys_pred, batch_idx, eval_model).detach().item()
+                    )
                 
                 # Stream output: log first sample's restored energy (consistent with original train-val.py)
                 # Only log on main process
@@ -1230,7 +1447,8 @@ class Trainer:
 
         # Keep total loss for logging, but use a composite metric for best/early-stop:
         # metric = val_energy_rmse + (b/a) * val_force_rmse
-        current_val_loss = self.a * val_energy_loss + self.b * val_force_loss + self.c * val_stress_loss
+        val_phys_loss = float(np.mean(val_phys_loss_list)) if val_phys_loss_list else 0.0
+        current_val_loss = self.a * val_energy_loss + self.b * val_force_loss + self.c * val_stress_loss + val_phys_loss
         ab_ratio = (self.b / self.a) if self.a != 0 else 0.0
         ac_ratio = (self.c / self.a) if self.a != 0 else 0.0
         current_val_metric = val_energy_rmse + ab_ratio * val_force_rmse + ac_ratio * val_stress_rmse
@@ -1243,9 +1461,11 @@ class Trainer:
                                 "Val Stress Loss (MSE)": {val_stress_loss},
                                 "Val Stress RMSE": {val_stress_rmse},
                                 "Val Stress MAE": {val_stress_mae},"""
+            phys_log_lines = f"""
+                                "Val Phys Loss (weighted)": {val_phys_loss},""" if val_phys_loss > 0 else ""
             logging.info(f"""
                                 "Val Loss (MSE)": {val_energy_loss},
-                                "Val Force Loss (MSE)": {val_force_loss},{stress_log_lines}
+                                "Val Force Loss (MSE)": {val_force_loss},{stress_log_lines}{phys_log_lines}
                                 "Val Total Loss (E+F+S, weighted)": {current_val_loss},
                                 "Val Energy RMSE": {val_energy_rmse},
                                 "Val Energy MAE": {val_energy_mae},
@@ -1317,7 +1537,10 @@ class Trainer:
                     'swa_applied': self.swa_applied,
                     'ema_enabled': self.ema_enabled,
                     'tensor_product_mode': self.tensor_product_mode,
+                    'inference_output_physical_tensors': self.inference_output_physical_tensors,
+                    'physical_tensor_weights': self.physical_tensor_weights,
                 }
+                best_checkpoint_dict.update(self.e3_arch_metadata)
                 if self.config is not None:
                     best_checkpoint_dict['max_radius'] = getattr(self.config, 'max_radius', 5.0)
                 
@@ -1349,6 +1572,7 @@ class Trainer:
             'train_energy_loss': 0,
             'train_force_loss': 0,
             'train_stress_loss': 0,
+            'train_phys_loss': 0,
             'train_energy_rmse': 0,
             'train_energy_mae': 0,
             'train_energy_rmse_avg': 0,
@@ -1361,6 +1585,7 @@ class Trainer:
             'val_energy_loss': val_energy_loss,
             'val_force_loss': val_force_loss,
             'val_stress_loss': val_stress_loss,
+            'val_phys_loss': val_phys_loss,
             'val_energy_rmse': val_energy_rmse,
             'val_energy_mae': val_energy_mae,
             'val_energy_rmse_avg': val_energy_rmse_avg,
@@ -1378,6 +1603,7 @@ class Trainer:
                 'train_energy_loss': train_metrics.get('train_energy_loss', 0),
                 'train_force_loss': train_metrics.get('train_force_loss', 0),
                 'train_stress_loss': train_metrics.get('train_stress_loss', 0),
+                'train_phys_loss': train_metrics.get('train_phys_loss', 0),
                 'train_energy_rmse': train_metrics.get('train_energy_rmse', 0),
                 'train_energy_mae': train_metrics.get('train_energy_mae', 0),
                 'train_energy_rmse_avg': train_metrics.get('train_energy_rmse_avg', 0),
@@ -1417,7 +1643,10 @@ class Trainer:
                 'swa_applied': self.swa_applied,
                 'ema_enabled': self.ema_enabled,
                 'tensor_product_mode': self.tensor_product_mode,
+                'inference_output_physical_tensors': self.inference_output_physical_tensors,
+                'physical_tensor_weights': self.physical_tensor_weights,
             }
+            checkpoint_dict.update(self.e3_arch_metadata)
             if self.config is not None:
                 checkpoint_dict['max_radius'] = getattr(self.config, 'max_radius', 5.0)
 
@@ -1444,9 +1673,11 @@ class Trainer:
         energy_loss_sum = 0.0
         force_loss_sum = 0.0
         stress_loss_sum = 0.0
+        phys_loss_sum = 0.0
         energy_count = 0
         force_count = 0
         stress_count = 0
+        phys_count = 0
 
         energy_mse_sum = 0.0
         energy_mse_avg_sum = 0.0
@@ -1504,8 +1735,13 @@ class Trainer:
             if batch is None:
                 continue
 
-            (pos, A, batch_idx, force_ref, target_energies,
-             edge_src, edge_dst, edge_shifts, cell, stress_ref) = batch
+            extras = {}
+            if isinstance(batch, (list, tuple)) and len(batch) == 11:
+                (pos, A, batch_idx, force_ref, target_energies,
+                 edge_src, edge_dst, edge_shifts, cell, stress_ref, extras) = batch
+            else:
+                (pos, A, batch_idx, force_ref, target_energies,
+                 edge_src, edge_dst, edge_shifts, cell, stress_ref) = batch
 
             pos = pos.to(self.device)
             A = A.to(self.device)
@@ -1538,7 +1774,28 @@ class Trainer:
             mapped_A = map_tensor_values(A, self.keys, self.values).to(self.device)
             E_offset_mol = scatter(mapped_A, batch_idx, dim=0, reduce='sum')
 
-            E_per_atom = eval_model(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input)
+            extras = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in (extras or {}).items()}
+            want_phys = any(
+                k in extras for k in (
+                    "charge", "dipole", "polarizability", "quadrupole",
+                    "charge_per_atom", "dipole_per_atom", "polarizability_per_atom", "quadrupole_per_atom",
+                )
+            )
+            supports_phys = hasattr(eval_model, "physical_tensor_heads") and eval_model.physical_tensor_heads is not None
+            phys_pred = None
+            if want_phys and supports_phys:
+                try:
+                    out = eval_model(
+                        pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input,
+                        return_physical_tensors=True,
+                    )
+                except TypeError:
+                    out = eval_model(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input)
+            else:
+                out = eval_model(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input)
+            E_per_atom = out[0] if isinstance(out, tuple) else out
+            if isinstance(out, tuple) and len(out) >= 2:
+                phys_pred = out[1]
             E_conv_mol = scatter(E_per_atom, batch_idx, dim=0, reduce='sum').squeeze(-1)
             E_mean = E_conv_mol + E_offset_mol
 
@@ -1581,6 +1838,10 @@ class Trainer:
             force_loss_sum += force_loss.item() * num_force_elements
             energy_count += num_molecules
             force_count += num_force_elements
+            if want_phys and supports_phys and phys_pred is not None:
+                p_loss = self._compute_physical_tensor_loss(extras, phys_pred, batch_idx, eval_model)
+                phys_loss_sum += p_loss.item()
+                phys_count += 1
 
             energy_mse_sum += F.mse_loss(E_mean, target_energies, reduction='sum').item()
             energy_mse_avg_sum += F.mse_loss(E_avg_pred, target_energy_avg, reduction='sum').item()
@@ -1601,14 +1862,14 @@ class Trainer:
         if self.distributed:
             stats = torch.tensor([
                 energy_loss_sum, force_loss_sum, stress_loss_sum,
-                energy_count, force_count, stress_count,
+                phys_loss_sum, energy_count, force_count, stress_count, phys_count,
                 energy_mse_sum, energy_mse_avg_sum, force_mse_sum, stress_mse_sum,
                 energy_mae_sum, energy_mae_avg_sum, force_mae_sum, stress_mae_sum,
             ], dtype=torch.float64, device=self.device)
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
             (
                 energy_loss_sum, force_loss_sum, stress_loss_sum,
-                energy_count, force_count, stress_count,
+                phys_loss_sum, energy_count, force_count, stress_count, phys_count,
                 energy_mse_sum, energy_mse_avg_sum, force_mse_sum, stress_mse_sum,
                 energy_mae_sum, energy_mae_avg_sum, force_mae_sum, stress_mae_sum,
             ) = stats.tolist()
@@ -1616,6 +1877,7 @@ class Trainer:
         energy_loss_avg = energy_loss_sum / max(1, energy_count)
         force_loss_avg = force_loss_sum / max(1, force_count)
         stress_loss_avg = stress_loss_sum / max(1, stress_count)
+        phys_loss_avg = phys_loss_sum / max(1, phys_count)
 
         energy_rmse = np.sqrt(energy_mse_sum / max(1, energy_count))
         energy_rmse_avg = np.sqrt(energy_mse_avg_sum / max(1, energy_count))
@@ -1634,17 +1896,18 @@ class Trainer:
         force_rmse = self.train_dataset.restore_force(force_rmse)
         force_mae = self.train_dataset.restore_force(force_mae)
 
-        train_total_loss = self.a * energy_loss_avg + self.b * force_loss_avg + self.c * stress_loss_avg
+        train_total_loss = self.a * energy_loss_avg + self.b * force_loss_avg + self.c * stress_loss_avg + phys_loss_avg
 
         if self.is_main_process:
             eval_type = "Sampled" if use_sampling else "Full"
             sample_info = f" ({self.train_eval_sample_ratio*100:.1f}% sampled)" if use_sampling else ""
             stress_log = f" | Train Stress Loss: {stress_loss_avg:.6f}" if self.c > 0 else ""
+            phys_log = f" | Train Phys Loss: {phys_loss_avg:.6f}" if phys_loss_avg > 0 else ""
             logging.info(
                 f"{eval_type} Train Evaluation Done{sample_info} - "
-                f"Train Loss (a*E+b*F+c*S): {train_total_loss:.6f} | "
+                f"Train Loss (a*E+b*F+c*S+phys): {train_total_loss:.6f} | "
                 f"Train Energy Loss: {energy_loss_avg:.6f} | "
-                f"Train Force Loss: {force_loss_avg:.6f}{stress_log}"
+                f"Train Force Loss: {force_loss_avg:.6f}{stress_log}{phys_log}"
             )
 
         # Restore training mode
@@ -1656,6 +1919,7 @@ class Trainer:
             'train_energy_loss': energy_loss_avg,
             'train_force_loss': force_loss_avg,
             'train_stress_loss': stress_loss_avg,
+            'train_phys_loss': phys_loss_avg,
             'train_energy_rmse': energy_rmse,
             'train_energy_rmse_avg': energy_rmse_avg,
             'train_energy_mae': energy_mae,
@@ -1690,10 +1954,11 @@ class Trainer:
             metrics = self.train_epoch(epoch)
             
             if self.is_main_process:
+                phys_log = f" | Phys Loss: {metrics.get('phys_loss', 0):.6f}" if metrics.get('phys_loss', 0) > 0 else ""
                 logging.info(
                     f"Epoch {epoch}/{self.epoch_numbers} completed - "
                     f"Avg Energy Loss: {metrics['energy_loss']:.6f} | "
-                    f"Avg Force Loss: {metrics['force_loss']:.6f} | "
+                    f"Avg Force Loss: {metrics['force_loss']:.6f}{phys_log} | "
                     f"Energy RMSE: {metrics['energy_rmse']:.6f} | "
                     f"Force RMSE: {metrics['force_rmse']:.6f} | "
                     f"Epoch Time: {metrics['epoch_time']:.1f}s | "
@@ -1749,7 +2014,10 @@ class Trainer:
                     'swa_applied': self.swa_applied,
                     'ema_enabled': self.ema_enabled,
                     'tensor_product_mode': self.tensor_product_mode,
+                    'inference_output_physical_tensors': self.inference_output_physical_tensors,
+                    'physical_tensor_weights': self.physical_tensor_weights,
                 }
+                checkpoint_dict.update(self.e3_arch_metadata)
                 if self.config is not None:
                     checkpoint_dict['max_radius'] = getattr(self.config, 'max_radius', 5.0)
                 if self.save_ema_model and self.ema_enabled and self.e3trans_ema is not None:

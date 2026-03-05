@@ -4,6 +4,7 @@ import argparse
 import torch
 import logging
 import os
+import re
 import numpy as np
 from torch.utils.data import DataLoader
 
@@ -88,6 +89,24 @@ def main():
                         help='Pass dynamic=True to torch.compile.')
     parser.add_argument('--compile-precache', action='store_true',
                         help='Run one eager forward before compiling to warm ICTD caches on CUDA (recommended).')
+    parser.add_argument('--output-physical-tensors', type=str, default='auto',
+                        choices=['auto', 'true', 'false'],
+                        help="Output physical tensors (dipole, polarizability, etc.): 'auto'=use checkpoint's inference_output_physical_tensors, "
+                             "'true'=always output, 'false'=never (MD/LAMMPS 仅需能量和力时用 false)")
+
+    # 外部张量 / 物理张量数据（与训练时一致，用于 H5Dataset 加载 label）
+    parser.add_argument('--charge-file', type=str, default=None,
+                        help='Per-structure charge label file (for evaluation with physical tensor output)')
+    parser.add_argument('--dipole-file', type=str, default=None,
+                        help='Per-structure dipole label file (Bx3)')
+    parser.add_argument('--polarizability-file', type=str, default=None,
+                        help='Per-structure polarizability label file (Bx3x3)')
+    parser.add_argument('--quadrupole-file', type=str, default=None,
+                        help='Per-structure quadrupole label file (Bx3x3)')
+    parser.add_argument('--external-field-file', type=str, default=None,
+                        help='Per-structure external field file (Bx3, for pure-cartesian-ictd)')
+    parser.add_argument('--extra-per-node-file', type=str, default=None,
+                        help='Per-node label HDF5 (charge_per_atom, dipole_per_atom, etc.)')
     
     # MD simulation parameters
     parser.add_argument('--md-input', type=str, default='start_structure.xyz',
@@ -263,6 +282,53 @@ def main():
     
     # Load checkpoint
     checkpoint = torch.load(args.checkpoint, map_location=device)
+    state_dict_ckpt = checkpoint.get("e3trans_state_dict", {})
+
+    def _infer_physical_tensor_outputs_from_state_dict(sd: dict) -> dict | None:
+        """
+        Backward compatibility fallback for older checkpoints that have physical heads
+        in state_dict but did not save physical_tensor_outputs config.
+        """
+        per_name: dict[str, dict[int, int]] = {}
+        pat = re.compile(r"^physical_tensor_heads\.([^.]+)\.(\d+)\.weight$")
+        for k, v in sd.items():
+            m = pat.match(k)
+            if not m:
+                continue
+            name = m.group(1)
+            l = int(m.group(2))
+            # weight shape: (channels_out, channels_in)
+            ch_out = int(v.shape[0]) if hasattr(v, "shape") and len(v.shape) >= 1 else 1
+            per_name.setdefault(name, {})[l] = ch_out
+
+        if not per_name:
+            return None
+
+        out = {}
+        for name, ch_by_l in per_name.items():
+            ls = sorted(ch_by_l.keys())
+            out[name] = {
+                "ls": ls,
+                "channels_out": {l: ch_by_l[l] for l in ls},
+                # reduce 不影响参数结构；旧 checkpoint 无法可靠恢复，默认用 sum
+                "reduce": "sum",
+            }
+        return out
+
+    physical_tensor_outputs_ckpt = checkpoint.get("physical_tensor_outputs")
+    if physical_tensor_outputs_ckpt is None:
+        physical_tensor_outputs_ckpt = _infer_physical_tensor_outputs_from_state_dict(state_dict_ckpt)
+
+    external_tensor_rank_ckpt = checkpoint.get("external_tensor_rank")
+    if external_tensor_rank_ckpt is None and "e3_conv_emb.external_tensor_scale_by_l" in state_dict_ckpt:
+        # 旧 checkpoint 兼容：若检测到 external tensor scale 参数，则按 rank=1 恢复（当前 CLI 支持的外场）
+        external_tensor_rank_ckpt = 1
+
+    # Use tensor_product_mode from checkpoint if saved (backward compat: old checkpoints may not have it)
+    tensor_product_mode = checkpoint.get('tensor_product_mode') or args.tensor_product_mode
+    if checkpoint.get('tensor_product_mode') and checkpoint['tensor_product_mode'] != args.tensor_product_mode:
+        logging.info("Using tensor_product_mode=%s from checkpoint (override --tensor-product-mode=%s)",
+                     checkpoint['tensor_product_mode'], args.tensor_product_mode)
     
     # Model configuration
     # Convert dtype string to torch.dtype
@@ -337,7 +403,7 @@ def main():
     logging.info("=" * 80)
     
     # Initialize model based on tensor product mode
-    if args.tensor_product_mode == 'pure-cartesian':
+    if tensor_product_mode == 'pure-cartesian':
         logging.info("Using PURE Cartesian mode (rank tensors 3^L with delta/epsilon contractions), num_interaction=%d", args.num_interaction)
         e3trans = PureCartesianTransformerLayer(
             max_embed_radius=config.max_radius,
@@ -358,7 +424,7 @@ def main():
             lmax=config.lmax,
             device=device
         ).to(device)
-    elif args.tensor_product_mode == 'pure-cartesian-ictd':
+    elif tensor_product_mode == 'pure-cartesian-ictd':
         logging.info("Using PURE Cartesian ICTD mode (pure_cartesian_ictd_layers_full, DDP sync), num_interaction=%d", args.num_interaction)
         e3trans = PureCartesianICTDTransformerLayerFull(
             max_embed_radius=config.max_radius,
@@ -378,9 +444,11 @@ def main():
             function_type_main=config.function_type,
             lmax=config.lmax,
             internal_compute_dtype=config.dtype,
+            physical_tensor_outputs=physical_tensor_outputs_ckpt,
+            external_tensor_rank=external_tensor_rank_ckpt,
             device=device,
         ).to(device)
-    elif args.tensor_product_mode == 'pure-cartesian-ictd-save':
+    elif tensor_product_mode == 'pure-cartesian-ictd-save':
         logging.info("Using PURE Cartesian ICTD mode (pure_cartesian_ictd_layers, save/original), num_interaction=%d", args.num_interaction)
         e3trans = PureCartesianICTDTransformerLayer(
             max_embed_radius=config.max_radius,
@@ -402,7 +470,7 @@ def main():
             internal_compute_dtype=config.dtype,
             device=device,
         ).to(device)
-    elif args.tensor_product_mode == 'pure-cartesian-sparse':
+    elif tensor_product_mode == 'pure-cartesian-sparse':
         logging.info("Using PURE Cartesian SPARSE mode (δ/ε path-sparse within 3^L, O(3) strict), num_interaction=%d", args.num_interaction)
         e3trans = PureCartesianSparseTransformerLayer(
             max_embed_radius=config.max_radius,
@@ -423,7 +491,7 @@ def main():
             lmax=config.lmax,
             device=device
         ).to(device)
-    elif args.tensor_product_mode == 'partial-cartesian':
+    elif tensor_product_mode == 'partial-cartesian':
         logging.info("Using Partial-Cartesian tensor product mode (strict), num_interaction=%d", args.num_interaction)
         e3trans = CartesianTransformerLayer(
             max_embed_radius=config.max_radius,
@@ -444,7 +512,7 @@ def main():
             lmax=config.lmax,
             device=device
         ).to(device)
-    elif args.tensor_product_mode == 'partial-cartesian-loose':
+    elif tensor_product_mode == 'partial-cartesian-loose':
         logging.info("Using Partial-Cartesian LOOSE mode (non-strictly-equivariant, norm product approximation), num_interaction=%d", args.num_interaction)
         e3trans = CartesianTransformerLayerLoose(
             max_embed_radius=config.max_radius,
@@ -465,7 +533,7 @@ def main():
             lmax=config.lmax,
             device=device
         ).to(device)
-    elif args.tensor_product_mode == 'spherical-save':
+    elif tensor_product_mode == 'spherical-save':
         logging.info("Using Spherical (channelwise conv) tensor product mode (e3nn_layers_channelwise), num_interaction=%d", args.num_interaction)
         e3trans = E3_TransformerLayer_multi_channelwise(
             max_embed_radius=config.max_radius,
@@ -490,7 +558,7 @@ def main():
             function_type_main=config.function_type,
             device=device
         ).to(device)
-    elif args.tensor_product_mode == 'spherical-save-cue':
+    elif tensor_product_mode == 'spherical-save-cue':
         logging.info("Using Spherical (channelwise conv) tensor product mode (cuEquivariance backend), num_interaction=%d", args.num_interaction)
         # Detect optional dependency early with a clear message.
         try:
@@ -639,8 +707,25 @@ def main():
             logging.info(f"  - {args.cell_file}")
         
         # Static evaluation
+        extra_label_paths = {}
+        if args.charge_file:
+            extra_label_paths["charge"] = args.charge_file
+        if args.dipole_file:
+            extra_label_paths["dipole"] = args.dipole_file
+        if args.polarizability_file:
+            extra_label_paths["polarizability"] = args.polarizability_file
+        if args.quadrupole_file:
+            extra_label_paths["quadrupole"] = args.quadrupole_file
+        if args.external_field_file:
+            extra_label_paths["external_field"] = args.external_field_file
+        extra_label_paths = extra_label_paths if extra_label_paths else None
+
         if args.use_h5:
-            dataset = H5Dataset(args.test_prefix, data_dir=args.data_dir)
+            dataset = H5Dataset(
+                args.test_prefix, data_dir=args.data_dir,
+                extra_label_paths=extra_label_paths,
+                extra_per_node_label_path=args.extra_per_node_file,
+            )
             collate_fn = collate_fn_h5
         else:
             if args.read_file is None:
@@ -688,13 +773,20 @@ def main():
             except StopIteration:
                 e3trans = _maybe_compile_e3trans(e3trans, precache_batch=None)
         
+        # Resolve output_physical_tensors: auto=from checkpoint, true/false=explicit
+        if args.output_physical_tensors == 'auto':
+            output_physical = checkpoint.get('inference_output_physical_tensors', False)
+        else:
+            output_physical = (args.output_physical_tensors == 'true')
         evaluator = Evaluator(
             model=e3trans,
             dataset=dataset,
             device=device,
             atomic_energy_keys=config.atomic_energy_keys,
             atomic_energy_values=config.atomic_energy_values,
+            output_physical_tensors=output_physical,
         )
+        evaluator.physical_tensor_weights = checkpoint.get("physical_tensor_weights", {}) or {}
         
         logging.info("Starting static evaluation...")
         metrics = evaluator.evaluate(data_loader, output_prefix=args.output_prefix)

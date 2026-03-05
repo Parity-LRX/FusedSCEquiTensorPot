@@ -92,7 +92,11 @@ class LAMMPS_MP(torch.autograd.Function):
 
 
 class _TorchScriptEdgeVecCore(nn.Module):
-    """Core wrapper to make precomputed_edge_vec traceable (positional arg)."""
+    """Core wrapper to make precomputed_edge_vec traceable (positional arg).
+
+    LAMMPS 接口仅接受能量和力：trace 时 model.forward 不传 return_physical_tensors，
+    默认 False，故 TorchScript 导出的 core.pt 只输出 per-atom energy（力由 dE/dpos 计算）。
+    """
 
     def __init__(self, model: nn.Module):
         super().__init__()
@@ -109,10 +113,18 @@ class _TorchScriptEdgeVecCore(nn.Module):
         cell: torch.Tensor,
         edge_vec: torch.Tensor,
     ) -> torch.Tensor:
-        return self.model(
-            pos, A, batch, edge_src, edge_dst, edge_shifts, cell,
-            precomputed_edge_vec=edge_vec,
-        )
+        # 强制只输出能量：LAMMPS 接口仅接受能量和力，不输出物理张量
+        try:
+            return self.model(
+                pos, A, batch, edge_src, edge_dst, edge_shifts, cell,
+                precomputed_edge_vec=edge_vec,
+                return_physical_tensors=False,
+            )
+        except TypeError:
+            return self.model(
+                pos, A, batch, edge_src, edge_dst, edge_shifts, cell,
+                precomputed_edge_vec=edge_vec,
+            )
 
 
 class _TorchScriptEdgeVecAdapter(nn.Module):

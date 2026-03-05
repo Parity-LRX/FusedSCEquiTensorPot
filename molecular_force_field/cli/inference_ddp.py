@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import time
 
 import torch
@@ -599,6 +600,7 @@ def run_one_ddp_inference(
     dtype: torch.dtype = torch.float32,
     return_forces: bool = False,
     partition_mode: str = "modulo",
+    output_physical_tensors: bool = False,
 ) -> tuple[float, float] | tuple[float, float, torch.Tensor]:
     """
     Run one DDP inference with timing. Requires dist initialized and model built on all ranks.
@@ -658,6 +660,10 @@ def run_one_ddp_inference(
     if device.type == "cuda":
         torch.cuda.synchronize()
     t0 = time.perf_counter()
+    want_phys = output_physical_tensors and hasattr(model, "physical_tensor_heads") and model.physical_tensor_heads is not None
+    fwd_kw = {"sync_after_scatter": sync_after_scatter}
+    if want_phys:
+        fwd_kw["return_physical_tensors"] = True
     if return_forces:
         out = model(
             pos_local,
@@ -667,8 +673,9 @@ def run_one_ddp_inference(
             edge_dst_local,
             edge_shifts_local,
             cell_local,
-            sync_after_scatter=sync_after_scatter,
+            **fwd_kw,
         )
+        out = out[0] if isinstance(out, tuple) else out
         local_energy = out[:num_owned].sum()
         total_energy = local_energy.clone()
         dist.all_reduce(total_energy, op=dist.ReduceOp.SUM)
@@ -688,8 +695,9 @@ def run_one_ddp_inference(
                 edge_dst_local,
                 edge_shifts_local,
                 cell_local,
-                sync_after_scatter=sync_after_scatter,
+                **fwd_kw,
             )
+        out = out[0] if isinstance(out, tuple) else out
         local_energy = out[:num_owned].sum()
         total_energy = local_energy.clone()
         dist.all_reduce(total_energy, op=dist.ReduceOp.SUM)
@@ -779,6 +787,10 @@ def main():
                         help="dist backend: nccl (multi-GPU) or gloo (CPU/single-node); default auto by CUDA availability")
     parser.add_argument("--partition", type=str, default="modulo", choices=["modulo", "spatial"],
                         help="Graph partition: modulo (by node ID) or spatial (by coordinate principal axis)")
+    parser.add_argument("--output-physical-tensors", type=str, default="auto",
+                        choices=["auto", "true", "false"],
+                        help="Output physical tensors: 'auto'=use checkpoint's inference_output_physical_tensors, "
+                             "'true'=always, 'false'=never (MD/LAMMPS 仅需能量和力时用 false)")
     args = parser.parse_args()
 
     # NCCL requires setting GPU before init_process_group (avoid device unknown warning / potential hang)
@@ -799,6 +811,29 @@ def main():
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
 
+    def _infer_physical_tensor_outputs_from_state_dict(sd: dict) -> dict | None:
+        per_name: dict[str, dict[int, int]] = {}
+        pat = re.compile(r"^physical_tensor_heads\.([^.]+)\.(\d+)\.weight$")
+        for k, v in sd.items():
+            m = pat.match(k)
+            if not m:
+                continue
+            name = m.group(1)
+            l = int(m.group(2))
+            ch_out = int(v.shape[0]) if hasattr(v, "shape") and len(v.shape) >= 1 else 1
+            per_name.setdefault(name, {})[l] = ch_out
+        if not per_name:
+            return None
+        out = {}
+        for name, ch_by_l in per_name.items():
+            ls = sorted(ch_by_l.keys())
+            out[name] = {
+                "ls": ls,
+                "channels_out": {l: ch_by_l[l] for l in ls},
+                "reduce": "sum",
+            }
+        return out
+
     # Config and model (aligned with train/evaluate)
     cfg = dict(
         max_embed_radius=5.0,
@@ -816,16 +851,38 @@ def main():
         ictd_tp_path_policy="full",
         internal_compute_dtype=dtype,
     )
-    model = PureCartesianICTDTransformerLayer(**cfg).to(device=device, dtype=dtype)
+
+    ckpt = None
+    physical_tensor_outputs = None
+    external_tensor_rank = None
     if args.checkpoint and os.path.isfile(args.checkpoint):
-        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
-        if "state_dict" in ckpt:
-            model.load_state_dict(ckpt["state_dict"], strict=True)
-        else:
-            model.load_state_dict(ckpt, strict=True)
+        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        state = ckpt.get("e3trans_state_dict") or ckpt.get("state_dict") or ckpt
+        physical_tensor_outputs = ckpt.get("physical_tensor_outputs")
+        if physical_tensor_outputs is None:
+            physical_tensor_outputs = _infer_physical_tensor_outputs_from_state_dict(state)
+        external_tensor_rank = ckpt.get("external_tensor_rank")
+        if external_tensor_rank is None and "e3_conv_emb.external_tensor_scale_by_l" in state:
+            external_tensor_rank = 1
+
+    model = PureCartesianICTDTransformerLayer(
+        **cfg,
+        physical_tensor_outputs=physical_tensor_outputs,
+        external_tensor_rank=external_tensor_rank,
+    ).to(device=device, dtype=dtype)
+
+    if ckpt is not None:
+        state = ckpt.get("e3trans_state_dict") or ckpt.get("state_dict") or ckpt
+        model.load_state_dict(state, strict=True)
         if rank == 0:
             print(f"Loaded checkpoint: {args.checkpoint}")
     dist.barrier()
+
+    # Resolve output_physical_tensors: auto=from checkpoint, true/false=explicit
+    if args.output_physical_tensors == "auto":
+        output_physical = (ckpt or {}).get("inference_output_physical_tensors", False)
+    else:
+        output_physical = (args.output_physical_tensors == "true")
 
     if args.forces:
         time_ms, total_energy, forces = run_one_ddp_inference(
@@ -837,6 +894,7 @@ def main():
             dtype=dtype,
             return_forces=True,
             partition_mode=args.partition,
+            output_physical_tensors=output_physical,
         )
         if rank == 0:
             print(f"DDP inference: {args.atoms} atoms, {time_ms:.2f} ms, total_energy={total_energy:.6f}")
@@ -852,6 +910,7 @@ def main():
             device=device,
             dtype=dtype,
             partition_mode=args.partition,
+            output_physical_tensors=output_physical,
         )
         if rank == 0:
             print(f"DDP inference: {args.atoms} atoms, {time_ms:.2f} ms, total_energy={total_energy:.6f}")

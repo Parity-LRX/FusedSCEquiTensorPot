@@ -62,6 +62,11 @@ setup(
             "cuequivariance-torch>=0.8.1",
             "cuequivariance-ops-torch-cu12>=0.8.1; platform_system=='Linux'",
         ],
+        # Active learning (PES coverage, etc.)
+        "al": [
+            "dscribe>=2.0.0",
+            "scikit-learn>=1.0.0",
+        ],
     },
     entry_points={
         "console_scripts": [
@@ -70,6 +75,8 @@ setup(
             "mff-preprocess=molecular_force_field.cli.preprocess:main",
             "mff-lammps=molecular_force_field.cli.lammps_interface:main",
             "mff-export-core=molecular_force_field.cli.export_libtorch_core:main",
+            "mff-evaluate-pes-coverage=molecular_force_field.cli.evaluate_pes_coverage:main",
+            "mff-active-learn=molecular_force_field.cli.active_learning:main",
         ],
     },
 )

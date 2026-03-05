@@ -26,6 +26,7 @@ from torch_scatter import scatter
 from e3nn.math import soft_one_hot_linspace
 import math
 
+from molecular_force_field.models.pure_cartesian_ictd_layers import PhysicalTensorICTDEmbedding
 from molecular_force_field.models.ictd_irreps import (
     HarmonicElementwiseProduct,
     HarmonicFullyConnectedTensorProduct,
@@ -137,6 +138,14 @@ class ICTDIrrepsE3Conv(nn.Module):
         ictd_tp_max_rank_other: int | None = None,
         # Internal computation dtype for ICTD operations (default: float64 for stability)
         internal_compute_dtype: torch.dtype = torch.float64,
+        # Optional: external physical tensor input (e.g. uniform electric field).
+        # If set, you may pass `external_tensor` to forward() and it will be embedded into ICTD irreps blocks.
+        external_tensor_rank: int | None = None,
+        external_tensor_input_repr: str = "cartesian",
+        external_tensor_channels_in: int = 1,
+        external_tensor_include_trace_chain: bool = True,
+        # Learnable per-l scale for external injection; default 0 keeps behavior unchanged at init.
+        external_tensor_scale_init: float = 0.0,
     ):
         super().__init__()
         self.max_radius = max_radius
@@ -171,9 +180,44 @@ class ICTDIrrepsE3Conv(nn.Module):
             nn.Linear(64, self.tp2.num_paths),
         )
 
+        # External tensor embedding (optional)
+        self.external_tensor_rank = int(external_tensor_rank) if external_tensor_rank is not None else None
+        if self.external_tensor_rank is not None:
+            self.external_tensor_embed = PhysicalTensorICTDEmbedding(
+                rank=self.external_tensor_rank,
+                lmax_out=self.lmax,
+                channels_in=int(external_tensor_channels_in),
+                channels_out=1,
+                input_repr=str(external_tensor_input_repr),
+                include_trace_chain=bool(external_tensor_include_trace_chain),
+                internal_compute_dtype=internal_compute_dtype,
+            )
+            self.external_tensor_scale_by_l = nn.Parameter(
+                torch.full((self.lmax + 1,), float(external_tensor_scale_init))
+            )
+        else:
+            self.external_tensor_embed = None
+            self.external_tensor_scale_by_l = None
+
         self.output_dim = _irreps_total_dim(channels_out, lmax)
 
-    def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell, *, precomputed_n=None, precomputed_edge_length=None, precomputed_Y_list=None):
+    def forward(
+        self,
+        pos,
+        A,
+        batch,
+        edge_src,
+        edge_dst,
+        edge_shifts,
+        cell,
+        *,
+        precomputed_n=None,
+        precomputed_edge_length=None,
+        precomputed_Y_list=None,
+        # Optional external tensor:
+        external_tensor: torch.Tensor | None = None,
+        external_tensor_blocks: dict[int, torch.Tensor] | None = None,
+    ):
         dtype = next(self.parameters()).dtype
         pos = pos.to(dtype=dtype)
         cell = cell.to(dtype=dtype)
@@ -194,6 +238,51 @@ class ICTDIrrepsE3Conv(nn.Module):
         n = n.to(dtype=Ai.dtype)
         edge_length = edge_length.to(dtype=Ai.dtype)
 
+        # External tensor blocks (optional). Shape expectation per l:
+        #   (N or 1, mul, 2l+1)
+        ext_blocks: dict[int, torch.Tensor] | None = None
+        if external_tensor_blocks is not None:
+            ext_blocks = external_tensor_blocks
+        elif external_tensor is not None:
+            if self.external_tensor_embed is None:
+                raise ValueError(
+                    "external_tensor was provided but ICTDIrrepsE3Conv was not configured with external_tensor_rank"
+                )
+            ext_blocks = self.external_tensor_embed(external_tensor, return_blocks=True)
+
+        if ext_blocks is not None:
+            num_nodes = Ai.shape[0]
+            num_graphs = int(batch.max().item()) + 1 if batch.numel() else 0
+            norm_blocks: dict[int, torch.Tensor] = {}
+            for l in range(self.lmax + 1):
+                t = ext_blocks.get(l)
+                if t is None:
+                    continue
+                if t.shape[-1] != 2 * l + 1:
+                    raise ValueError(f"external_tensor_blocks[{l}] last dim must be 2l+1={2*l+1}, got {t.shape[-1]}")
+                # Accept:
+                #   - (N, mul, 2l+1) per-node
+                #   - (1, mul, 2l+1) broadcast
+                #   - (mul, 2l+1) global (broadcast)
+                #   - (B, mul, 2l+1) per-graph (mapped to nodes via batch)
+                if t.dim() == 2:
+                    t = t.unsqueeze(0).expand(num_nodes, *t.shape)
+                elif t.dim() == 3:
+                    if num_graphs > 0 and t.shape[0] == num_graphs:
+                        t = t[batch]
+                    elif t.shape[0] == 1 and num_nodes > 1:
+                        t = t.expand(num_nodes, *t.shape[1:])
+                    elif t.shape[0] != num_nodes:
+                        raise ValueError(
+                            f"external_tensor_blocks[{l}] first dim must be N={num_nodes} (or 1), got {t.shape[0]}"
+                        )
+                else:
+                    raise ValueError(
+                        f"external_tensor_blocks[{l}] must have shape (mul,2l+1) or (N,mul,2l+1); got {tuple(t.shape)}"
+                    )
+                norm_blocks[l] = t.to(device=Ai.device, dtype=Ai.dtype)
+            ext_blocks = norm_blocks
+
         if precomputed_Y_list is None:
             Y_list = direction_harmonics_all(n, self.lmax)
         else:
@@ -201,6 +290,24 @@ class ICTDIrrepsE3Conv(nn.Module):
         Y = {l: Y_list[l] for l in range(self.lmax + 1)}  # (E, 2l+1)
 
         f_in = {l: Ai[edge_src].unsqueeze(-1) * Y[l].unsqueeze(-2) for l in range(self.lmax + 1)}  # (E, output_size, 2l+1)
+        if ext_blocks is not None:
+            for l in range(self.lmax + 1):
+                t = ext_blocks.get(l)
+                if t is None:
+                    continue
+                t_e = t[edge_src]  # (E, mul, 2l+1)
+                if t_e.shape[-2] == 1:
+                    # scalar(Ai) ⊗ external_irrep_l
+                    t_e = t_e * Ai[edge_src].unsqueeze(-1)
+                elif t_e.shape[-2] == self.output_size:
+                    # already channel-matched
+                    pass
+                else:
+                    raise ValueError(
+                        f"external_tensor_blocks[{l}] mul must be 1 or output_size={self.output_size}, got {t_e.shape[-2]}"
+                    )
+                scale = self.external_tensor_scale_by_l[l] if self.external_tensor_scale_by_l is not None else 1.0
+                f_in[l] = f_in[l] + t_e * scale
 
         x2 = {l: torch.zeros(edge_src.shape[0], self.output_size, 2 * l + 1, device=Ai.device, dtype=Ai.dtype) for l in range(self.lmax + 1)}
         x2[0] = Ai[edge_dst].unsqueeze(-1)  # scalar only
@@ -259,6 +366,19 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         # If None: keep current behavior (mul_l = channels for all l).
         # If provided: dict l->mul_l for l=0..lmax; used only for the readout invariants.
         product5_muls_by_l: dict[int, int] | None = None,
+        # Optional: physical tensor outputs (equivariant heads).
+        # Example:
+        #   physical_tensor_outputs={
+        #     "dipole": {"ls":[1], "channels_out": 1, "reduce":"sum"},
+        #     "polarizability": {"ls":[0,2], "channels_out": 1, "reduce":"sum"},
+        #   }
+        physical_tensor_outputs: dict[str, dict] | None = None,
+        # Optional: external tensor (e.g. electric field) embedding configuration for conv1.
+        external_tensor_rank: int | None = None,
+        external_tensor_input_repr: str = "cartesian",
+        external_tensor_channels_in: int = 1,
+        external_tensor_include_trace_chain: bool = True,
+        external_tensor_scale_init: float = 0.0,
     ):
         super().__init__()
         if embed_size is None:
@@ -293,6 +413,11 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             ictd_tp_path_policy=ictd_tp_path_policy,
             ictd_tp_max_rank_other=ictd_tp_max_rank_other,
             internal_compute_dtype=internal_compute_dtype,
+            external_tensor_rank=external_tensor_rank,
+            external_tensor_input_repr=external_tensor_input_repr,
+            external_tensor_channels_in=external_tensor_channels_in,
+            external_tensor_include_trace_chain=external_tensor_include_trace_chain,
+            external_tensor_scale_init=external_tensor_scale_init,
         )
 
         # conv2..convN: node irreps (mul=C) x edge Y_l (mul=1) -> node irreps (mul=C), per-edge weights
@@ -370,6 +495,50 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         sum_mul = sum(self.product5_muls_by_l[l] for l in range(self.lmax + 1))
         self.proj_total = MainNet(self.num_interaction * sum_mul + scalar_channels, embed_size, 17)
 
+        # Optional physical tensor heads (equivariant linear maps per l).
+        self._physical_tensor_specs: dict[str, dict] | None = None
+        self.physical_tensor_heads: nn.ModuleDict | None = None
+        if physical_tensor_outputs is not None:
+            self._physical_tensor_specs = {}
+            heads = nn.ModuleDict()
+            combined_channels = self.channels * self.num_interaction
+            for name, spec_in in physical_tensor_outputs.items():
+                if not isinstance(spec_in, dict):
+                    raise ValueError(f"physical_tensor_outputs[{name!r}] must be a dict, got {type(spec_in)}")
+                spec = dict(spec_in)
+                ls = spec.get("ls", None)
+                if ls is None:
+                    raise ValueError(f"physical_tensor_outputs[{name!r}] missing 'ls' (list of l to output)")
+                ls = [int(l) for l in ls]
+                for l in ls:
+                    if not (0 <= l <= self.lmax):
+                        raise ValueError(f"physical_tensor_outputs[{name!r}] l={l} out of range 0..lmax={self.lmax}")
+                reduce = str(spec.get("reduce", "sum")).strip().lower()
+                if reduce not in ("sum", "mean", "none"):
+                    raise ValueError(f"physical_tensor_outputs[{name!r}] reduce must be 'sum'|'mean'|'none', got {reduce!r}")
+                channels_out = spec.get("channels_out", 1)
+                if isinstance(channels_out, int):
+                    ch_out_by_l = {l: int(channels_out) for l in ls}
+                elif isinstance(channels_out, dict):
+                    ch_out_by_l = {int(k): int(v) for k, v in channels_out.items()}
+                    for l in ls:
+                        if l not in ch_out_by_l:
+                            raise ValueError(f"physical_tensor_outputs[{name!r}] channels_out missing l={l}")
+                else:
+                    raise ValueError(f"physical_tensor_outputs[{name!r}] channels_out must be int or dict, got {type(channels_out)}")
+
+                per_l = nn.ModuleDict()
+                for l in ls:
+                    if ch_out_by_l[l] <= 0:
+                        raise ValueError(f"physical_tensor_outputs[{name!r}] channels_out[{l}] must be positive")
+                    if ch_out_by_l[l] == combined_channels:
+                        per_l[str(l)] = nn.Identity()
+                    else:
+                        per_l[str(l)] = nn.Linear(combined_channels, ch_out_by_l[l], bias=False)
+                heads[name] = per_l
+                self._physical_tensor_specs[name] = {"ls": ls, "reduce": reduce, "channels_out": ch_out_by_l}
+            self.physical_tensor_heads = heads
+
     def forward(
         self,
         pos,
@@ -382,6 +551,11 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         *,
         precomputed_edge_vec=None,
         sync_after_scatter: callable | None = None,
+        # Optional external tensor injected at conv1:
+        external_tensor: torch.Tensor | None = None,
+        external_tensor_blocks: dict[int, torch.Tensor] | None = None,
+        # Optional physical tensor outputs (default False：推理/MD 仅需能量和力时不计算物理张量头).
+        return_physical_tensors: bool = False,
     ):
         """
         sync_after_scatter: 若提供，在 conv1 输出后、每个 tp2 scatter 后对节点特征做同步（DDP 下同步 ghost 节点）。
@@ -415,6 +589,8 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             precomputed_n=n,
             precomputed_edge_length=edge_length,
             precomputed_Y_list=Y_list,
+            external_tensor=external_tensor,
+            external_tensor_blocks=external_tensor_blocks,
         )  # (N, C*(lmax+1)^2)
         if sync_after_scatter is not None:
             f1 = sync_after_scatter(f1)
@@ -452,6 +628,37 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         f_combine = torch.cat(features, dim=-1)  # (N, nC*(lmax+1)^2)
 
         xb = _split_irreps(f_combine, self.channels * self.num_interaction, self.lmax)
+        physical_out: dict[str, dict[int, torch.Tensor]] | None = None
+        if return_physical_tensors:
+            if self.physical_tensor_heads is None or self._physical_tensor_specs is None:
+                raise ValueError("return_physical_tensors=True but physical_tensor_outputs was not set in __init__")
+            physical_out = {}
+            num_graphs = int(batch.max().item()) + 1 if batch.numel() else 0
+            counts = None
+            for name, per_l in self.physical_tensor_heads.items():
+                spec = self._physical_tensor_specs[name]
+                ls = spec["ls"]
+                reduce = spec["reduce"]
+                out_blocks: dict[int, torch.Tensor] = {}
+                for l in ls:
+                    y_l = _apply_channel_adapter_per_l(xb[l], per_l[str(l)])  # (N, Cout, 2l+1)
+                    if reduce == "none":
+                        out_blocks[l] = y_l
+                    else:
+                        yg = scatter(y_l, batch, dim=0, dim_size=num_graphs, reduce="sum")
+                        if reduce == "mean":
+                            if counts is None:
+                                counts = scatter(
+                                    torch.ones_like(batch, dtype=yg.dtype),
+                                    batch,
+                                    dim=0,
+                                    dim_size=num_graphs,
+                                    reduce="sum",
+                                ).clamp(min=1.0)
+                            yg = yg / counts.view(-1, 1, 1)
+                        out_blocks[l] = yg
+                physical_out[name] = out_blocks
+
         scalars = torch.zeros(f_combine.shape[0], (self.num_interaction - 1) * 32, device=f_combine.device, dtype=f_combine.dtype)
         for l in range(self.lmax + 1):
             t = xb[l]  # (N,nC,2l+1)
@@ -481,5 +688,9 @@ class PureCartesianICTDTransformerLayer(nn.Module):
 
         product_proj = self.proj_total(f_prod5)
         e_out = self.weighted_sum(product_proj)
-        return e_out.sum(dim=-1, keepdim=True)
+        e_scalar = e_out.sum(dim=-1, keepdim=True)
+        if return_physical_tensors:
+            assert physical_out is not None
+            return e_scalar, physical_out
+        return e_scalar
 

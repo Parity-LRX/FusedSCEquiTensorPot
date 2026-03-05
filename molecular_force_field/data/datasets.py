@@ -8,7 +8,66 @@ from torch.utils.data import Dataset
 from matscipy.neighbours import neighbour_list as matscipy_neighbour_list
 from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict, Any
+
+
+def _load_struct_property_file(file_path: str, *, kind: str) -> torch.Tensor:
+    """
+    Load per-structure (graph-level) properties from an external file.
+
+    Supported formats:
+      - .npy/.npz: numpy array
+      - pandas HDF (.h5/.hdf/.hdf5): DataFrame (values are used)
+
+    kind:
+      - "scalar": (B,)
+      - "vector3": (B, 3)
+      - "mat33": (B, 3, 3) or (B, 9) row-major
+    """
+    import os
+
+    if file_path is None:
+        raise ValueError("file_path must not be None")
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Property file not found: {file_path}")
+
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in (".npy", ".npz"):
+        arr = np.load(file_path)
+        if isinstance(arr, np.lib.npyio.NpzFile):
+            # Choose a reasonable default key
+            keys = list(arr.keys())
+            if not keys:
+                raise ValueError(f"Empty npz file: {file_path}")
+            values = arr[keys[0]]
+        else:
+            values = arr
+    else:
+        df = pd.read_hdf(file_path)
+        values = df.values
+
+    values = np.asarray(values)
+    if kind == "scalar":
+        if values.ndim == 2 and values.shape[1] >= 1:
+            values = values[:, 0]
+        values = values.reshape(-1).astype(np.float64)
+        return torch.from_numpy(values).double()
+
+    if kind == "vector3":
+        if values.ndim == 1 and values.shape[0] == 3:
+            values = values.reshape(1, 3)
+        if values.ndim != 2 or values.shape[1] != 3:
+            raise ValueError(f"Expected vector3 shape (B,3), got {values.shape} from {file_path}")
+        return torch.from_numpy(values.astype(np.float64)).double()
+
+    if kind == "mat33":
+        if values.ndim == 2 and values.shape[1] == 9:
+            values = values.reshape(-1, 3, 3)
+        if values.ndim != 3 or values.shape[1:] != (3, 3):
+            raise ValueError(f"Expected mat33 shape (B,3,3) or (B,9), got {values.shape} from {file_path}")
+        return torch.from_numpy(values.astype(np.float64)).double()
+
+    raise ValueError(f"Unknown kind={kind!r}")
 
 
 def _split_cell_and_pbc_from_cell_df(cell_df: pd.DataFrame) -> Tuple[np.ndarray, Optional[np.ndarray]]:
@@ -48,7 +107,10 @@ def compute_graph_worker(args):
     Returns:
         Dictionary with precomputed graph data
     """
-    if len(args) == 7:
+    extras: Dict[str, Any] | None = None
+    if len(args) == 8:
+        idx, block, target, cell, pbc, max_radius, stress, extras = args
+    elif len(args) == 7:
         idx, block, target, cell, pbc, max_radius, stress = args
     else:
         idx, block, target, cell, pbc, max_radius = args
@@ -78,7 +140,7 @@ def compute_graph_worker(args):
     )
     
     # Return cache dictionary (all converted to Tensor)
-    return {
+    out = {
         'read_tensor': block,
         'target_energy': target,
         'edge_src': torch.tensor(i, dtype=torch.long),
@@ -87,12 +149,31 @@ def compute_graph_worker(args):
         'cell': torch.tensor(current_cell, dtype=torch.float64),
         'stress': torch.tensor(stress, dtype=torch.float64)
     }
+    if extras:
+        # Keep extras as plain tensors (already on CPU)
+        out.update(extras)
+    return out
 
 
 class CustomDataset(Dataset):
     """Custom dataset with precomputed graph structures."""
     
-    def __init__(self, read_file_path, energy_file_path, cell_file_path, stress_file_path=None, max_radius=5.0, num_workers=10):
+    def __init__(
+        self,
+        read_file_path,
+        energy_file_path,
+        cell_file_path,
+        stress_file_path=None,
+        *,
+        max_radius=5.0,
+        num_workers=10,
+        # Optional per-structure Cartesian labels / global tensors
+        charge_file_path: str | None = None,            # scalar
+        dipole_file_path: str | None = None,            # vector3
+        polarizability_file_path: str | None = None,    # mat33
+        quadrupole_file_path: str | None = None,        # mat33 (typically traceless, but stored Cartesian)
+        external_field_file_path: str | None = None,    # vector3 (e.g., uniform E field)
+    ):
         """
         Initialize custom dataset.
         
@@ -111,6 +192,13 @@ class CustomDataset(Dataset):
         read_data = pd.read_hdf(read_file_path)
         energy_df = pd.read_hdf(energy_file_path)
         cell_df = pd.read_hdf(cell_file_path)
+
+        # Optional: load extra per-structure tensors
+        charges_all = _load_struct_property_file(charge_file_path, kind="scalar") if charge_file_path else None
+        dipoles_all = _load_struct_property_file(dipole_file_path, kind="vector3") if dipole_file_path else None
+        polars_all = _load_struct_property_file(polarizability_file_path, kind="mat33") if polarizability_file_path else None
+        quads_all = _load_struct_property_file(quadrupole_file_path, kind="mat33") if quadrupole_file_path else None
+        ext_fields_all = _load_struct_property_file(external_field_file_path, kind="vector3") if external_field_file_path else None
         
         # Load stress data (optional)
         import os
@@ -154,7 +242,18 @@ class CustomDataset(Dataset):
         for i in range(len(blocks)):
             pbc_i = pbcs[i] if pbcs is not None and i < len(pbcs) else None
             stress_i = stresses_all[i] if stresses_all is not None and i < len(stresses_all) else np.zeros((3, 3), dtype=np.float64)
-            tasks.append((i, blocks[i], targets[i], cells[i], pbc_i, self.max_radius, stress_i))
+            extras = {}
+            if charges_all is not None:
+                extras["charge"] = charges_all[i]
+            if dipoles_all is not None:
+                extras["dipole"] = dipoles_all[i]
+            if polars_all is not None:
+                extras["polarizability"] = polars_all[i]
+            if quads_all is not None:
+                extras["quadrupole"] = quads_all[i]
+            if ext_fields_all is not None:
+                extras["external_field"] = ext_fields_all[i]
+            tasks.append((i, blocks[i], targets[i], cells[i], pbc_i, self.max_radius, stress_i, extras))
         
         # Use process pool for parallel computation
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -183,6 +282,9 @@ class CustomDataset(Dataset):
     def __getitem__(self, idx):
         # Return precomputed results directly from memory list
         d = self.cache[idx]
+        extras = {k: v for k, v in d.items() if k not in {
+            "read_tensor", "target_energy", "edge_src", "edge_dst", "edge_shifts", "cell", "stress"
+        }}
         return (
             d['read_tensor'],
             d['target_energy'],
@@ -190,14 +292,25 @@ class CustomDataset(Dataset):
             d['edge_dst'],
             d['edge_shifts'],
             d['cell'],
-            d['stress']
+            d['stress'],
+            extras,
         )
 
 
 class H5Dataset(Dataset):
     """Dataset loading from preprocessed HDF5 files."""
     
-    def __init__(self, prefix, data_dir='.', file_path=None):
+    def __init__(
+        self,
+        prefix,
+        data_dir='.',
+        file_path=None,
+        *,
+        # Optional: external per-structure label files (Cartesian)
+        extra_label_paths: Dict[str, str] | None = None,
+        # Optional: per-node label file (HDF5 with sample_0, sample_1, ... each with charge_per_atom etc.)
+        extra_per_node_label_path: str | None = None,
+    ):
         """
         Initialize H5 dataset.
         
@@ -221,6 +334,36 @@ class H5Dataset(Dataset):
         
         with h5py.File(self.file_path, 'r') as f:
             self.num_samples = len(f.keys())
+
+        self._extra_labels: Dict[str, torch.Tensor] = {}
+        if extra_label_paths:
+            for name, path in extra_label_paths.items():
+                key = str(name)
+                p = str(path)
+                if key in ("charge",):
+                    self._extra_labels[key] = _load_struct_property_file(p, kind="scalar")
+                elif key in ("dipole", "external_field"):
+                    self._extra_labels[key] = _load_struct_property_file(p, kind="vector3")
+                elif key in ("polarizability", "quadrupole"):
+                    self._extra_labels[key] = _load_struct_property_file(p, kind="mat33")
+                else:
+                    raise ValueError(f"Unknown extra label name {key!r}; supported: charge, dipole, polarizability, quadrupole, external_field")
+            # Basic length validation (best-effort)
+            for k, v in self._extra_labels.items():
+                if v.shape[0] != self.num_samples:
+                    raise ValueError(f"Extra label {k!r} length {v.shape[0]} != num_samples {self.num_samples}")
+
+        self._extra_per_node: Dict[str, list] = {}
+        if extra_per_node_label_path and os.path.exists(extra_per_node_label_path):
+            with h5py.File(extra_per_node_label_path, 'r') as f:
+                for i in range(self.num_samples):
+                    key = f'sample_{i}'
+                    if key not in f:
+                        continue
+                    g = f[key]
+                    for k in ("charge_per_atom", "dipole_per_atom", "polarizability_per_atom", "quadrupole_per_atom"):
+                        if k in g:
+                            self._extra_per_node.setdefault(k, [None] * self.num_samples)[i] = torch.from_numpy(g[k][:]).double()
     
     def restore_energy(self, normalized_energy):
         """Restore energy units (if normalized)."""
@@ -242,7 +385,7 @@ class H5Dataset(Dataset):
             stress = torch.from_numpy(g['stress'][:]).double()
         else:
             stress = torch.zeros((3, 3), dtype=torch.float64)
-        return {
+        out = {
             'pos': torch.from_numpy(g['pos'][:]).double(),
             'A': torch.from_numpy(g['A'][:]).long(),
             'y': torch.from_numpy(np.array([g['y'][()]])).double(),
@@ -253,12 +396,39 @@ class H5Dataset(Dataset):
             'cell': torch.from_numpy(g['cell'][:]).double(),
             'stress': stress,
         }
+        # Prefer in-H5 datasets when present, else fall back to extra_label_paths.
+        for k in ("charge", "dipole", "polarizability", "quadrupole", "external_field"):
+            if k in g:
+                out[k] = torch.from_numpy(g[k][:]).double()
+            elif k in self._extra_labels:
+                out[k] = self._extra_labels[k][idx]
+        # Per-node labels (reduce="none"): shape (num_atoms,) or (num_atoms, 3) or (num_atoms, 3, 3)
+        for k in ("charge_per_atom", "dipole_per_atom", "polarizability_per_atom", "quadrupole_per_atom"):
+            if k in g:
+                out[k] = torch.from_numpy(g[k][:]).double()
+            elif hasattr(self, "_extra_per_node") and k in self._extra_per_node:
+                out[k] = self._extra_per_node[k][idx]
+        return out
 
 
 class OnTheFlyDataset(Dataset):
     """Dataset that computes graph structure on-the-fly during loading."""
     
-    def __init__(self, read_file_path, energy_file_path, cell_file_path, stress_file_path=None, max_radius=5.0):
+    def __init__(
+        self,
+        read_file_path,
+        energy_file_path,
+        cell_file_path,
+        stress_file_path=None,
+        *,
+        max_radius=5.0,
+        # Optional per-structure Cartesian labels / global tensors
+        charge_file_path: str | None = None,            # scalar
+        dipole_file_path: str | None = None,            # vector3
+        polarizability_file_path: str | None = None,    # mat33
+        quadrupole_file_path: str | None = None,        # mat33
+        external_field_file_path: str | None = None,    # vector3
+    ):
         """
         Initialize on-the-fly dataset.
         
@@ -277,6 +447,13 @@ class OnTheFlyDataset(Dataset):
         self.read_data = pd.read_hdf(read_file_path)
         self.energy_df = pd.read_hdf(energy_file_path)
         self.cell_df = pd.read_hdf(cell_file_path)
+
+        # Optional: load extra per-structure tensors
+        self.charges_all = _load_struct_property_file(charge_file_path, kind="scalar") if charge_file_path else None
+        self.dipoles_all = _load_struct_property_file(dipole_file_path, kind="vector3") if dipole_file_path else None
+        self.polars_all = _load_struct_property_file(polarizability_file_path, kind="mat33") if polarizability_file_path else None
+        self.quads_all = _load_struct_property_file(quadrupole_file_path, kind="mat33") if quadrupole_file_path else None
+        self.ext_fields_all = _load_struct_property_file(external_field_file_path, kind="vector3") if external_field_file_path else None
         
         # Load stress data (optional)
         import os
@@ -352,7 +529,7 @@ class OnTheFlyDataset(Dataset):
             stress = np.zeros((3, 3), dtype=np.float64)
 
         # 5. Convert to Tensor and return
-        return {
+        out = {
             'pos': torch.tensor(pos, dtype=torch.float64),
             'A': torch.tensor(atom_types, dtype=torch.float64),
             'force': torch.tensor(forces, dtype=torch.float64),
@@ -363,3 +540,14 @@ class OnTheFlyDataset(Dataset):
             'cell': torch.tensor(current_cell, dtype=torch.float64),
             'stress': torch.tensor(stress, dtype=torch.float64),
         }
+        if self.charges_all is not None:
+            out["charge"] = self.charges_all[idx]
+        if self.dipoles_all is not None:
+            out["dipole"] = self.dipoles_all[idx]
+        if self.polars_all is not None:
+            out["polarizability"] = self.polars_all[idx]
+        if self.quads_all is not None:
+            out["quadrupole"] = self.quads_all[idx]
+        if self.ext_fields_all is not None:
+            out["external_field"] = self.ext_fields_all[idx]
+        return out

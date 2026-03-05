@@ -8,13 +8,15 @@ from torch.utils.data import DataLoader
 from molecular_force_field.utils.scatter import scatter
 
 from molecular_force_field.utils.tensor_utils import map_tensor_values
+from molecular_force_field.models.pure_cartesian_ictd_layers import PhysicalTensorICTDEmbedding
 
 
 class Evaluator:
     """Evaluator for static model evaluation."""
     
     def __init__(self, model, dataset, device, atomic_energy_keys=None,
-                 atomic_energy_values=None, force_shift_value=1):
+                 atomic_energy_values=None, force_shift_value=1,
+                 output_physical_tensors: bool = False):
         """
         Initialize evaluator.
         
@@ -42,6 +44,79 @@ class Evaluator:
             ]).to(device)
         else:
             self.values = atomic_energy_values.to(device)
+        self.output_physical_tensors = output_physical_tensors
+        self._phys_label_embedders = {}
+        self.physical_tensor_weights = {}
+
+    def _compute_physical_tensor_loss(self, extras, phys_pred, batch_idx, model):
+        if phys_pred is None or not isinstance(phys_pred, dict):
+            return torch.tensor(0.0, device=self.device)
+        lmax_model = int(getattr(model, "lmax", 2))
+        num_graphs = int(batch_idx.max().item()) + 1 if batch_idx.numel() else 0
+        phys_loss = torch.tensor(0.0, device=self.device)
+
+        def _phys_weight(name: str) -> float:
+            base = name.replace("_per_atom", "")
+            return self.physical_tensor_weights.get(name, self.physical_tensor_weights.get(base, 1.0))
+
+        def _get_embed(rank: int, *, include_trace_chain: bool):
+            key = (rank, include_trace_chain, lmax_model)
+            m = self._phys_label_embedders.get(key)
+            if m is None:
+                m = PhysicalTensorICTDEmbedding(
+                    rank=rank,
+                    lmax_out=lmax_model,
+                    channels_in=1,
+                    channels_out=1,
+                    input_repr="cartesian",
+                    include_trace_chain=include_trace_chain,
+                ).to(self.device)
+                self._phys_label_embedders[key] = m
+            return m
+
+        for name in ("charge", "charge_per_atom"):
+            if name in extras and name in phys_pred:
+                w = _phys_weight(name)
+                y = extras[name].view(-1)
+                p0 = phys_pred[name].get(0) if isinstance(phys_pred[name], dict) else None
+                if p0 is None:
+                    continue
+                if name.endswith("_per_atom"):
+                    if p0.shape[0] != y.shape[0]:
+                        continue
+                    p = p0.view(y.shape[0], -1).mean(dim=1)
+                else:
+                    if p0.shape[0] != num_graphs:
+                        continue
+                    p = p0.view(num_graphs, -1).mean(dim=1)
+                phys_loss = phys_loss + w * F.smooth_l1_loss(p, y, beta=0.5)
+
+        for name in ("dipole", "dipole_per_atom"):
+            if name in extras and name in phys_pred:
+                w = _phys_weight(name)
+                y_blocks = _get_embed(1, include_trace_chain=False)(extras[name], return_blocks=True)
+                p1 = phys_pred[name].get(1) if isinstance(phys_pred[name], dict) else None
+                if p1 is not None and 1 in y_blocks:
+                    phys_loss = phys_loss + w * F.smooth_l1_loss(p1.view(-1), y_blocks[1].view(-1), beta=0.5)
+
+        for name in ("polarizability", "polarizability_per_atom"):
+            if name in extras and name in phys_pred:
+                w = _phys_weight(name)
+                y_blocks = _get_embed(2, include_trace_chain=True)(extras[name], return_blocks=True)
+                for l in (0, 2):
+                    pl = phys_pred[name].get(l) if isinstance(phys_pred[name], dict) else None
+                    if pl is not None and l in y_blocks:
+                        phys_loss = phys_loss + w * F.smooth_l1_loss(pl.view(-1), y_blocks[l].view(-1), beta=0.5)
+
+        for name in ("quadrupole", "quadrupole_per_atom"):
+            if name in extras and name in phys_pred:
+                w = _phys_weight(name)
+                y_blocks = _get_embed(2, include_trace_chain=True)(extras[name], return_blocks=True)
+                p2 = phys_pred[name].get(2) if isinstance(phys_pred[name], dict) else None
+                if p2 is not None and 2 in y_blocks:
+                    phys_loss = phys_loss + w * F.smooth_l1_loss(p2.view(-1), y_blocks[2].view(-1), beta=0.5)
+
+        return phys_loss
     
     def evaluate(self, data_loader, output_prefix='test'):
         """
@@ -63,6 +138,7 @@ class Evaluator:
         val_F_preds = []
         val_F_targets = []
         val_total_loss_list = []
+        val_phys_loss_list = []
         
         # Use SmoothL1Loss consistent with run_eval.py
         criterion = torch.nn.SmoothL1Loss(beta=0.5)
@@ -72,8 +148,13 @@ class Evaluator:
                 continue
             
             # Unpack
-            (pos, A, batch_idx, force_ref, target_energies,
-             edge_src, edge_dst, edge_shifts, cell, _stress_ref) = batch
+            extras = {}
+            if isinstance(batch, (list, tuple)) and len(batch) == 11:
+                (pos, A, batch_idx, force_ref, target_energies,
+                 edge_src, edge_dst, edge_shifts, cell, _stress_ref, extras) = batch
+            else:
+                (pos, A, batch_idx, force_ref, target_energies,
+                 edge_src, edge_dst, edge_shifts, cell, _stress_ref) = batch
 
             # Move to GPU
             pos = pos.to(self.device)
@@ -85,6 +166,7 @@ class Evaluator:
             edge_dst = edge_dst.to(self.device)
             edge_shifts = edge_shifts.to(self.device)
             cell = cell.to(self.device)
+            extras = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in (extras or {}).items()}
             
             pos.requires_grad = True
             
@@ -93,7 +175,24 @@ class Evaluator:
             E_offset_val = scatter(mapped_A, batch_idx, dim=0, reduce='sum')
             
             # Forward
-            E_per_atom = self.model(pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
+            forward_kwargs = {}
+            if "external_field" in extras:
+                forward_kwargs["external_tensor"] = extras["external_field"]
+            want_phys = any(
+                k in extras for k in (
+                    "charge", "dipole", "polarizability", "quadrupole",
+                    "charge_per_atom", "dipole_per_atom", "polarizability_per_atom", "quadrupole_per_atom",
+                )
+            )
+            supports_phys = hasattr(self.model, "physical_tensor_heads") and self.model.physical_tensor_heads is not None
+            if (self.output_physical_tensors or want_phys) and supports_phys:
+                forward_kwargs["return_physical_tensors"] = True
+            try:
+                out = self.model(pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell, **forward_kwargs)
+            except TypeError:
+                out = self.model(pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
+            E_per_atom = out[0] if isinstance(out, tuple) else out
+            phys_pred = out[1] if isinstance(out, tuple) and len(out) >= 2 else None
             # E_conv_val shape: [Batch_Size, 1]
             E_conv_val = scatter(E_per_atom, batch_idx, dim=0, reduce='sum')
             
@@ -132,7 +231,11 @@ class Evaluator:
                 # Loss (only for Log)
                 batch_e_loss = criterion(E_mean_val, target_energies)
                 batch_f_loss = criterion(f_pred_final.view(-1), f_ref_final.view(-1))
-                val_total_loss_list.append((batch_e_loss + batch_f_loss).item())
+                batch_phys_loss = torch.tensor(0.0, device=self.device)
+                if want_phys and supports_phys and phys_pred is not None:
+                    batch_phys_loss = self._compute_physical_tensor_loss(extras, phys_pred, batch_idx, self.model)
+                    val_phys_loss_list.append(batch_phys_loss.item())
+                val_total_loss_list.append((batch_e_loss + batch_f_loss + batch_phys_loss).item())
 
             # Fix: take [0] when printing log to avoid error when batch_size > 1
             logging.info(f"Batch Sample -> Pred: {self.dataset.restore_energy(E_mean_val[0].item()):.4f} , True: {self.dataset.restore_energy(target_energies[0].item()):.4f}")
@@ -163,14 +266,17 @@ class Evaluator:
         # Force (Flatten to calculate metrics)
         val_force_rmse = torch.sqrt(F.mse_loss(all_F_preds.view(-1), all_F_targets.view(-1))).item()
         val_force_mae = F.l1_loss(all_F_preds.view(-1), all_F_targets.view(-1)).item()
+        val_phys_loss = float(sum(val_phys_loss_list) / max(1, len(val_phys_loss_list))) if val_phys_loss_list else 0.0
 
+        phys_log_line = f"""
+                        "Phys Loss Val (weighted)": {val_phys_loss}""" if val_phys_loss_list else ""
         logging.info(f"""
                         "Energy Loss Val (MSE)": {val_energy_loss},
                         "Energy RMSE Val": {val_energy_rmse},
                         "Energy RMSE avg Val": {val_energy_rmse_avg},
                         "Energy MAE avg Val": {val_energy_mae_avg},
                         "Force MAE Val": {val_force_mae},
-                        "Force RMSE Val":  {val_force_rmse}
+                        "Force RMSE Val":  {val_force_rmse},{phys_log_line}
                         """)
         
         # Save results
@@ -213,6 +319,7 @@ class Evaluator:
             'energy_loss': val_energy_loss,
             'force_rmse': val_force_rmse,
             'force_mae': val_force_mae,
+            'phys_loss': val_phys_loss,
         }
     
     def compute_hessian(self, pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell):

@@ -9,6 +9,8 @@ Difference from torch.save(obj):
 This script exports core.pt with:
 - forward signature:
     (pos, A, batch, edge_src, edge_dst, edge_shifts, cell, edge_vec) -> atom_energies
+- **LAMMPS 接口仅需能量和力**：TorchScript trace 时 model 不输出物理张量（dipole/polarizability 等），
+  只输出 per-atom energy；力由 C++ 侧 dE/dpos 计算。
 - **Optional embedded E0** (option B): embed per-element constant energy (E0) from preprocessing/fitting
   into TorchScript; exported core.pt outputs per-atom energy as "network energy + E0(Z)".
   Note: E0 does not affect forces (constant gradient w.r.t. coordinates is zero).

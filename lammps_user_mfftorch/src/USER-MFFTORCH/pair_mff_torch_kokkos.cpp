@@ -83,7 +83,9 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
   int vflag = vflag_in;
 
   if (neighflag == FULL) no_virial_fdotr_compute = 1;
-  ev_init(eflag, vflag, 0);
+  // Use default allocation behavior so eatom/vatom are available when
+  // computes like pe/atom or stress/atom request per-atom quantities.
+  ev_init(eflag, vflag);
 
   atomKK->sync(execution_space, X_MASK | F_MASK | TYPE_MASK);
   atomKK->modified(execution_space, F_MASK);
@@ -170,15 +172,17 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
 
   auto A = type2Z_cuda_.index_select(0, buf_type_idx_);
 
-  const bool need_energy = static_cast<bool>(eflag_global);
+  const bool need_energy = static_cast<bool>(eflag_global || eflag_atom);
+  const bool need_atom_virial = static_cast<bool>(vflag_atom);
   mfftorch::MFFOutputs out;
   try {
-    out = engine_->compute(nlocal, ntotal, A, buf_edge_src_, buf_edge_dst_, buf_rij_, need_energy);
+    out = engine_->compute(nlocal, ntotal, A, buf_edge_src_, buf_edge_dst_, buf_rij_,
+                           need_energy, need_atom_virial);
   } catch (const std::exception &e) {
     error->all(FLERR, (std::string("mff/torch/kk engine compute failed: ") + e.what()).c_str());
   }
 
-  if (need_energy) eng_vdwl += out.energy;
+  if (eflag_global) eng_vdwl += out.energy;
 
   // Write forces on device (no host transfer).
   auto forces = out.forces.contiguous();
@@ -193,17 +197,45 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
       });
   Kokkos::fence();
 
+  // Per-atom energy: copy NN atom_energy to LAMMPS eatom (local atoms only).
+  if (eflag_atom && eatom && out.atom_energy.defined()) {
+    auto ae = out.atom_energy.to(torch::kCPU, torch::kFloat64).contiguous().view({ntotal});
+    const double *ep = ae.data_ptr<double>();
+    for (int i = 0; i < nlocal; i++) eatom[i] += ep[i];
+  }
+
+  // Per-atom virial: engine computed atom_virial [ntotal, 6] on GPU via edge-force
+  // outer products (rij ⊗ edge_forces), scatter-added 50/50 to src and dst.
+  // With newton OFF + FULL list, only write LOCAL atoms (consistent with ev_tally
+  // convention — each pair is visited twice, so each local atom gets its full share).
+  if (vflag_atom && vatom && out.atom_virial.defined()) {
+    auto avir = out.atom_virial.to(torch::kCPU, torch::kFloat64).contiguous();
+    const double *vp = avir.data_ptr<double>();
+    const int nvir = force->newton_pair ? ntotal : nlocal;
+    for (int i = 0; i < nvir; i++) {
+      vatom[i][0] += vp[i * 6 + 0];
+      vatom[i][1] += vp[i * 6 + 1];
+      vatom[i][2] += vp[i * 6 + 2];
+      vatom[i][3] += vp[i * 6 + 3];
+      vatom[i][4] += vp[i * 6 + 4];
+      vatom[i][5] += vp[i * 6 + 5];
+    }
+  }
+
 #ifdef MFF_ENABLE_VIRIAL
   if (vflag_global) {
-    // fdotr virial entirely on GPU — one reduce kernel, no GPU→CPU sync.
-    // Uses Kokkos::View<double[6]> as reduction target for a single kernel launch.
+    // f·r virial must sum over ALL atoms (local + ghost).
+    // Ghost atoms carry the "other half" of cross-boundary PBC interactions.
+    // Using forces_v (NN output) directly guarantees ghost forces are included.
     Kokkos::View<double[6], DeviceType> d_virial("mfftorch::d_virial");
     Kokkos::deep_copy(d_virial, 0.0);
 
     Kokkos::parallel_for(
-        "mfftorch::virial_fdotr", nlocal, KOKKOS_LAMBDA(const int i) {
+        "mfftorch::virial_fdotr", ntotal, KOKKOS_LAMBDA(const int i) {
           const double xi = x(i, 0), yi = x(i, 1), zi = x(i, 2);
-          const double fx = f(i, 0), fy = f(i, 1), fz = f(i, 2);
+          const double fx = static_cast<double>(forces_v(i, 0));
+          const double fy = static_cast<double>(forces_v(i, 1));
+          const double fz = static_cast<double>(forces_v(i, 2));
           Kokkos::atomic_add(&d_virial(0), fx * xi);  // xx
           Kokkos::atomic_add(&d_virial(1), fy * yi);  // yy
           Kokkos::atomic_add(&d_virial(2), fz * zi);  // zz

@@ -188,17 +188,20 @@ void PairMFFTorch::compute(int eflag, int vflag) {
   auto edge_dst_t = torch::from_blob(edge_dst_cpu.data(), {E}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU)).clone();
   auto rij_t = torch::from_blob(rij_cpu.data(), {E, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone();
 
+  const bool want_atom_virial = static_cast<bool>(vflag_atom);
   mfftorch::MFFOutputs out;
   try {
-    out = engine_->compute(nlocal, ntotal, A_t, edge_src_t, edge_dst_t, rij_t, static_cast<bool>(eflag));
+    out = engine_->compute(nlocal, ntotal, A_t, edge_src_t, edge_dst_t, rij_t,
+                           static_cast<bool>(eflag), want_atom_virial);
   } catch (const std::exception &e) {
     error->all(FLERR, (std::string("mff/torch engine compute failed: ") + e.what()).c_str());
   }
 
   if (eflag) eng_vdwl += out.energy;
 
-  // Write forces back. (StepA: device -> CPU copy)
-  const int nwrite = force->newton_pair ? ntotal : nlocal;
+  // When virial is needed, ghost forces must be in f[] for virial_fdotr_compute()
+  // to produce correct results (it sums over nall = nlocal + nghost).
+  const int nwrite = (force->newton_pair || vflag_fdotr) ? ntotal : nlocal;
   auto forces_cpu = out.forces.to(torch::kCPU, torch::kFloat64).contiguous();
   const double *fp = forces_cpu.data_ptr<double>();
   for (int i = 0; i < nwrite; i++) {
@@ -207,11 +210,24 @@ void PairMFFTorch::compute(int eflag, int vflag) {
     f[i][2] += fp[i * 3 + 2];
   }
 
-  if (eflag_atom) {
-    // Add per-atom energies for owned atoms (LAMMPS expects eatom sized nlocal).
+  if (eflag_atom && eatom && out.atom_energy.defined()) {
     auto ae_cpu = out.atom_energy.to(torch::kCPU, torch::kFloat64).contiguous().view({ntotal});
     const double *ep = ae_cpu.data_ptr<double>();
     for (int i = 0; i < nlocal; i++) eatom[i] += ep[i];
+  }
+
+  if (vflag_atom && vatom && out.atom_virial.defined()) {
+    auto vir_cpu = out.atom_virial.to(torch::kCPU, torch::kFloat64).contiguous();
+    const double *vp = vir_cpu.data_ptr<double>();
+    const int nvir = force->newton_pair ? ntotal : nlocal;
+    for (int i = 0; i < nvir; i++) {
+      vatom[i][0] += vp[i * 6 + 0];
+      vatom[i][1] += vp[i * 6 + 1];
+      vatom[i][2] += vp[i * 6 + 2];
+      vatom[i][3] += vp[i * 6 + 3];
+      vatom[i][4] += vp[i * 6 + 4];
+      vatom[i][5] += vp[i * 6 + 5];
+    }
   }
 
   if (vflag_fdotr) virial_fdotr_compute();

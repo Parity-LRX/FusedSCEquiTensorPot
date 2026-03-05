@@ -4,7 +4,7 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.12%2B-orange)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-**FusedSCEquiTensorPot** is an E(3)-equivariant neural potential for predicting molecular energies and forces. Built with PyTorch, it supports **eight equivariant tensor product modes**, including e3nn-based spherical harmonics, channelwise spherical backends, and multiple self-implemented Cartesian tensor product methods.
+**FusedSCEquiTensorPot** is an E(3)-equivariant neural potential for predicting molecular energies and forces. Built with PyTorch, it supports **eight equivariant tensor product modes**, including e3nn-based spherical harmonics, channelwise spherical backends, and multiple self-implemented Cartesian tensor product methods. **Highlights**: embed **external fields** (e.g., electric field) into the equivariant message passing, and train **physical tensors** (charge, dipole, polarizability, quadrupole) as supervised outputs—both supported in `pure-cartesian-ictd` mode.
 
 ## ✨ Features
 
@@ -19,6 +19,11 @@
   - `pure-cartesian-ictd`: ICTD irreps internal representation (strictly equivariant, -72.1% params, fastest, best for memory)
   
 - **E(3)-Equivariant**: All modes maintain rotational equivariance and parity conservation
+
+- **External Fields & Physical Tensors** (pure-cartesian-ictd):
+  - **External field embedding**: Inject global tensors (e.g., electric field, rank-1) into conv1 for field-dependent potentials
+  - **Physical tensor training**: Supervised outputs for charge, dipole, polarizability, quadrupole (per-structure or per-atom)
+  - Configurable loss weights, checkpoint-based inference mode; LAMMPS/TorchScript export outputs energy+forces only
   
 - **Complete Workflow**:
   - Data preprocessing from Extended XYZ format with PBC support
@@ -146,6 +151,17 @@ mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-pr
 
 # Pure-Cartesian-ICTD (strictly equivariant, -72.1% params, best for memory)
 mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode pure-cartesian-ictd
+```
+
+Train with external field and physical tensors (pure-cartesian-ictd only):
+
+```bash
+# External electric field + dipole/polarizability training
+mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd \
+  --external-tensor-rank 1 --external-field-file data/efield.npy \
+  --physical-tensors dipole,polarizability \
+  --dipole-file data/dipole.npy --polarizability-file data/pol.npy \
+  --physical-tensor-weights "dipole:2.0,polarizability:1.0"
 ```
 
 By default, dynamic loss weights `a/b` are clamped to `[1, 1000]` (they change during training). You can override the range:

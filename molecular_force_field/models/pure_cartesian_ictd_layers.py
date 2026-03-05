@@ -20,13 +20,17 @@ import torch.nn as nn
 from molecular_force_field.utils.scatter import scatter
 from e3nn.math import soft_one_hot_linspace
 import math
+from functools import lru_cache
 
 from molecular_force_field.models.ictd_irreps import (
     HarmonicElementwiseProduct,
     HarmonicFullyConnectedTensorProduct,
     direction_harmonics,
     direction_harmonics_all,
+    build_harmonic_projectors,
+    sym_dim,
 )
+from molecular_force_field.models.ictd_fast import _counts_list
 from molecular_force_field.models.mlp import RobustScalarWeightedSum
 from molecular_force_field.models.mlp import MainNet
 
@@ -51,6 +55,236 @@ def _merge_irreps(blocks: dict[int, torch.Tensor], channels: int, lmax: int) -> 
     for l in range(lmax + 1):
         parts.append(blocks[l].reshape(*blocks[l].shape[:-2], channels * (2 * l + 1)))
     return torch.cat(parts, dim=-1)
+
+
+@lru_cache(maxsize=None)
+def _sym_rank_linear_indices_and_coefs(L: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Precompute:
+      - linear indices into a flattened (..., 3,3,...,3) rank-L tensor (last axis flattened)
+        for a canonical representative of each (a,b,c) monomial in Sym^L.
+      - multinomial coefficients multinomial(L; a,b,c) that map the symmetric tensor entry
+        to the polynomial coefficient t_{abc}.
+
+    Ordering of (a,b,c) follows `molecular_force_field.models.ictd_fast._counts_list(L)`,
+    which is the canonical order expected by ICTD projectors in `ictd_irreps`.
+
+    Returns:
+      lin_idx: (Dsym(L),) int64
+      coefs:   (Dsym(L),) float64
+    """
+    L = int(L)
+    if L < 0:
+        raise ValueError(f"L must be >= 0, got {L}")
+    counts = _counts_list(L)
+    D = len(counts)
+    if L == 0:
+        return torch.zeros(1, dtype=torch.int64), torch.ones(1, dtype=torch.float64)
+
+    # Flattening convention for a rank-L tensor shaped (3,)*L:
+    # linear index = sum_{k=0..L-1} i_k * 3^{L-1-k}
+    pow3 = [3 ** (L - 1 - k) for k in range(L)]
+    lin = torch.empty(D, dtype=torch.int64)
+    coefs = torch.empty(D, dtype=torch.float64)
+    for d, (a, b, c) in enumerate(counts):
+        idx_seq = ([0] * a) + ([1] * b) + ([2] * c)  # canonical representative
+        if len(idx_seq) != L:
+            raise RuntimeError("Internal error: bad exponent tuple length")
+        li = 0
+        for ik, pk in zip(idx_seq, pow3):
+            li += int(ik) * int(pk)
+        lin[d] = li
+        coefs[d] = float(math.factorial(L) / (math.factorial(a) * math.factorial(b) * math.factorial(c)))
+    return lin.contiguous(), coefs.contiguous()
+
+
+class PhysicalTensorICTDEmbedding(nn.Module):
+    """
+    Embed a (symmetric) Cartesian physical tensor of rank L into ICTD-irreps blocks.
+
+    Supported inputs (per-sample, with optional channel/multiplicity dimension):
+      - cartesian symmetric tensor: (..., Cin, 3, 3, ..., 3) with L trailing 3's
+        (assumes symmetry across index permutations; a single canonical entry is used)
+      - monomial coefficients (Sym^L): (..., Cin, Dsym(L)) where Dsym(L) = (L+2 choose 2)
+
+    Output:
+      - dict l -> (..., Cout, 2l+1) for all l=0..lmax_out (missing l are zero)
+      - or a flattened (..., Cout*(lmax_out+1)^2) vector compatible with this model's
+        internal irreps layout (concatenated l-blocks).
+
+    Internals:
+      Uses the trace-chain projectors from `ictd_irreps.build_harmonic_projectors` to decompose
+      Sym^L into harmonic irreps blocks l=L, L-2, ..., (0 or 1). This matches how ICTD builds
+      Cartesian tensor products: polynomial multiplication in Sym-space followed by trace-chain
+      projection into irreps.
+    """
+
+    def __init__(
+        self,
+        *,
+        rank: int,
+        lmax_out: int,
+        channels_in: int = 1,
+        channels_out: int | None = None,
+        input_repr: str = "cartesian",
+        include_trace_chain: bool = True,
+        internal_compute_dtype: torch.dtype = torch.float64,
+    ):
+        super().__init__()
+        self.rank = int(rank)
+        self.lmax_out = int(lmax_out)
+        self.channels_in = int(channels_in)
+        self.channels_out = int(channels_out) if channels_out is not None else int(channels_in)
+        self.input_repr = str(input_repr).strip().lower()
+        self.include_trace_chain = bool(include_trace_chain)
+        self.internal_compute_dtype = internal_compute_dtype
+
+        if self.rank < 0:
+            raise ValueError(f"rank must be >= 0, got {self.rank}")
+        if self.lmax_out < 0:
+            raise ValueError(f"lmax_out must be >= 0, got {self.lmax_out}")
+        if self.channels_in <= 0:
+            raise ValueError(f"channels_in must be positive, got {self.channels_in}")
+        if self.channels_out <= 0:
+            raise ValueError(f"channels_out must be positive, got {self.channels_out}")
+        if self.input_repr not in ("cartesian", "monomial"):
+            raise ValueError(f"input_repr must be 'cartesian' or 'monomial', got {self.input_repr!r}")
+
+        # Precompute Sym^L lookup for cartesian -> monomial coefficients
+        lin_idx, coefs = _sym_rank_linear_indices_and_coefs(self.rank)
+        self.register_buffer("_sym_lin_idx_cpu", lin_idx, persistent=False)
+        self.register_buffer("_sym_multinom_cpu", coefs, persistent=False)
+
+        # Per-l channel mixing (Cin -> Cout). Only needed for l present in trace chain and <= lmax_out.
+        self._adapters = nn.ModuleDict()
+        for l in range(self.lmax_out + 1):
+            if self.channels_in == self.channels_out:
+                self._adapters[str(l)] = nn.Identity()
+            else:
+                self._adapters[str(l)] = nn.Linear(self.channels_in, self.channels_out, bias=False)
+
+        # Cache projectors per (device, dtype) to avoid repeated .to() allocations.
+        # key: (device_str, dtype_str) -> dict l -> P (2l+1, Dsym(rank)) in internal_compute_dtype
+        self._proj_cache: dict[tuple[str, str], dict[int, torch.Tensor]] = {}
+
+        self.output_dim = _irreps_total_dim(self.channels_out, self.lmax_out)
+
+    def _get_projectors(self, device: torch.device, dtype: torch.dtype) -> dict[int, torch.Tensor]:
+        # Use internal_compute_dtype for stability; output casting happens later.
+        compute_dtype = self.internal_compute_dtype
+        key = (str(device), str(compute_dtype))
+        cached = self._proj_cache.get(key)
+        if cached is not None:
+            return cached
+
+        proj = build_harmonic_projectors(Lmax=self.rank)  # cached CPU float64
+        D = sym_dim(self.rank)
+
+        P_by_l: dict[int, torch.Tensor] = {}
+        if self.include_trace_chain:
+            ls = list(range(self.rank, -1, -2))
+        else:
+            ls = [self.rank]
+        for l in ls:
+            if l > self.lmax_out:
+                continue
+            P = proj.P[(self.rank, l)]  # (2l+1, D) CPU float64
+            if P.shape[-1] != D:
+                raise RuntimeError("ICTD projector has unexpected Sym dimension")
+            P_by_l[l] = P.to(device=device, dtype=compute_dtype).contiguous()
+
+        self._proj_cache[key] = P_by_l
+        return P_by_l
+
+    def _ensure_channel_dim_monomial(self, x: torch.Tensor) -> torch.Tensor:
+        # Accept (..., D) or (..., Cin, D) where channel dim is -2.
+        if x.dim() >= 2 and x.shape[-2] == self.channels_in:
+            return x
+        return x.unsqueeze(-2)
+
+    def _ensure_channel_dim_cartesian(self, T: torch.Tensor) -> torch.Tensor:
+        # Accept (..., Cin, 3,3,...,3) where channel dim is -(rank+1),
+        # or (..., 3,3,...,3) when channels_in==1 (we insert the Cin dim).
+        if self.rank == 0:
+            # Scalar: accept (..., Cin) or (...) when Cin==1.
+            if T.dim() >= 1 and T.shape[-1] == self.channels_in:
+                return T
+            if self.channels_in == 1:
+                return T.unsqueeze(-1)
+            raise ValueError(f"rank=0 cartesian tensor must have trailing channels_in={self.channels_in}; got shape={tuple(T.shape)}")
+
+        if T.dim() >= (self.rank + 1) and T.shape[-(self.rank + 1)] == self.channels_in:
+            return T
+        if self.channels_in == 1:
+            return T.unsqueeze(-(self.rank + 1))
+        raise ValueError(f"Expected channels_in={self.channels_in} at dim -{self.rank + 1}, got shape={tuple(T.shape)}")
+
+    def _to_monomial_coeffs(self, T: torch.Tensor) -> torch.Tensor:
+        """
+        Convert a symmetric cartesian tensor (..., Cin, 3,3,...,3) to monomial coefficients
+        (..., Cin, Dsym(rank)) consistent with ICTD ordering.
+        """
+        if self.rank == 0:
+            Tch = self._ensure_channel_dim_cartesian(T)  # (..., Cin)
+            return Tch.unsqueeze(-1)  # (..., Cin, 1)
+
+        # Expect L trailing 3's (channel dim may be absent when channels_in==1)
+        if T.dim() < self.rank:
+            raise ValueError(f"cartesian input must have at least rank={self.rank} dims; got shape={tuple(T.shape)}")
+        if tuple(T.shape[-self.rank:]) != (3,) * self.rank:
+            raise ValueError(f"cartesian input last {self.rank} dims must be all 3; got shape={tuple(T.shape)}")
+
+        T = self._ensure_channel_dim_cartesian(T)
+
+        # Flatten the 3^L cartesian indices and gather one canonical representative per (a,b,c).
+        lin_idx = self._sym_lin_idx_cpu.to(device=T.device)
+        coefs = self._sym_multinom_cpu.to(device=T.device, dtype=T.dtype)
+        flat = T.reshape(*T.shape[:-self.rank], 3 ** self.rank)  # (..., Cin, 3^L)
+        vals = flat.index_select(-1, lin_idx)  # (..., Cin, Dsym)
+        return vals * coefs
+
+    def forward(self, tensor: torch.Tensor, *, return_blocks: bool = False) -> torch.Tensor | dict[int, torch.Tensor]:
+        """
+        Args:
+          tensor:
+            - if input_repr="cartesian": (..., Cin, 3,3,...,3) (rank trailing dims)
+            - if input_repr="monomial": (..., Cin, Dsym(rank))
+          return_blocks: if True, return dict l->(..., Cout, 2l+1); else return flattened (..., Cout*(lmax_out+1)^2)
+        """
+        dtype = tensor.dtype
+        device = tensor.device
+
+        if self.input_repr == "cartesian":
+            t = self._to_monomial_coeffs(tensor)  # (..., Cin, Dsym)
+        else:
+            t = self._ensure_channel_dim_monomial(tensor)
+            D = sym_dim(self.rank)
+            if t.shape[-1] != D:
+                raise ValueError(f"monomial input last dim must be Dsym(rank)={D}, got {t.shape[-1]}")
+            if t.shape[-2] != self.channels_in:
+                raise ValueError(f"monomial input channel dim must be channels_in={self.channels_in}, got {t.shape[-2]}")
+
+        # Project Sym^L -> harmonic blocks using trace-chain projectors
+        P_by_l = self._get_projectors(device=device, dtype=dtype)
+        compute_dtype = self.internal_compute_dtype
+        t_comp = t.to(dtype=compute_dtype) if t.dtype != compute_dtype else t
+
+        out_blocks: dict[int, torch.Tensor] = {}
+        batch_shape = t.shape[:-2]
+        for l in range(self.lmax_out + 1):
+            if l in P_by_l:
+                P = P_by_l[l]  # (2l+1, Dsym) compute_dtype
+                # (..., Cin, D) x (2l+1, D) -> (..., Cin, 2l+1)
+                c = torch.einsum("...cd,md->...cm", t_comp, P)
+                c = c.to(dtype=dtype) if c.dtype != dtype else c
+                c = _apply_channel_adapter_per_l(c, self._adapters[str(l)])  # (..., Cout, 2l+1)
+                out_blocks[l] = c
+            else:
+                out_blocks[l] = torch.zeros(*batch_shape, self.channels_out, 2 * l + 1, device=device, dtype=dtype)
+
+        if return_blocks:
+            return out_blocks
+        return _merge_irreps(out_blocks, self.channels_out, self.lmax_out)
 
 def _irreps_elementwise_tensor_product_0e(x1: torch.Tensor, x2: torch.Tensor, channels: int, lmax: int) -> torch.Tensor:
     """

@@ -63,6 +63,51 @@ def main():
     assert out_sync.shape == (num_nodes, 1)
     print(f"  forward with sync_after_scatter (identity): OK")
 
+    # 外场张量注入接口（以电场向量 rank=1 为例）
+    model_ext = PureCartesianICTDTransformerLayer(
+        max_embed_radius=max_radius,
+        main_max_radius=max_radius,
+        main_number_of_basis=8,
+        hidden_dim_conv=64,
+        hidden_dim_sh=32,
+        hidden_dim=64,
+        lmax=2,
+        num_interaction=2,
+        external_tensor_rank=1,
+        external_tensor_scale_init=0.0,  # 默认关闭（数值上等价于无外场）
+    ).to(device=device, dtype=dtype)
+    Efield = torch.tensor([0.1, -0.2, 0.3], device=device, dtype=dtype)
+    out_ext = model_ext(pos.detach(), A, batch, edge_src, edge_dst, edge_shifts, cell, external_tensor=Efield)
+    assert out_ext.shape == (num_nodes, 1)
+    print("  external_tensor injection (rank=1): OK")
+
+    # 物理张量输出 head 接口（例：偶极矩 l=1，极化率 l=0+2），按 batch 聚合为 graph 级输出
+    model_phys = PureCartesianICTDTransformerLayer(
+        max_embed_radius=max_radius,
+        main_max_radius=max_radius,
+        main_number_of_basis=8,
+        hidden_dim_conv=64,
+        hidden_dim_sh=32,
+        hidden_dim=64,
+        lmax=2,
+        num_interaction=2,
+        physical_tensor_outputs={
+            "dipole": {"ls": [1], "channels_out": 1, "reduce": "sum"},
+            "alpha": {"ls": [0, 2], "channels_out": 1, "reduce": "sum"},
+        },
+    ).to(device=device, dtype=dtype)
+    out_e, phys = model_phys(pos.detach(), A, batch, edge_src, edge_dst, edge_shifts, cell, return_physical_tensors=True)
+    assert out_e.shape == (num_nodes, 1)
+    assert "dipole" in phys and "alpha" in phys
+    assert 1 in phys["dipole"] and phys["dipole"][1].shape[-1] == 3
+    assert 0 in phys["alpha"] and phys["alpha"][0].shape[-1] == 1
+    assert 2 in phys["alpha"] and phys["alpha"][2].shape[-1] == 5
+    # batch 全 0 -> num_graphs=1，输出应为 (1, channels_out, 2l+1)
+    assert phys["dipole"][1].shape[:2] == (1, 1)
+    assert phys["alpha"][0].shape[:2] == (1, 1)
+    assert phys["alpha"][2].shape[:2] == (1, 1)
+    print("  physical_tensor_outputs head: OK")
+
     print("  pure_cartesian_ictd_layers_full: OK (usable, DDP sync supported).")
 
 

@@ -11,8 +11,9 @@ namespace mfftorch {
 
 struct MFFOutputs {
   double energy = 0.0;
-  torch::Tensor atom_energy;  // (ntotal,1) or (ntotal,) on engine device
-  torch::Tensor forces;       // (ntotal,3) on engine device
+  torch::Tensor atom_energy;   // (ntotal,1) or (ntotal,) on engine device
+  torch::Tensor forces;        // (ntotal,3) on engine device
+  torch::Tensor atom_virial;   // (ntotal,6) on engine device — Voigt: xx,yy,zz,xy,xz,yz
 };
 
 class MFFTorchEngine {
@@ -32,7 +33,8 @@ class MFFTorchEngine {
                      const torch::Tensor& edge_src,
                      const torch::Tensor& edge_dst,
                      const torch::Tensor& rij,
-                     bool need_energy = true);
+                     bool need_energy = true,
+                     bool need_atom_virial = false);
 
  private:
   torch::jit::script::Module core_;

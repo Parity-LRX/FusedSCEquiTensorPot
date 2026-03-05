@@ -1,6 +1,6 @@
 # 使用指南
 
-FusedSCEquiTensorPot 支持**八种等变张量积实现模式**，包括：
+FusedSCEquiTensorPot 支持**八种等变张量积实现模式**，并可在 `pure-cartesian-ictd` 模式下**嵌入外场**（如电场）和**训练物理张量**（电荷、偶极矩、极化率、四极矩）。包括：
 - `spherical`: 基于 e3nn 的球谐函数方法（默认）
 - `spherical-save`: channelwise edge conv（e3nn 后端，参数量更少）
 - `spherical-save-cue`: channelwise edge conv（cuEquivariance 后端，需可选依赖，GPU 加速）
@@ -145,6 +145,42 @@ mff-train \
     --atomic-energy-keys 1 6 7 8 \
     --atomic-energy-values -430.53299511 -821.03326787 -1488.18856918 -2044.3509823
 ```
+
+**外场与物理张量训练**（仅 `pure-cartesian-ictd` 支持）：
+
+- **外场嵌入**：将全局张量（如电场，rank=1）注入 conv1，用于场依赖势能
+- **物理张量训练**：监督输出电荷、偶极矩、极化率、四极矩（结构级或原子级）
+
+```bash
+# 外场（电场）+ 偶极矩/极化率训练
+mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd \
+  --external-tensor-rank 1 --external-field-file data/efield.npy \
+  --physical-tensors dipole,polarizability \
+  --dipole-file data/dipole.npy --polarizability-file data/pol.npy \
+  --physical-tensor-weights "dipole:2.0,polarizability:1.0"
+
+# 原子级物理张量（需 per-node 标签 HDF5）
+mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd \
+  --extra-per-node-file data/per_atom_labels.h5 \
+  --physical-tensors-per-node charge_per_atom,dipole_per_atom
+```
+
+**外场与物理张量相关参数：**
+
+| 参数 | 说明 |
+|------|------|
+| `--external-tensor-rank` | 外场张量秩（如 1=电场），需配合 `--external-field-file` |
+| `--external-field-file` | 外场标签文件（.npy/.npz/.h5，形状 B×3） |
+| `--charge-file` | 结构级电荷标签（标量/样本） |
+| `--dipole-file` | 结构级偶极矩标签（B×3） |
+| `--polarizability-file` | 结构级极化率标签（B×3×3） |
+| `--quadrupole-file` | 结构级四极矩标签（B×3×3） |
+| `--extra-per-node-file` | 原子级标签 HDF5（sample_0, sample_1, ... 含 charge_per_atom 等） |
+| `--physical-tensors` | 结构级输出：charge,dipole,polarizability,quadrupole |
+| `--physical-tensors-per-node` | 原子级输出：charge_per_atom,dipole_per_atom 等 |
+| `--physical-tensor-reduce` | 结构级归约：sum（默认）、mean、none |
+| `--physical-tensor-weights` | 损失权重：`charge:1.0,dipole:2.0,...` |
+| `--inference-output-physical-tensors` | 保存到 checkpoint：推理时输出物理张量（默认不输出，MD/LAMMPS 仅需能量和力） |
 
 **方式二：自动预处理并训练（一步完成）**
 ```bash
@@ -326,7 +362,7 @@ mff-train \
 
 **日志和记录文件（保存在当前目录）：**
 - `training_YYYYMMDD_HHMMSS.log` - 训练日志（包含详细的batch级别信息，使用RotatingFileHandler，每个文件最大1GB，保留5个备份）
-- `loss.csv` - 损失记录（包含每个验证点的训练和验证指标，如 loss、RMSE、MAE 等；启用应力训练时还包含 stress_loss、stress_rmse、stress_mae）
+- `loss.csv` - 损失记录（包含每个验证点的训练和验证指标，如 loss、RMSE、MAE 等；启用应力训练时还包含 stress_loss、stress_rmse、stress_mae；启用物理张量训练时还包含 train_phys_loss、val_phys_loss）
 
 ### 步骤 3: 评估模型
 
@@ -363,9 +399,10 @@ mff-evaluate \
 - `--irreps-output-conv-channels`: 必须与训练时相同（如果训练时设置了）
 - `--function-type`: 必须与训练时相同
 - `--tensor-product-mode`: 必须与训练时相同（支持六种模式：`spherical`、`partial-cartesian`、`partial-cartesian-loose`、`pure-cartesian`、`pure-cartesian-sparse`、`pure-cartesian-ictd`）
+- `--output-physical-tensors`: 物理张量输出控制（`auto`=使用 checkpoint 的 inference_output_physical_tensors，`true`=始终输出，`false`=不输出；MD/LAMMPS 仅需能量和力时用 `false`）
 
 **输出文件：**
-- `test_loss.csv` - 测试集损失指标
+- `test_loss.csv` - 测试集损失指标（启用物理张量时含 phys_loss）
 - `test_energy.csv` - 测试集能量预测
 - `test_force.csv` - 测试集力预测
 

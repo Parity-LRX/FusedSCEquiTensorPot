@@ -1,6 +1,6 @@
 # Usage Guide
 
-FusedSCEquiTensorPot supports **eight equivariant tensor product implementation modes**, including:
+FusedSCEquiTensorPot supports **eight equivariant tensor product implementation modes**, and in `pure-cartesian-ictd` mode can **embed external fields** (e.g., electric field) and **train physical tensors** (charge, dipole, polarizability, quadrupole). Including:
 - `spherical`: e3nn-based spherical harmonics method (default)
 - `spherical-save`: channelwise edge conv (e3nn backend, fewer params)
 - `spherical-save-cue`: channelwise edge conv (cuEquivariance backend, optional dependency, GPU accelerated)
@@ -144,6 +144,42 @@ mff-train \
     --atomic-energy-keys 1 6 7 8 \
     --atomic-energy-values -430.53299511 -821.03326787 -1488.18856918 -2044.3509823
 ```
+
+**External Fields & Physical Tensor Training** (pure-cartesian-ictd only):
+
+- **External field embedding**: Inject global tensors (e.g., electric field, rank=1) into conv1 for field-dependent potentials
+- **Physical tensor training**: Supervised outputs for charge, dipole, polarizability, quadrupole (per-structure or per-atom)
+
+```bash
+# External field (electric) + dipole/polarizability training
+mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd \
+  --external-tensor-rank 1 --external-field-file data/efield.npy \
+  --physical-tensors dipole,polarizability \
+  --dipole-file data/dipole.npy --polarizability-file data/pol.npy \
+  --physical-tensor-weights "dipole:2.0,polarizability:1.0"
+
+# Per-atom physical tensors (requires per-node label HDF5)
+mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd \
+  --extra-per-node-file data/per_atom_labels.h5 \
+  --physical-tensors-per-node charge_per_atom,dipole_per_atom
+```
+
+**External field & physical tensor parameters:**
+
+| Parameter | Description |
+|-----------|--------------|
+| `--external-tensor-rank` | External tensor rank (e.g., 1=electric field), requires `--external-field-file` |
+| `--external-field-file` | External field label file (.npy/.npz/.h5, shape B×3) |
+| `--charge-file` | Per-structure charge labels (scalar per sample) |
+| `--dipole-file` | Per-structure dipole labels (B×3) |
+| `--polarizability-file` | Per-structure polarizability labels (B×3×3) |
+| `--quadrupole-file` | Per-structure quadrupole labels (B×3×3) |
+| `--extra-per-node-file` | Per-atom label HDF5 (sample_0, sample_1, ... with charge_per_atom, etc.) |
+| `--physical-tensors` | Per-structure outputs: charge,dipole,polarizability,quadrupole |
+| `--physical-tensors-per-node` | Per-atom outputs: charge_per_atom,dipole_per_atom, etc. |
+| `--physical-tensor-reduce` | Per-structure reduce: sum (default), mean, none |
+| `--physical-tensor-weights` | Loss weights: `charge:1.0,dipole:2.0,...` |
+| `--inference-output-physical-tensors` | Save to checkpoint: inference outputs physical tensors (default: no; MD/LAMMPS only needs energy and forces) |
 
 **Method 2: Auto Preprocess and Train (One Step)**
 ```bash
@@ -323,7 +359,7 @@ All output files are saved in the current working directory:
 
 **Log and Record Files (saved in current directory):**
 - `training_YYYYMMDD_HHMMSS.log` - Training log (contains detailed batch-level information, uses RotatingFileHandler, max 1GB per file, keeps 5 backups)
-- `loss.csv` - Loss records (contains training and validation metrics for each validation point, such as loss, RMSE, MAE, etc.)
+- `loss.csv` - Loss records (contains training and validation metrics for each validation point, such as loss, RMSE, MAE, etc.; when stress training is enabled, also includes stress_loss, stress_rmse, stress_mae; when physical tensor training is enabled, also includes train_phys_loss, val_phys_loss)
 
 ### Step 3: Evaluate Model
 
@@ -360,9 +396,10 @@ mff-evaluate \
 - `--irreps-output-conv-channels`: Must be the same as training (if set during training)
 - `--function-type`: Must be the same as training
 - `--tensor-product-mode`: Must be the same as training (supports eight modes: `spherical`, `spherical-save`, `spherical-save-cue`, `partial-cartesian`, `partial-cartesian-loose`, `pure-cartesian`, `pure-cartesian-sparse`, `pure-cartesian-ictd`)
+- `--output-physical-tensors`: Physical tensor output control (`auto`=use checkpoint's inference_output_physical_tensors, `true`=always output, `false`=never; use `false` when MD/LAMMPS only needs energy and forces)
 
 **Output Files:**
-- `test_loss.csv` - Test set loss metrics
+- `test_loss.csv` - Test set loss metrics (includes phys_loss when physical tensors are enabled)
 - `test_energy.csv` - Test set energy predictions
 - `test_force.csv` - Test set force predictions
 

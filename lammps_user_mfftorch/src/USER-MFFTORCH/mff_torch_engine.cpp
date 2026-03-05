@@ -137,13 +137,13 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
                                   const torch::Tensor& edge_src_in,
                                   const torch::Tensor& edge_dst_in,
                                   const torch::Tensor& rij_in,
-                                  bool need_energy) {
+                                  bool need_energy,
+                                  bool need_atom_virial) {
   if (!loaded_) throw std::runtime_error("MFFTorchEngine not loaded");
   if (nlocal <= 0 || ntotal <= 0) return {};
 
   const int64_t nedges = rij_in.size(0);
 
-  // Inputs already on device: skip .to() if device/dtype match.
   auto A = (A_in.device() == device_ && A_in.dtype() == torch::kInt64)
                ? A_in : A_in.to(device_, torch::kInt64);
   auto edge_src = (edge_src_in.device() == device_ && edge_src_in.dtype() == torch::kInt64)
@@ -153,7 +153,6 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
   auto rij = (rij_in.device() == device_ && rij_in.dtype() == torch::kFloat32)
                  ? rij_in : rij_in.to(device_, torch::kFloat32);
 
-  // Reuse pos/batch/edge_shifts buffers when sizes haven't changed.
   if (cached_ntotal_ != ntotal) {
     buf_pos_ = torch::zeros({ntotal, 3},
                             torch::TensorOptions().dtype(torch::kFloat32).device(device_));
@@ -167,10 +166,18 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
     cached_nedges_ = nedges;
   }
 
-  // pos must be a fresh leaf with requires_grad for autograd.
   auto pos = buf_pos_.detach().zero_().requires_grad_(true);
 
-  auto edge_vec = pos.index_select(0, edge_dst) - pos.index_select(0, edge_src) + rij;
+  // When per-atom virial is requested, also differentiate w.r.t. edge vectors.
+  // Clone+detach to get an independent leaf tensor (separate storage from buf_rij_).
+  torch::Tensor rij_leaf;
+  if (need_atom_virial) {
+    rij_leaf = rij.clone().detach().requires_grad_(true);
+  } else {
+    rij_leaf = rij;
+  }
+
+  auto edge_vec = pos.index_select(0, edge_dst) - pos.index_select(0, edge_src) + rij_leaf;
 
   std::vector<torch::jit::IValue> inputs;
   inputs.reserve(8);
@@ -187,14 +194,51 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
   auto atom_e_flat = atom_e.view({atom_e.size(0)});
   auto E_local = atom_e_flat.narrow(0, 0, nlocal).sum();
 
-  auto grads = torch::autograd::grad({E_local}, {pos}, {}, false, false);
+  // Differentiate w.r.t. pos (forces) and optionally rij_leaf (edge forces).
+  std::vector<torch::Tensor> grad_inputs = {pos};
+  if (need_atom_virial) grad_inputs.push_back(rij_leaf);
+
+  auto grads = torch::autograd::grad({E_local}, grad_inputs, {}, /*retain_graph=*/false,
+                                     /*create_graph=*/false, /*allow_unused=*/true);
   auto forces = -grads[0];
 
   MFFOutputs out;
   out.atom_energy = atom_e;
   out.forces = forces;
 
-  // Only do the expensive GPU->CPU sync when caller actually needs the scalar energy.
+  if (need_atom_virial && grads.size() > 1 && grads[1].defined()) {
+    auto edge_forces = -grads[1];  // [nedges, 3]
+
+    // Per-edge virial in Voigt order (LAMMPS convention):
+    //   v = del ⊗ f_on_src,  where del = x[src]-x[dst] = -rij,  f_on_src = -edge_forces
+    //   v = (-rij) ⊗ (-edge_forces) = rij ⊗ edge_forces
+    auto r0 = rij_leaf.select(1, 0);  // [E]
+    auto r1 = rij_leaf.select(1, 1);
+    auto r2 = rij_leaf.select(1, 2);
+    auto f0 = edge_forces.select(1, 0);
+    auto f1 = edge_forces.select(1, 1);
+    auto f2 = edge_forces.select(1, 2);
+
+    auto edge_vir = torch::stack({
+        r0 * f0,  // xx
+        r1 * f1,  // yy
+        r2 * f2,  // zz
+        r0 * f1,  // xy
+        r0 * f2,  // xz
+        r1 * f2,  // yz
+    }, 1);  // [nedges, 6]
+
+    // Scatter half to each endpoint (gauge-invariant split).
+    auto atom_vir = torch::zeros({ntotal, 6}, edge_vir.options());
+    auto half_vir = 0.5f * edge_vir;
+    auto src_idx = edge_src.unsqueeze(1).expand_as(half_vir);
+    auto dst_idx = edge_dst.unsqueeze(1).expand_as(half_vir);
+    atom_vir.scatter_add_(0, src_idx, half_vir);
+    atom_vir.scatter_add_(0, dst_idx, half_vir);
+
+    out.atom_virial = atom_vir;
+  }
+
   if (need_energy) {
     out.energy = E_local.detach().to(torch::kCPU).item<double>();
   }

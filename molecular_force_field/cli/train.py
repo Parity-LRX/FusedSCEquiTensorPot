@@ -364,6 +364,37 @@ def main():
                              'If both --train-data and --valid-data are set, use these files and skip preprocessing.')
     parser.add_argument('--valid-data', type=str, default=None,
                         help='Path to preprocessed validation H5 file. Use together with --train-data.')
+
+    # 外部张量 / 物理张量（仅 pure-cartesian-ictd 支持）
+    parser.add_argument('--external-tensor-rank', type=int, default=None,
+                        help='External tensor rank for conv1 injection (e.g. 1=electric field). '
+                             'Requires --external-field-file. Only for pure-cartesian-ictd.')
+    parser.add_argument('--charge-file', type=str, default=None,
+                        help='Per-structure charge label file (.npy/.npz/.h5, scalar per sample)')
+    parser.add_argument('--dipole-file', type=str, default=None,
+                        help='Per-structure dipole label file (.npy/.npz/.h5, shape Bx3)')
+    parser.add_argument('--polarizability-file', type=str, default=None,
+                        help='Per-structure polarizability label file (.npy/.npz/.h5, shape Bx3x3)')
+    parser.add_argument('--quadrupole-file', type=str, default=None,
+                        help='Per-structure quadrupole label file (.npy/.npz/.h5, shape Bx3x3)')
+    parser.add_argument('--external-field-file', type=str, default=None,
+                        help='Per-structure external field file (.npy/.npz/.h5, shape Bx3). '
+                             'Requires --external-tensor-rank=1 for pure-cartesian-ictd.')
+    parser.add_argument('--extra-per-node-file', type=str, default=None,
+                        help='Per-node label HDF5 (sample_0, sample_1, ... with charge_per_atom, dipole_per_atom, etc.)')
+    parser.add_argument('--physical-tensors', type=str, default=None,
+                        help='Comma-separated physical tensor outputs: charge,dipole,polarizability,quadrupole. '
+                             'Requires corresponding label files. Only for pure-cartesian-ictd.')
+    parser.add_argument('--physical-tensors-per-node', type=str, default=None,
+                        help='Comma-separated per-node outputs: charge_per_atom,dipole_per_atom,polarizability_per_atom,quadrupole_per_atom. '
+                             'Requires --extra-per-node-file. Only for pure-cartesian-ictd.')
+    parser.add_argument('--physical-tensor-reduce', type=str, default='sum',
+                        choices=['sum', 'mean', 'none'],
+                        help='Reduce mode for graph-level physical tensors (default: sum). '
+                             'Per-node tensors always use reduce=none.')
+    parser.add_argument('--physical-tensor-weights', type=str, default=None,
+                        help='Loss weights for physical tensors: "charge:1.0,dipole:2.0,polarizability:1.0,quadrupole:1.0". '
+                             'Per-node (charge_per_atom) uses charge weight. Unspecified default 1.0.')
     parser.add_argument('--distributed', action='store_true',
                         help='Enable distributed training (DDP)')
     parser.add_argument('--local-rank', type=int, default=-1,
@@ -442,6 +473,11 @@ def main():
                         help='Pass dynamic=True to torch.compile for validation.')
     parser.add_argument('--compile-val-precache', action='store_true',
                         help='Run one eager forward on the first validation batch before compiling (recommended for ICTD).')
+
+    # 推理模式：保存到 checkpoint，供 evaluate/inference_ddp 使用；TorchScript/LAMMPS 导出始终只输出能量和力
+    parser.add_argument('--inference-output-physical-tensors', action='store_true',
+                        help='Save in checkpoint: inference should output physical tensors (dipole, polarizability, etc.). '
+                             'Default False: MD/LAMMPS 接口仅需能量和力，不输出物理张量。')
     
     args = parser.parse_args()
 
@@ -450,6 +486,33 @@ def main():
         raise ValueError("Must specify both --train-data and --valid-data together, or neither.")
     if (args.train_input_file is None) != (args.valid_input_file is None):
         raise ValueError("Must specify both --train-input-file and --valid-input-file together, or neither.")
+
+    # --- External tensor / physical tensor validation ---
+    if args.external_field_file and not args.external_tensor_rank:
+        raise ValueError("--external-field-file requires --external-tensor-rank (e.g. 1 for electric field)")
+    if args.external_tensor_rank and not args.external_field_file:
+        raise ValueError("--external-tensor-rank requires --external-field-file")
+    if args.external_tensor_rank and args.tensor_product_mode != "pure-cartesian-ictd":
+        raise ValueError("--external-tensor-rank only supported for --tensor-product-mode pure-cartesian-ictd")
+    if (args.physical_tensors or args.physical_tensors_per_node) and args.tensor_product_mode != "pure-cartesian-ictd":
+        raise ValueError("--physical-tensors and --physical-tensors-per-node only supported for --tensor-product-mode pure-cartesian-ictd")
+    if args.physical_tensors_per_node and not args.extra_per_node_file:
+        raise ValueError("--physical-tensors-per-node requires --extra-per-node-file")
+
+    # Parse physical_tensor_weights: "charge:1.0,dipole:2.0,..." -> {"charge": 1.0, "dipole": 2.0, ...}
+    physical_tensor_weights = {}
+    if args.physical_tensor_weights:
+        for part in args.physical_tensor_weights.split(","):
+            part = part.strip()
+            if ":" in part:
+                k, v = part.split(":", 1)
+                k = k.strip()
+                try:
+                    physical_tensor_weights[k] = float(v.strip())
+                except ValueError:
+                    raise ValueError(f"Invalid --physical-tensor-weights part {part!r}; expected name:weight")
+            else:
+                raise ValueError(f"Invalid --physical-tensor-weights part {part!r}; expected name:weight")
 
     # --- Rank / world size (updated later if --distributed) ---
     rank = 0
@@ -629,13 +692,43 @@ def main():
             logging.error("Data preparation failed. Exiting.")
             return
 
+    # --- Build extra_label_paths and extra_per_node for H5Dataset ---
+    extra_label_paths = {}
+    if args.charge_file:
+        extra_label_paths["charge"] = args.charge_file
+    if args.dipole_file:
+        extra_label_paths["dipole"] = args.dipole_file
+    if args.polarizability_file:
+        extra_label_paths["polarizability"] = args.polarizability_file
+    if args.quadrupole_file:
+        extra_label_paths["quadrupole"] = args.quadrupole_file
+    if args.external_field_file:
+        extra_label_paths["external_field"] = args.external_field_file
+    extra_label_paths = extra_label_paths if extra_label_paths else None
+
     # --- Build datasets (from custom paths or data_dir + prefix) ---
     if use_custom_data_paths:
-        train_dataset = H5Dataset('train', data_dir=args.data_dir, file_path=args.train_data)
-        val_dataset = H5Dataset('val', data_dir=args.data_dir, file_path=args.valid_data)
+        train_dataset = H5Dataset(
+            'train', data_dir=args.data_dir, file_path=args.train_data,
+            extra_label_paths=extra_label_paths,
+            extra_per_node_label_path=args.extra_per_node_file,
+        )
+        val_dataset = H5Dataset(
+            'val', data_dir=args.data_dir, file_path=args.valid_data,
+            extra_label_paths=extra_label_paths,
+            extra_per_node_label_path=args.extra_per_node_file,
+        )
     else:
-        train_dataset = H5Dataset(args.train_prefix, data_dir=args.data_dir)
-        val_dataset = H5Dataset(args.val_prefix, data_dir=args.data_dir)
+        train_dataset = H5Dataset(
+            args.train_prefix, data_dir=args.data_dir,
+            extra_label_paths=extra_label_paths,
+            extra_per_node_label_path=args.extra_per_node_file,
+        )
+        val_dataset = H5Dataset(
+            args.val_prefix, data_dir=args.data_dir,
+            extra_label_paths=extra_label_paths,
+            extra_per_node_label_path=args.extra_per_node_file,
+        )
 
     # --- DataLoaders and distributed samplers ---
     if args.distributed:
@@ -769,6 +862,38 @@ def main():
     elif args.tensor_product_mode == 'pure-cartesian-ictd':
         logging.info("Using PURE Cartesian ICTD mode (pure_cartesian_ictd_layers_full, DDP sync), num_interaction=%d", args.num_interaction)
         logging.info(f"  ictd_tp_path_policy={args.ictd_tp_path_policy}, ictd_tp_max_rank_other={args.ictd_tp_max_rank_other}")
+
+        # Build physical_tensor_outputs from CLI
+        _phys_specs = {"charge": [0], "dipole": [1], "polarizability": [0, 2], "quadrupole": [2]}
+        physical_tensor_outputs = {}
+        if args.physical_tensors:
+            for name in (s.strip() for s in args.physical_tensors.split(",") if s.strip()):
+                if name in _phys_specs:
+                    physical_tensor_outputs[name] = {
+                        "ls": _phys_specs[name],
+                        "channels_out": 1,
+                        "reduce": args.physical_tensor_reduce,
+                    }
+                else:
+                    raise ValueError(f"Unknown --physical-tensors name {name!r}; supported: charge, dipole, polarizability, quadrupole")
+        if args.physical_tensors_per_node:
+            for name in (s.strip() for s in args.physical_tensors_per_node.split(",") if s.strip()):
+                base = name.replace("_per_atom", "")
+                if base in _phys_specs:
+                    physical_tensor_outputs[name] = {
+                        "ls": _phys_specs[base],
+                        "channels_out": 1,
+                        "reduce": "none",
+                    }
+                else:
+                    raise ValueError(f"Unknown --physical-tensors-per-node {name!r}; supported: charge_per_atom, dipole_per_atom, polarizability_per_atom, quadrupole_per_atom")
+        physical_tensor_outputs = physical_tensor_outputs if physical_tensor_outputs else None
+
+        if physical_tensor_outputs and rank == 0:
+            logging.info("  physical_tensor_outputs: %s", list(physical_tensor_outputs.keys()))
+        if args.external_tensor_rank is not None and rank == 0:
+            logging.info("  external_tensor_rank=%d (e.g. electric field)", args.external_tensor_rank)
+
         e3trans = PureCartesianICTDTransformerLayerFull(
             max_embed_radius=config.max_radius,
             main_max_radius=config.max_radius_main,
@@ -790,6 +915,8 @@ def main():
             ictd_tp_max_rank_other=args.ictd_tp_max_rank_other,
             internal_compute_dtype=config.dtype,
             device=device,
+            physical_tensor_outputs=physical_tensor_outputs,
+            external_tensor_rank=args.external_tensor_rank,
         ).to(device)
     elif args.tensor_product_mode == 'pure-cartesian-ictd-save':
         logging.info("Using PURE Cartesian ICTD mode (pure_cartesian_ictd_layers, save/original), num_interaction=%d", args.num_interaction)
@@ -1035,6 +1162,8 @@ def main():
         compile_val_fullgraph=args.compile_val_fullgraph,
         compile_val_dynamic=args.compile_val_dynamic,
         compile_val_precache=args.compile_val_precache,
+        inference_output_physical_tensors=args.inference_output_physical_tensors,
+        physical_tensor_weights=physical_tensor_weights,
     )
     
     # Start training

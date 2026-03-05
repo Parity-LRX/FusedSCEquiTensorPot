@@ -31,9 +31,15 @@ def my_collate_fn(batch_list):
     num_nodes_accumulated = 0
 
     stress_list = []
+    extras_out = {}
+    extras_masks = {}
 
     for i, item in enumerate(batch_list):
-        read_tensor, target_energy, src, dst, shifts, cell, stress = item
+        if len(item) == 7:
+            read_tensor, target_energy, src, dst, shifts, cell, stress = item
+            extras = {}
+        else:
+            read_tensor, target_energy, src, dst, shifts, cell, stress, extras = item
         num_atoms = read_tensor.shape[0]
         
         pos = read_tensor[:, 1:4]
@@ -55,7 +61,12 @@ def my_collate_fn(batch_list):
         
         num_nodes_accumulated += num_atoms
 
-    return (
+        # Graph-level extras (optional)
+        for k, v in (extras or {}).items():
+            extras_out.setdefault(k, []).append(v)
+            extras_masks.setdefault(k, []).append(torch.tensor(True))
+
+    base = (
         torch.cat(pos_list, dim=0),
         torch.cat(A_list, dim=0),
         torch.cat(batch_idx_list, dim=0),
@@ -65,8 +76,17 @@ def my_collate_fn(batch_list):
         torch.cat(edge_dst_list, dim=0),
         torch.cat(edge_shifts_list, dim=0),
         torch.stack(cell_list, dim=0),  # (B, 3, 3)
-        torch.stack(stress_list, dim=0)  # (B, 3, 3)
+        torch.stack(stress_list, dim=0),  # (B, 3, 3)
     )
+    extras_batch = {}
+    for k, vs in extras_out.items():
+        try:
+            extras_batch[k] = torch.stack(vs, dim=0)
+        except Exception:
+            extras_batch[k] = torch.tensor(vs)
+        extras_batch[f"{k}_mask"] = torch.stack(extras_masks[k], dim=0).to(dtype=torch.bool)
+    # 向后兼容：无 extras 时返回 10 元组，有 extras 时返回 11 元组
+    return base + (extras_batch,) if extras_batch else base
 
 
 def collate_fn_h5(batch_list):
@@ -81,6 +101,9 @@ def collate_fn_h5(batch_list):
     """
     pos_l, A_l, b_idx_l, force_l, target_l = [], [], [], [], []
     src_l, dst_l, shift_l, cell_l, stress_l = [], [], [], [], []
+    extras_lists = {}
+    extras_masks = {}
+    per_node_keys = ("charge_per_atom", "dipole_per_atom", "polarizability_per_atom", "quadrupole_per_atom")
     
     node_offset = 0
     for i, data in enumerate(batch_list):
@@ -105,7 +128,21 @@ def collate_fn_h5(batch_list):
         
         node_offset += num_nodes
 
-    return (
+        # Optional extras (graph-level Cartesian labels / global tensors)
+        for k in ("charge", "dipole", "polarizability", "quadrupole", "external_field"):
+            if k in data:
+                extras_lists.setdefault(k, []).append(data[k])
+                extras_masks.setdefault(k, []).append(torch.tensor(True))
+            else:
+                # leave missing; caller can interpret absence by missing key
+                pass
+        # Optional extras (per-node labels, reduce="none")
+        for k in per_node_keys:
+            if k in data and data[k] is not None:
+                extras_lists.setdefault(k, []).append(data[k])
+                extras_masks.setdefault(k, []).append(torch.ones(data[k].shape[0], dtype=torch.bool))
+
+    base = (
         torch.cat(pos_l),
         torch.cat(A_l),
         torch.cat(b_idx_l),
@@ -115,8 +152,21 @@ def collate_fn_h5(batch_list):
         torch.cat(dst_l),       # [Total_Edges]
         torch.cat(shift_l),     # [Total_Edges, 3]
         torch.cat(cell_l),      # [Batch_Size, 3, 3]
-        torch.cat(stress_l)     # [Batch_Size, 3, 3]
+        torch.cat(stress_l),     # [Batch_Size, 3, 3]
     )
+    extras_batch = {}
+    for k, vs in extras_lists.items():
+        if k in per_node_keys:
+            extras_batch[k] = torch.cat(vs, dim=0)
+            extras_batch[f"{k}_mask"] = torch.cat(extras_masks[k], dim=0).to(dtype=torch.bool)
+        else:
+            try:
+                extras_batch[k] = torch.stack(vs, dim=0)
+            except Exception:
+                extras_batch[k] = torch.tensor(vs)
+            extras_batch[f"{k}_mask"] = torch.stack(extras_masks[k], dim=0).to(dtype=torch.bool)
+    # 向后兼容：无 extras 时返回 10 元组，有 extras 时返回 11 元组
+    return base + (extras_batch,) if extras_batch else base
 
 
 def on_the_fly_collate(batch_list):
@@ -135,6 +185,8 @@ def on_the_fly_collate(batch_list):
     # Initialize lists
     pos_l, A_l, force_l, target_l, cell_l, stress_l, b_idx_l = [], [], [], [], [], [], []
     src_l, dst_l, shift_l = [], [], []
+    extras_lists = {}
+    extras_masks = {}
     
     num_nodes_accum = 0
     
@@ -156,7 +208,12 @@ def on_the_fly_collate(batch_list):
         
         num_nodes_accum += num_atoms
 
-    return (
+        for k in ("charge", "dipole", "polarizability", "quadrupole", "external_field"):
+            if k in item:
+                extras_lists.setdefault(k, []).append(item[k])
+                extras_masks.setdefault(k, []).append(torch.tensor(True))
+
+    base = (
         torch.cat(pos_l),
         torch.cat(A_l),
         torch.cat(b_idx_l),
@@ -166,5 +223,14 @@ def on_the_fly_collate(batch_list):
         torch.cat(dst_l),
         torch.cat(shift_l),
         torch.stack(cell_l),
-        torch.stack(stress_l)
+        torch.stack(stress_l),
     )
+    extras_batch = {}
+    for k, vs in extras_lists.items():
+        try:
+            extras_batch[k] = torch.stack(vs, dim=0)
+        except Exception:
+            extras_batch[k] = torch.tensor(vs)
+        extras_batch[f"{k}_mask"] = torch.stack(extras_masks[k], dim=0).to(dtype=torch.bool)
+    # 向后兼容：无 extras 时返回 10 元组，有 extras 时返回 11 元组
+    return base + (extras_batch,) if extras_batch else base
