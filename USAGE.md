@@ -34,6 +34,7 @@ mff-train --help
 mff-evaluate --help
 mff-export-core --help   # LAMMPS LibTorch 导出
 mff-lammps --help        # LAMMPS fix external 接口
+mff-init-data --help     # 初始数据集生成（冷启动）
 mff-active-learn --help  # 主动学习工作流
 python -m molecular_force_field.cli.export_mliap --help  # LAMMPS ML-IAP 导出
 ```
@@ -338,11 +339,18 @@ mff-train \
 - `--compile-val-fullgraph`: 强制完整图编译
 - `--compile-val-dynamic`: 动态形状
 
-**分布式训练参数：**
-- `--distributed`: 启用分布式训练（DDP模式）。需要配合`torchrun`或`torch.distributed.launch`使用。启用后，训练会自动使用多GPU并行
-- `--local-rank`: 本地进程rank（默认-1，通常由`torchrun`自动设置，无需手动指定）。如果未设置，会从环境变量`LOCAL_RANK`读取
-- `--backend`: 分布式后端（默认'nccl'，选项：'nccl'或'gloo'）。'nccl'用于GPU训练（推荐），'gloo'用于CPU训练
-- `--init-method`: 分布式初始化方法（默认'env://'）。通常使用环境变量方式初始化，无需修改
+**分布式训练参数（推荐方式：`--n-gpu`）：**
+- `--n-gpu`: GPU 数量（默认1）。>1 时自动通过 `torchrun` 启动 DDP，无需手动写 `torchrun` 命令
+- `--nnodes`: 节点数（默认1）。>1 时启用多节点 DDP
+- `--master-addr`: rendezvous 地址（默认 `auto`，从 SLURM 或 hostname 自动解析）
+- `--master-port`: rendezvous 端口（默认 29500）
+- `--launcher`: 启动器（`auto` / `local` / `slurm`）
+
+**分布式训练参数（高级 / 手动 torchrun 方式）：**
+- `--distributed`: 启用分布式训练（DDP模式）。使用 `--n-gpu` 时自动添加，手动 `torchrun` 时需显式指定
+- `--local-rank`: 本地进程rank（默认-1，通常由`torchrun`自动设置，无需手动指定）
+- `--backend`: 分布式后端（默认'nccl'，选项：'nccl'或'gloo'）
+- `--init-method`: 分布式初始化方法（默认'env://'）
 
 **原子参考能量（E0）参数：**
 - `--atomic-energy-file`: 包含原子参考能量的CSV文件路径（可选，默认None）。CSV文件应包含`Atom`和`E0`两列。如果未设置，会使用`{data-dir}/fitted_E0.csv`（由训练集最小二乘拟合得到）
@@ -885,6 +893,27 @@ pip install scipy  # 声子谱计算需要（用于矩阵对角化）
 pip install ase    # 结构处理和邻居列表（通常已安装）
 ```
 
+## 冷启动：从零生成初始数据集 (mff-init-data)
+
+只有种子结构、没有已标注数据时，`mff-init-data` 一键完成 **扰动 → DFT 标注 → 预处理**：
+
+```bash
+mff-init-data --structures water.xyz ethanol.xyz \
+    --n-perturb 15 --rattle-std 0.05 \
+    --label-type pyscf --pyscf-method b3lyp --pyscf-basis 6-31g* \
+    --output-dir data
+
+# 周期性体系
+mff-init-data --structures POSCAR.vasp \
+    --n-perturb 20 --rattle-std 0.02 --cell-scale-range 0.03 \
+    --label-type vasp --vasp-xc PBE --vasp-encut 500 \
+    --output-dir data
+```
+
+主要参数：`--n-perturb`（扰动数）、`--rattle-std`（位移 σ，Å）、`--cell-scale-range`（晶胞缩放范围，周期性体系）、`--min-dist`（最小原子间距过滤）。详见 [ACTIVE_LEARNING.md](ACTIVE_LEARNING.md)。
+
+---
+
 ## 主动学习 (mff-active-learn)
 
 主动学习模块实现 DPGen2 风格的工作流：**训练集成 → 探索（MD/NEB）→ 按力偏差筛选 → DFT 标注 → 合并数据 → 重复**，用于在势能面尚未覆盖的区域自动采点并扩充训练集。支持**单节点**（本机多进程并发标注）和**超算**（SLURM 按结构提交作业）；同一套 DFT 脚本模板可同时用于本地测试（`local-script`）和集群（`slurm`）。
@@ -911,7 +940,7 @@ mff-active-learn --help
 |------|------|------|
 | `--work-dir` | `al_work` | 主动学习工作目录 |
 | `--data-dir` | `data` | 训练数据目录（需含 processed_train.h5 或 train.xyz） |
-| `--init-structure` | 从 data-dir 自动提取 | 初始结构 XYZ 路径 |
+| `--init-structure` | 从 data-dir 自动提取 | 一个或多个初始结构路径（多结构并行探索），或包含 .xyz 文件的目录 |
 | `--n-models` | 4 | 集成模型数量 |
 | `--n-iterations` | 20 | 单阶段最大迭代次数（未用 --stages 时） |
 | `--explore-type` | 必选 | 探索后端：`ase` 或 `lammps` |
@@ -926,11 +955,41 @@ mff-active-learn --help
 | `--level-f-lo` / `--level-f-hi` | 0.05 / 0.5 | 力偏差筛选阈值 (eV/Å) |
 | `--conv-accuracy` | 0.9 | 收敛判定比例 |
 | `--epochs` | 由 mff-train 默认 | 每轮每个模型的训练 epoch 数 |
+| `--train-n-gpu` | 1 | 训练每个集成模型使用的 GPU 数（每节点）。1=单进程（兼容 CPU/单卡），>1 自动 torchrun DDP |
+| `--train-max-parallel` | 0 (auto) | 同时并行训练的最大模型数。0=自动（可用 GPU ÷ train-n-gpu），1=串行。多节点时强制为1 |
+| `--train-nnodes` | 1 | **每个模型**使用的节点数。SLURM 下自动按 `总节点÷nnodes` 并行训练多模型 |
+| `--train-master-addr` | auto | rendezvous 地址。`auto`=从 SLURM 或本机 hostname 解析 |
+| `--train-master-port` | 29500 | 基础端口。并行模型自动偏移 (`+slot`) 避免端口冲突 |
+| `--train-launcher` | auto | 启动器：`auto` / `local` / `slurm`。SLURM 下自动按节点子集分配 `--nodelist` |
 | `--stages` | 无 | 多阶段 JSON 文件路径 |
 | `--device` | `cuda` | 推理设备 |
 | `--max-radius` | 5.0 | 邻居搜索最大半径 (Å) |
 | `--atomic-energy-file` | `data/fitted_E0.csv` | 原子参考能量 CSV |
 | `--neb-initial` / `--neb-final` | 无 | NEB 模式下的初/末结构 |
+
+### 多层筛选
+
+候选构型经过三层筛选后再送标注，显著降低 DFT 成本并提升训练集多样性：
+
+| 层 | 名称 | 说明 |
+|----|------|------|
+| **Layer 0** | 失败帧恢复 | 可选地将部分 `fail` 帧中最不极端的构型纳入候选 |
+| **Layer 1** | 不确定性门控 | 保留 `level_f_lo ≤ max_devi_f < level_f_hi` 的帧 |
+| **Layer 2** | 多样性筛选 | 用结构指纹（SOAP / deviation 直方图）+ FPS 选取最大化多样性的子集 |
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--diversity-metric` | `soap` | 指纹类型：`soap`（需 dscribe）、`devi_hist`（零额外推理）、`none`（不筛） |
+| `--max-candidates-per-iter` | 50 | 多样性筛选后每轮最多保留的候选数 |
+| `--soap-rcut` | 5.0 | SOAP 截断半径 (Å) |
+| `--soap-nmax` | 8 | SOAP 径向基展开阶数 |
+| `--soap-lmax` | 6 | SOAP 角向展开阶数 |
+| `--soap-sigma` | 0.5 | SOAP 高斯展宽 |
+| `--devi-hist-bins` | 32 | `devi_hist` 直方图桶数 |
+| `--fail-strategy` | `discard` | `discard`（丢弃 fail 帧）或 `sample_topk`（取最温和 fail 帧加入候选） |
+| `--fail-max-select` | 10 | `sample_topk` 时最多纳入的 fail 帧数 |
+
+> SOAP 指纹需 `dscribe`：`pip install dscribe` 或 `pip install molecular_force_field[al]`。未安装时自动回退为 `devi_hist`。
 
 ### 标注类型 (--label-type)
 
@@ -1045,6 +1104,77 @@ mff-active-learn --explore-type ase --explore-mode neb \
     --label-type pyscf --pyscf-method b3lyp --n-iterations 5
 ```
 
+**多模型并行训练（自动 GPU 分配）：**
+
+```bash
+# 8 张 GPU，4 个模型各用 1 张 → 4 个模型同时训练（自动）
+mff-active-learn --explore-type ase --explore-mode md --label-type pyscf \
+    --pyscf-method b3lyp --pyscf-basis 6-31g* \
+    --n-models 4 --train-n-gpu 1 --md-steps 500 --n-iterations 5
+
+# 8 张 GPU，4 个模型各用 2 张 DDP → 4 个模型同时训练（自动 8÷2=4）
+mff-active-learn --explore-type ase --explore-mode md --label-type pyscf \
+    --pyscf-method b3lyp --pyscf-basis 6-31g* \
+    --n-models 4 --train-n-gpu 2 --md-steps 500 --n-iterations 5
+
+# 4 张 GPU，4 个模型各用 4 张 → 串行（自动 4÷4=1）
+mff-active-learn --explore-type ase --explore-mode md --label-type pyscf \
+    --pyscf-method b3lyp --pyscf-basis 6-31g* \
+    --n-models 4 --train-n-gpu 4 --md-steps 500 --n-iterations 5
+
+# 手动指定并行度：8 张 GPU，每模型 1 张，最多同时训 2 个
+mff-active-learn --explore-type ase --explore-mode md --label-type pyscf \
+    --n-models 4 --train-n-gpu 1 --train-max-parallel 2
+```
+
+> **GPU 分配逻辑**：系统自动检测可用 GPU 池（尊重 `CUDA_VISIBLE_DEVICES`），按 `available_gpus // train_n_gpu` 计算默认并行度。每个模型通过 `CUDA_VISIBLE_DEVICES` 被分配到不重叠的 GPU 子集。日志输出到 `train_logs/model_*.log`。
+>
+> - `--train-n-gpu 1`（默认）= 单进程 `python -m`，完全兼容 CPU 和单卡
+> - `--train-n-gpu N` (N > 1) = `torchrun --nproc_per_node=N --distributed` DDP
+> - `--train-max-parallel 0`（默认）= 自动最大并行；`1` = 串行（原始行为）
+
+**多节点 DDP 训练（超算/集群）：**
+
+```bash
+# 场景 1：SLURM 分配 2 节点 × 4 GPU，4 个模型各用 2 节点 → 串行（2÷2=1）
+#SBATCH --nodes=2 --gres=gpu:4
+mff-active-learn --explore-type ase --label-type vasp \
+    --train-n-gpu 4 --train-nnodes 2 --n-models 4
+
+# 场景 2：SLURM 分配 8 节点 × 4 GPU，4 个模型各用 2 节点 → 4 模型并行（8÷2=4）
+#SBATCH --nodes=8 --gres=gpu:4
+mff-active-learn --explore-type ase --label-type vasp \
+    --train-n-gpu 4 --train-nnodes 2 --n-models 4
+
+# 场景 3：SLURM 分配 2 节点 × 8 GPU，4 模型各用 4 GPU → 4 模型并行（跨节点分发）
+# 每节点放 2 个模型（8÷4=2），2 节点 × 2 = 4 个并行 slot
+#SBATCH --nodes=2 --gres=gpu:8
+mff-active-learn --explore-type ase --label-type vasp \
+    --train-n-gpu 4 --train-nnodes 1 --n-models 4
+
+# 场景 4：SLURM 分配 4 节点 × 8 GPU，4 模型各用 1 整个节点
+#SBATCH --nodes=4 --gres=gpu:8
+mff-active-learn --explore-type ase --label-type vasp \
+    --train-n-gpu 8 --train-nnodes 1 --n-models 4
+```
+
+> **资源分配逻辑（三种模式自动切换）**：
+>
+> | 条件 | 模式 | 分配策略 |
+> |------|------|----------|
+> | `nnodes=1`，非 SLURM 或单节点 | **本地** | 本地 GPU 池按 `n_gpu` 切分 |
+> | `nnodes=1`，SLURM 多节点 | **跨节点分发** | 每个节点的 GPU 池按 `n_gpu` 切分，模型通过 `srun --nodelist` 分发到不同节点 |
+> | `nnodes>1` | **多节点 DDP** | SLURM 节点池按 `nnodes` 分组，每组训练一个模型 |
+>
+> - 每个并行模型使用独立端口 `master_port + slot`，避免冲突
+> - 跨节点分发时，模型通过 `srun --nodes=1 --nodelist=<node>` 在指定节点运行，`CUDA_VISIBLE_DEVICES` 限定 GPU 子集
+> - 非 SLURM 环境（`launcher=local`）下多节点默认串行
+
+**DDP 安全保证**：
+- 仅 rank 0 写入 checkpoint（`is_main_process` 检查）
+- 所有 rank 在 checkpoint 写入后通过 `dist.barrier()` 同步，确保文件完整写入后才继续
+- 训练结束后所有 rank 统一调用 `dist.destroy_process_group()` 清理
+
 ### 并发与错误处理
 
 | 参数 | 默认 | 说明 |
@@ -1061,7 +1191,10 @@ mff-active-learn --explore-type ase --explore-mode neb \
 
 1. **训练集成**：用当前 `data_dir` 中的训练数据训练 `n_models` 个模型（不同随机种子）， checkpoint 写入 `work_dir/checkpoint/`。
 2. **探索**：用其中一个模型对初始结构跑 MD（或 NEB），得到轨迹 `work_dir/iterations/iter_<i>/explore_traj.xyz`。
-3. **筛选**：计算轨迹上各帧的模型力偏差（集成预测的力与平均力的偏差），按 `level_f_lo` / `level_f_hi` 筛选出“不确定”的构型。
+3. **筛选（多层）**：
+   - **Layer 0**（失败帧恢复）：若 `--fail-strategy sample_topk`，取最不极端的 fail 帧加入候选。
+   - **Layer 1**（不确定性门控）：按 `level_f_lo` / `level_f_hi` 筛选出“不确定”的构型。
+   - **Layer 2**（多样性筛选）：用 SOAP / deviation 直方图等结构指纹 + FPS 选取最多 `--max-candidates-per-iter` 个多样化子集。
 4. **标注**：对筛选出的构型调用 DFT（或 identity/script），生成带能量、力的 extended XYZ，写入 `iterations/iter_<i>/labeled/`。
 5. **合并**：将新标注的数据合并回 `data_dir`（更新 processed_train.h5 / train.xyz 等），作为下一轮训练的输入。
 
@@ -1077,7 +1210,9 @@ al_work/
 ├── init.xyz              # 若未指定 --init-structure，从此处或 data_dir 提取
 └── iterations/
     ├── iter_0/
-    │   ├── explore_traj.xyz   # 本轮探索轨迹
+    │   ├── explore_traj_0.xyz # 多结构模式：第 0 个结构的子轨迹
+    │   ├── explore_traj_1.xyz # 多结构模式：第 1 个结构的子轨迹
+    │   ├── explore_traj.xyz   # 本轮合并后的探索轨迹
     │   └── labeled/           # 本轮 DFT 标注结果（extended XYZ）
     ├── iter_1/
     │   └── ...
@@ -1164,7 +1299,7 @@ ORCA 和 QE 可通过 `--orca-command`、`--qe-command` 指定，或确保可执
 
 ### 常见问题（FAQ）
 
-- **初始结构从哪里来？** 未指定 `--init-structure` 时，从 `--data-dir` 的 `train.xyz` 或 `processed_train.h5` 取第一个结构。
+- **初始结构从哪里来？** 未指定 `--init-structure` 时，从 `--data-dir` 的 `train.xyz` 或 `processed_train.h5` 取第一个结构。支持传入多个文件或一个目录实现**多结构并行探索**：`--init-structure A.xyz B.xyz` 或 `--init-structure structures/`。
 - **如何从上次中断处继续？** SLURM 模式下，若某结构的 `output.xyz` 已存在会自动跳过；本地模式可用 `--label-error-handling skip` 跳过失败结构继续。
 - **输出 XYZ 格式要求？** 标注器输出的 XYZ 需包含 `Properties=species:S:1:pos:R:3:energy:R:1:forces:R:3`，能量 eV，力 eV/Å。
 - **训练超参数？** `--epochs` 会传给内部 `mff-train`；当前 CLI 仅暴露 `--epochs`，其余见训练章节。
@@ -1579,12 +1714,20 @@ mff-export-core \
   --checkpoint model.pth \
   --elements H O \
   --device cuda \
-  --max-radius 5.0 \
   --dtype float32 \
-  --embed-e0 \
   --e0-csv fitted_E0.csv \
   --out core.pt
 ```
+
+**checkpoint 自动恢复说明**：
+
+- `mff-export-core` 会优先从 checkpoint 自动恢复模型结构超参数，例如 `tensor_product_mode`、`max_radius`、`num_interaction`
+- `mff-export-core` 现在**默认嵌入 E0**；只有显式传 `--no-embed-e0` 时才导出纯网络能量
+- 新 checkpoint 还会保存 `atomic_energy_keys/atomic_energy_values`，因此多数情况下可直接使用 checkpoint 中的 E0；若显式传 `--e0-csv`，则以 `--e0-csv` 为准
+- 如果你显式传了同名 CLI 参数，则**以 CLI 为准**
+- 因此日常推荐做法是：只在你明确想覆盖 checkpoint 配置时，才手动传这些结构参数
+- 老 checkpoint 若未保存 E0，仍会按旧逻辑回退到本地 `fitted_E0.csv`
+- 这不会改变 checkpoint 内容本身，只是改变“导出时如何解析参数”的优先级
 
 **步骤 2：编译 LAMMPS**：启用 `PKG_KOKKOS`、`PKG_USER-MFFTORCH`，详见 [lammps_user_mfftorch/docs/BUILD_AND_RUN.md](lammps_user_mfftorch/docs/BUILD_AND_RUN.md)。
 
@@ -1632,9 +1775,19 @@ python -m molecular_force_field.cli.export_mliap your_checkpoint.pth \
     --elements H O \
     --atomic-energy-keys 1 8 \
     --atomic-energy-values -13.6 -75.0 \
-    --max-radius 5.0 \
     --output model-mliap.pt
 ```
+
+**自动 TorchScript 行为（重要）**：
+
+- 对 `spherical-save-cue`，`python -m molecular_force_field.cli.export_mliap` 会**自动启用 TorchScript 导出**，即使用户没有显式传 `--torchscript`
+- 这样做是为了避免该模式在普通 Python pickle 路径下出现不稳定或无法序列化的问题
+- 因此你可以直接使用上面的命令；若 checkpoint 对应模式是 `spherical-save-cue`，CLI 会自动切换到安全导出路径
+- 对 `pure-cartesian-ictd`、`pure-cartesian-ictd-save`，你仍可按需显式传 `--torchscript`
+- `export_mliap` 也会优先从 checkpoint 自动恢复模型结构超参数；如果显式传了冲突的 CLI 参数，则**以 CLI 为准**
+- 对新 checkpoint，`export_mliap` 也会优先读取 checkpoint 中保存的 `atomic_energy_keys/atomic_energy_values`；如果显式传了 `--atomic-energy-keys/--atomic-energy-values`，则以 CLI 为准
+- 老 checkpoint 若没有保存 E0，则仍按旧逻辑回退到本地 `fitted_E0.csv`
+- 这不会影响已有导出功能，只是让“默认不手填结构参数”变成安全可用的路径
 
 **步骤 2：在 Python 中驱动 LAMMPS**
 
@@ -1733,6 +1886,138 @@ torchrun --nproc_per_node=2 -m molecular_force_field.cli.inference_ddp \
 - `--checkpoint`: 模型检查点路径
 - `--forces`: 同时计算并输出力
 - `--partition`: 图分区策略，`modulo`（默认）或 `spatial`
+
+### 示例 5d: 热导率工作流（MLFF -> IFC2/IFC3 -> intrinsic BTE -> Callaway）
+
+这一工作流用于**晶体体系**的热导率计算，不使用 Green-Kubo 积分。推荐路线是：
+
+1. 用 MLFF 计算位移超胞受力，生成 `IFC2/IFC3`
+2. 用 `phono3py` 求解本征晶格热导率（intrinsic BTE）
+3. 在 intrinsic BTE 结果上叠加 `Callaway` 风格的工程散射项，用于晶粒、缺陷、界面等工艺因素扫描
+
+这条路线与 `mff-evaluate --phonon` 的定位不同：
+
+- `mff-evaluate --phonon`：更适合做 Hessian、虚频、稳定性与频率分布检查
+- `thermal_transport bte`：更适合做真正的热输运求解
+
+#### 安装依赖
+
+```bash
+pip install -e ".[thermal]"
+```
+
+或手动安装：`pip install phonopy phono3py spglib scipy`
+
+#### 入口
+
+```bash
+python -m molecular_force_field.cli.thermal_transport --help
+```
+
+提供两个子命令：
+
+- `bte`：生成 `IFC2/IFC3` 并运行 intrinsic BTE
+- `callaway`：在 `phono3py` 的 intrinsic 结果上做工程散射后处理
+
+#### 步骤 1：运行 intrinsic BTE
+
+```bash
+python -m molecular_force_field.cli.thermal_transport bte \
+  --checkpoint best_model.pth \
+  --structure relaxed.cif \
+  --supercell 4 4 4 \
+  --phonon-supercell 4 4 4 \
+  --mesh 16 16 16 \
+  --temperatures 300 400 500 600 700 \
+  --output-dir thermal_bte \
+  --device cuda \
+  --atomic-energy-file fitted_E0.csv
+```
+
+**工作流程**：
+
+1. 从 checkpoint 自动恢复模型结构超参数与 `tensor_product_mode`
+2. 读取晶体结构，必要时可用 `--relax-fmax` 先用 MLFF 预优化
+3. 调用 `phono3py` 生成 FC2/FC3 位移超胞
+4. 通过现有 ASE calculator 批量计算每个位移超胞的受力
+5. 生成 `fc2.hdf5`、`fc3.hdf5`
+6. 运行 intrinsic BTE，默认是 `RTA`；使用 `--lbte` 可切换为迭代 `LBTE`
+
+**主要输出文件**：
+
+- `fc2.hdf5`
+- `fc3.hdf5`
+- `fc2_forces.hdf5`
+- `fc3_forces.hdf5`
+- `fc2_forces.txt`
+- `fc3_forces.txt`
+- `thermal_workflow_metadata.json`
+- `kappa-*.hdf5`
+
+**推荐实践**：
+
+- 输入结构最好已经接近平衡相
+- 先用 `mff-evaluate --phonon` 检查有没有明显虚频
+- 对 `--supercell`、`--phonon-supercell`、`--mesh` 做收敛测试
+- 初次试算先用 `RTA`，稳定后再切 `LBTE`
+
+#### 步骤 2：在 intrinsic BTE 上叠加 Callaway 工程散射
+
+```bash
+python -m molecular_force_field.cli.thermal_transport callaway \
+  --kappa-hdf5 thermal_bte/kappa-m161616.hdf5 \
+  --output-prefix thermal_bte/callaway \
+  --component xx \
+  --grain-size-nm 200 \
+  --point-defect-coeff 1.0e-4
+```
+
+当前后处理使用 `phono3py` 的模态热导率与线宽，在此基础上施加 Matthiessen 叠加：
+
+- 边界散射：由 `grain_size_nm` 和 `specularity` 控制
+- 点缺陷散射：`point_defect_coeff * omega^4`
+- 位错散射：`dislocation_coeff * omega^2`
+- 界面散射：`interface_coeff * omega`
+
+**输出文件**：
+
+- `<prefix>.csv`
+- `<prefix>.json`
+- `<prefix>_summary.json`
+
+#### 步骤 3：用实验热导率反推工程散射参数
+
+若已有实验热导率，可只拟合外禀散射项，而不必重复跑 BTE：
+
+```bash
+python -m molecular_force_field.cli.thermal_transport callaway \
+  --kappa-hdf5 thermal_bte/kappa-m161616.hdf5 \
+  --output-prefix thermal_bte/callaway_fit \
+  --fit-experiment-csv exp_kappa.csv \
+  --fit-component xx \
+  --fit-parameters grain_size_nm,point_defect_coeff
+```
+
+实验 CSV 至少需要：
+
+- `temperature`
+- 一个热导率列，如 `xx`、`yy`、`zz`，或通过 `--fit-column` 指定的列
+
+这一步的物理含义是：
+
+- intrinsic BTE 保持不变
+- 只拟合晶粒、缺陷、界面等外禀散射参数
+- 拟合好的参数可用于不同工艺窗口下的快速扫描
+
+#### 工程上推荐的使用顺序
+
+1. 先验证 MLFF 在平衡结构附近的声子稳定性
+2. 用 `bte` 得到本征 `kappa(T)`
+3. 用实验数据只拟合 Callaway 外禀散射参数
+4. 再用拟合好的参数扫描晶粒尺寸、缺陷浓度、界面质量
+5. 最后把得到的 `k(T)` 曲线导入 COMSOL、ANSYS 或器件级热仿真流程
+
+更完整的热导率文档见仓库根目录的 `THERMAL_TRANSPORT.md`。
 
 ### 示例 6: 声子谱计算（Hessian 和频率）
 
@@ -1871,7 +2156,7 @@ python -m molecular_force_field.cli.export_mliap --help  # LAMMPS ML-IAP 导出
 LAMMPS LibTorch 接口（USER-MFFTORCH）通过 `pair_style mff/torch` 在 C++ 侧用 LibTorch 加载 TorchScript 模型，**运行时无需 Python**，适合 HPC 与生产部署。
 
 **快速步骤**：
-1. 导出：`mff-export-core --checkpoint model.pth --elements H O --max-radius 5.0 --embed-e0 --e0-csv fitted_E0.csv --out core.pt`
+1. 导出：`mff-export-core --checkpoint model.pth --elements H O --e0-csv fitted_E0.csv --out core.pt`
 2. 编译 LAMMPS：启用 `PKG_KOKKOS`、`PKG_USER-MFFTORCH`，见 [lammps_user_mfftorch/docs/BUILD_AND_RUN.md](lammps_user_mfftorch/docs/BUILD_AND_RUN.md)
 3. 运行：`lmp -k on g 1 -sf kk -pk kokkos newton off neigh full -in in.mfftorch`
 
@@ -1889,6 +2174,51 @@ python -m molecular_force_field.cli.export_mliap checkpoint.pth \
 
 支持模型：`spherical`、`spherical-save`、`spherical-save-cue`、`pure-cartesian-ictd`、`pure-cartesian-ictd-save`。详见 [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md)。
 
+补充说明：
+
+- 对 `spherical-save-cue`，CLI 会自动启用 TorchScript 导出，无需手动添加 `--torchscript`
+- 不支持 `pure-cartesian`、`pure-cartesian-sparse`
+
+### Q: 如何计算热导率？
+
+推荐的晶体热导率路线是：
+
+1. `MLFF -> IFC2/IFC3`
+2. `IFC2/IFC3 -> intrinsic BTE`
+3. `intrinsic BTE -> Callaway 工程散射`
+
+入口：
+
+```bash
+python -m molecular_force_field.cli.thermal_transport --help
+```
+
+典型命令：
+
+```bash
+python -m molecular_force_field.cli.thermal_transport bte \
+  --checkpoint best_model.pth \
+  --structure relaxed.cif \
+  --supercell 4 4 4 \
+  --phonon-supercell 4 4 4 \
+  --mesh 16 16 16 \
+  --temperatures 300 400 500 600 700 \
+  --output-dir thermal_bte \
+  --device cuda \
+  --atomic-energy-file fitted_E0.csv
+```
+
+```bash
+python -m molecular_force_field.cli.thermal_transport callaway \
+  --kappa-hdf5 thermal_bte/kappa-m161616.hdf5 \
+  --output-prefix thermal_bte/callaway \
+  --component xx \
+  --grain-size-nm 200 \
+  --point-defect-coeff 1.0e-4
+```
+
+详细说明见 `THERMAL_TRANSPORT.md`。
+
 ### Q: 训练时如何恢复之前的检查点？
 
 训练器会**自动检测并加载**检查点文件。如果 `--checkpoint` 指定的文件已存在，会自动恢复训练状态。
@@ -1900,6 +2230,14 @@ python -m molecular_force_field.cli.export_mliap checkpoint.pth \
 - ✅ 损失权重 `a` 和 `b`
 - ✅ 最佳验证损失（用于早停判断，基于 `a × 能量损失 + b × 受力损失 + c × 应力损失`）
 - ✅ 早停计数器（patience counter）
+- ✅ 模型结构超参数（优先级：`CLI 显式参数 > checkpoint.model_hyperparameters / checkpoint 顶层字段 > 默认值`）
+
+**推荐用法：**
+
+- 恢复训练时，通常只需要继续传 `--checkpoint` 和训练运行参数；大多数模型结构超参数可以省略
+- 只有在你**明确想覆盖 checkpoint 中的结构配置**时，才显式传 `--embedding-dim`、`--output-size`、`--lmax`、`--num-interaction`、`--max-radius`、`--tensor-product-mode` 等参数
+- 如果 CLI 和 checkpoint 冲突，当前行为是**CLI 覆盖 checkpoint**
+- 对非常老、未保存 `model_hyperparameters` 的 checkpoint，仍可能需要手动补部分参数
 
 **使用示例：**
 
@@ -1931,10 +2269,31 @@ mff-train \
 ```
 
 **注意事项：**
-1. 确保使用**相同的超参数**（`--max-atomvalue`, `--lmax`, `--function-type` 等）
+1. 若你没有显式覆盖，训练会优先从 checkpoint 自动恢复模型结构超参数
 2. 确保使用**相同的数据目录**和**相同的设备**
 3. 可以调整 `--epochs` 来延长训练（例如从 100 改为 200）
 4. **不能**在恢复时改变学习率调度器的初始设置（会重新初始化）
+
+### Q: 现在 `mff-evaluate` 应该怎么用？
+
+现在推荐优先使用“最小命令”：
+
+```bash
+mff-evaluate \
+    --checkpoint best_model.pth \
+    --test-prefix test \
+    --output-prefix test \
+    --use-h5
+```
+
+说明：
+
+- `mff-evaluate` 会优先从 checkpoint 自动恢复 `tensor_product_mode` 和模型结构超参数
+- 对新 checkpoint，`mff-evaluate` 也会优先读取 checkpoint 中保存的 `atomic_energy_keys/atomic_energy_values`
+- 如果你显式传了冲突参数，例如 `--tensor-product-mode`、`--embedding-dim`、`--output-size`，则**以 CLI 为准**
+- 如果你显式传了 `--atomic-energy-file` 或 `--atomic-energy-keys/--atomic-energy-values`，这些 E0 输入也会覆盖 checkpoint
+- 老 checkpoint 若没有保存 E0，则仍按旧逻辑读取本地 `fitted_E0.csv`
+- 因此，只有在你明确想做覆盖测试时，才建议手动传这些结构参数
 
 **如何从头重新训练（忽略已有检查点）：**
 ```bash
@@ -2244,24 +2603,34 @@ mff-train --dump-frequency 500
 
 ### Q: 如何使用多卡并行训练？
 
-多卡训练可以显著加速训练过程，特别是在大数据集上。使用步骤如下：
+多卡训练可以显著加速训练过程，特别是在大数据集上。
 
-**1. 使用 torchrun（推荐，PyTorch 1.9+）：**
+**方式 1：直接使用 `--n-gpu`（推荐，最简单）：**
+
 ```bash
-# 使用4张GPU
-torchrun --nproc_per_node=4 \
-    -m molecular_force_field.cli.train \
-    --distributed \
-    --data-dir data \
-    --epochs 1000 \
-    --batch-size 8
+# 4 卡训练，自动启动 torchrun DDP
+mff-train --n-gpu 4 --data-dir data --epochs 1000 --batch-size 8
+
+# 多节点：2 节点 × 4 卡（SLURM 环境下自动检测）
+mff-train --n-gpu 4 --nnodes 2 --data-dir data --epochs 1000
 ```
 
-**2. 使用 torch.distributed.launch（旧版本兼容）：**
+> `--n-gpu 1`（默认）时行为完全不变，与原始 `mff-train` 完全兼容。
+> `--n-gpu N` (N > 1) 或 `--nnodes > 1` 时，自动重启为 `torchrun --nproc_per_node=N --distributed ...`。
+> 原有的 `torchrun ... --distributed` 手动用法依然完全支持。
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--n-gpu` | 1 | GPU 数。>1 自动 torchrun DDP |
+| `--nnodes` | 1 | 节点数。>1 多节点 DDP |
+| `--master-addr` | auto | rendezvous 地址 |
+| `--master-port` | 29500 | rendezvous 端口 |
+| `--launcher` | auto | auto / local / slurm |
+
+**方式 2：手动 torchrun（完全向后兼容）：**
+
 ```bash
-python -m torch.distributed.launch \
-    --nproc_per_node=4 \
-    --master_port=29500 \
+torchrun --nproc_per_node=4 \
     -m molecular_force_field.cli.train \
     --distributed \
     --data-dir data \
@@ -2270,28 +2639,22 @@ python -m torch.distributed.launch \
 ```
 
 **注意事项：**
-- `--nproc_per_node` 指定使用的GPU数量
-- 必须添加 `--distributed` 参数
 - 每个GPU的有效batch size = `--batch-size`，总的有效batch size = `--batch-size × GPU数量`
 - 建议根据总的有效batch size调整学习率（通常线性缩放）
 - 所有日志、检查点和CSV文件只在主进程（rank 0）保存
 - 验证结果会自动聚合所有进程的结果
+- checkpoint 写入后所有 rank 通过 `dist.barrier()` 同步
 
 **示例：4卡训练，每卡batch size=8，总有效batch size=32**
 ```bash
-torchrun --nproc_per_node=4 \
-    -m molecular_force_field.cli.train \
-    --distributed \
-    --data-dir data \
-    --batch-size 8 \
-    --learning-rate 4e-3  # 可以适当增加学习率（4倍batch size）
+mff-train --n-gpu 4 --data-dir data --batch-size 8 --learning-rate 4e-3
 ```
 
-### Q: 如何使用多卡并行训练？
+### Q: 如何使用多卡并行训练？（旧版方式）
 
-多卡训练可以显著加速训练过程，特别是在大数据集上。使用步骤如下：
+如果你使用的是旧版 PyTorch 或需要更细粒度的控制：
 
-**1. 使用 torchrun（推荐，PyTorch 1.9+）：**
+**使用 torchrun（推荐，PyTorch 1.9+）：**
 ```bash
 # 使用4张GPU
 torchrun --nproc_per_node=4 \

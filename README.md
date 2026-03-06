@@ -31,7 +31,7 @@
   - Evaluation: static metrics, MD, NEB, phonon spectrum
   - LAMMPS integration: LibTorch (USER-MFFTORCH), ML-IAP, fix external
   
-- **🔄 Active Learning (DPGen2-style)** — *automatically grow your training set where the model is uncertain*:
+- **🔄 Active Learning** — *automatically grow your training set where the model is uncertain*:
   - **One command** runs the full loop: **Train (ensemble) → Explore (MD/NEB) → Select (force deviation) → Label (DFT) → Merge → repeat**.
   - **10+ label backends**: PySCF (no binary), VASP / CP2K / QE / Gaussian / ORCA via ASE; user script; **one script template for both local and SLURM**.
   - **Single-node**: `--label-n-workers 8` for parallel DFT; **HPC**: one sbatch job per structure, throttle & resume.
@@ -46,6 +46,7 @@
   - `mff-export-core` - Export LibTorch core.pt (USER-MFFTORCH)
   - `mff-lammps` - Generate LAMMPS fix external script
   - `python -m molecular_force_field.cli.export_mliap` - Export ML-IAP format
+- `python -m molecular_force_field.cli.thermal_transport` - IFC2/IFC3, intrinsic BTE, and Callaway thermal workflow
   - `torchrun -m molecular_force_field.cli.inference_ddp` - Large-scale multi-GPU inference (pure-cartesian-ictd only)
   
 - **Easy to Use**:
@@ -190,24 +191,13 @@ mff-train --data-dir data --atomic-energy-keys 1 6 7 8 --atomic-energy-values -4
 
 ### 3. Evaluation
 
-Evaluate a trained model (use the same tensor-product-mode as training):
+Evaluate a trained model. The recommended default is to let `mff-evaluate` restore model-structure hyperparameters and `tensor_product_mode` from the checkpoint automatically:
 
 ```bash
-# For spherical mode (default)
-mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode spherical --use-h5
-
-# For partial-cartesian mode
-mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode partial-cartesian --use-h5
-
-# For partial-cartesian-loose mode
-mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode partial-cartesian-loose --use-h5
-
-# For pure-cartesian-sparse mode
-mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode pure-cartesian-sparse --use-h5
-
-# For pure-cartesian-ictd mode
-mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode pure-cartesian-ictd --use-h5
+mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --use-h5
 ```
+
+If you explicitly pass conflicting structure arguments such as `--tensor-product-mode`, `--embedding-dim`, or `--output-size`, the CLI takes precedence over the checkpoint. For new checkpoints, `mff-evaluate` can also restore `atomic_energy_keys/atomic_energy_values` directly from the checkpoint; older checkpoints still fall back to local `fitted_E0.csv` behavior. Only pass those arguments when you intentionally want to override the checkpoint configuration.
 
 Outputs include:
 - `test_loss.csv`
@@ -275,8 +265,10 @@ FusedSCEquiTensorPot supports three LAMMPS integration methods:
 1. **Export core.pt** (one-time, requires Python):
    ```bash
    mff-export-core --checkpoint model.pth --elements H O --device cuda \
-     --max-radius 5.0 --embed-e0 --e0-csv fitted_E0.csv --out core.pt
+     --e0-csv fitted_E0.csv --out core.pt
    ```
+
+   `mff-export-core` restores structure hyperparameters such as `tensor_product_mode`, `max_radius`, and `num_interaction` from the checkpoint by default. It now embeds E0 by default as well. New checkpoints store `atomic_energy_keys/atomic_energy_values`, so checkpoint E0 is usually enough; if `--e0-csv` is passed explicitly, the CLI wins. Older checkpoints still fall back to local `fitted_E0.csv`. Use `--no-embed-e0` only if you explicitly want to export network energy without E0.
 
 2. **Build LAMMPS**: Enable `PKG_KOKKOS` and `PKG_USER-MFFTORCH`. See [lammps_user_mfftorch/docs/BUILD_AND_RUN.md](lammps_user_mfftorch/docs/BUILD_AND_RUN.md).
 
@@ -299,10 +291,59 @@ Export ML-IAP format (requires LAMMPS built with ML-IAP):
 
 ```bash
 python -m molecular_force_field.cli.export_mliap checkpoint.pth --elements H O \
-  --atomic-energy-keys 1 8 --atomic-energy-values -13.6 -75.0 --max-radius 5.0 --output model-mliap.pt
+  --atomic-energy-keys 1 8 --atomic-energy-values -13.6 -75.0 --output model-mliap.pt
 ```
 
 Supported models: `spherical`, `spherical-save`, `spherical-save-cue`, `pure-cartesian-ictd`, `pure-cartesian-ictd-save`.
+
+Notes:
+
+- `spherical-save-cue` is automatically exported through the TorchScript path in `export_mliap`, even if `--torchscript` is not specified explicitly. This is now the default safe behavior because the plain Python pickle path is not stable for this mode.
+- `pure-cartesian` and `pure-cartesian-sparse` are still not supported by `export_mliap`.
+- `export_mliap` also restores structure hyperparameters from the checkpoint by default. If conflicting CLI values are passed explicitly, the CLI wins.
+- For new checkpoints, `export_mliap` can also restore `atomic_energy_keys/atomic_energy_values` directly from the checkpoint. Older checkpoints still fall back to local `fitted_E0.csv`.
+
+### Thermal Transport Workflow
+
+For crystalline systems, the recommended thermal-conductivity route is:
+
+1. `MLFF -> IFC2/IFC3`
+2. `IFC2/IFC3 -> intrinsic lattice thermal conductivity` via `phono3py`
+3. `intrinsic BTE -> engineering scattering / fast generalization` via a Callaway-style post-process
+
+This workflow is intentionally separate from `mff-evaluate --phonon`. The phonon mode is useful for Hessian and stability checks, while the thermal workflow is meant for actual transport calculations.
+
+Install thermal deps: `pip install -e ".[thermal]"`
+
+Minimal intrinsic BTE example:
+
+```bash
+python -m molecular_force_field.cli.thermal_transport bte \
+  --checkpoint best_model.pth \
+  --structure relaxed.cif \
+  --supercell 4 4 4 \
+  --phonon-supercell 4 4 4 \
+  --mesh 16 16 16 \
+  --temperatures 300 400 500 600 700 \
+  --output-dir thermal_bte \
+  --device cuda \
+  --atomic-energy-file fitted_E0.csv
+```
+
+Minimal Callaway post-process example:
+
+```bash
+python -m molecular_force_field.cli.thermal_transport callaway \
+  --kappa-hdf5 thermal_bte/kappa-m161616.hdf5 \
+  --output-prefix thermal_bte/callaway \
+  --component xx \
+  --grain-size-nm 200 \
+  --point-defect-coeff 1.0e-4
+```
+
+Outputs include `fc2.hdf5`, `fc3.hdf5`, `kappa-*.hdf5`, and Callaway CSV/JSON summaries.
+
+For the detailed workflow, fitting strategy, and engineering notes, see [`THERMAL_TRANSPORT.md`](THERMAL_TRANSPORT.md).
 
 See [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md) for full documentation.
 
@@ -691,6 +732,7 @@ For detailed performance comparison and recommendations, see [USAGE.md](USAGE.md
 - [USAGE.md](USAGE.md) - Full CLI and hyperparameter reference (Chinese)
 - [USAGE_EN.md](USAGE_EN.md) - Full CLI and hyperparameter reference (English)
 - [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md) - LAMMPS integration guide (LibTorch, ML-IAP, fix external)
+- [THERMAL_TRANSPORT.md](THERMAL_TRANSPORT.md) - MLFF thermal conductivity workflow (`IFC2/IFC3 -> BTE -> Callaway`)
 - [lammps_user_mfftorch/docs/BUILD_AND_RUN.md](lammps_user_mfftorch/docs/BUILD_AND_RUN.md) - LibTorch interface build and run
 
 

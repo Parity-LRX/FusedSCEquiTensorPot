@@ -100,6 +100,7 @@ class ModelDeviCalculator:
                 "min_devi_f": 0.0,
                 "avg_devi_f": 0.0,
                 "devi_e": 0.0,
+                "per_atom_f_std": np.array([], dtype=np.float64),
             }
         f_std_per_atom = np.std(forces, axis=0)  # [n_atoms, 3]
         f_std_mag = np.linalg.norm(f_std_per_atom, axis=1)  # [n_atoms]
@@ -109,6 +110,7 @@ class ModelDeviCalculator:
             "min_devi_f": float(np.min(f_std_mag)),
             "avg_devi_f": float(np.mean(f_std_mag)),
             "devi_e": float(devi_e),
+            "per_atom_f_std": f_std_mag,
         }
 
     def compute_from_trajectory(
@@ -118,10 +120,19 @@ class ModelDeviCalculator:
     ) -> List[dict]:
         """
         Compute model deviation for all frames in trajectory.
-        Writes model_devi.out (DPGen2 format) and returns list of devi dicts.
+        Writes model_devi.out (DPGen2 format) and a companion
+        ``*_per_atom.txt`` file with per-atom force deviations (for
+        diversity-based sub-selection).
+
+        Returns list of devi dicts (without the per_atom_f_std arrays).
         """
+        from molecular_force_field.active_learning.diversity_selector import (
+            save_per_atom_devi,
+        )
+
         atoms_list = read(traj_path, index=":")
         results = []
+        per_atom_devis: List[np.ndarray] = []
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
         with open(output_path, "w") as f:
             f.write(
@@ -129,10 +140,15 @@ class ModelDeviCalculator:
             )
             for i, atoms in enumerate(atoms_list):
                 devi = self.compute_devi(atoms)
+                per_atom_devis.append(devi.pop("per_atom_f_std"))
                 results.append(devi)
                 f.write(
                     f"{i} {devi['max_devi_f']:.6e} {devi['min_devi_f']:.6e} "
                     f"{devi['avg_devi_f']:.6e} {devi['devi_e']:.6e}\n"
                 )
+
+        per_atom_path = output_path.replace(".out", "_per_atom.txt")
+        save_per_atom_devi(per_atom_devis, per_atom_path)
+
         logger.info(f"Wrote model_devi to {output_path} ({len(results)} frames)")
         return results

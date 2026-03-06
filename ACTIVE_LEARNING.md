@@ -1,8 +1,46 @@
 # 主动学习 (mff-active-learn)
 
-主动学习实现 DPGen2 风格的工作流：**训练集成 → 探索（MD/NEB）→ 按力偏差筛选 → DFT 标注 → 合并数据 → 重复**，用于在势能面尚未覆盖的区域自动采点并扩充训练集。
+主动学习实现的工作流：**训练集成 → 探索（MD/NEB）→ 按力偏差筛选 → DFT 标注 → 合并数据 → 重复**，用于在势能面尚未覆盖的区域自动采点并扩充训练集。
 
 支持 **单节点**（本机多进程并发标注）和 **超算**（SLURM 按结构提交作业）。同一套 DFT 脚本模板可同时用于本地测试（`local-script`）和集群（`slurm`）。
+
+---
+
+## 冷启动：从零生成初始数据集 (mff-init-data)
+
+当只有一个或几个种子结构、没有已标注数据时，`mff-init-data` 可一键完成：**扰动 → DFT 标注 → 预处理**，输出可直接用于训练或 AL 的完整数据集。
+
+```bash
+# 分子体系（PySCF，无需外部二进制）
+mff-init-data --structures water.xyz ethanol.xyz \
+    --n-perturb 15 --rattle-std 0.05 \
+    --label-type pyscf --pyscf-method b3lyp --pyscf-basis 6-31g* \
+    --label-n-workers 4 --output-dir data
+
+# 周期性体系（VASP，含晶胞缩放）
+mff-init-data --structures POSCAR.vasp \
+    --n-perturb 20 --rattle-std 0.02 --cell-scale-range 0.03 \
+    --label-type vasp --vasp-xc PBE --vasp-encut 500 --vasp-kpts 4 4 4 \
+    --label-n-workers 8 --output-dir data
+
+# 从目录自动收集所有种子结构
+mff-init-data --structures structures/ \
+    --n-perturb 10 --label-type pyscf --output-dir data
+```
+
+### 扰动参数
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--structures` | 必选 | 一个或多个种子结构文件，或包含 .xyz/.cif 文件的目录 |
+| `--n-perturb` | 10 | 每个种子结构生成的扰动数量（不含原始结构本身） |
+| `--rattle-std` | 0.05 | 原子位移高斯分布 σ (Å)。分子用 0.03–0.1，晶体用 0.01–0.03 |
+| `--cell-scale-range` | 0 | 晶胞随机缩放 ±范围（仅周期性体系）。如 0.03 表示 ±3% |
+| `--min-dist` | 0.5 | 最小原子间距过滤 (Å)，丢弃非物理构型 |
+| `--train-ratio` | 0.9 | 训练/验证集比例 |
+| `--skip-preprocess` | False | 仅输出标注后的 XYZ，跳过 H5 预处理 |
+
+> **典型流程**：`mff-init-data` 生成初始数据集 → `mff-active-learn` 迭代扩充。
 
 ---
 
@@ -53,7 +91,7 @@ mff-active-learn --explore-type ase --label-type local-script \
 |------|------|------|
 | `--work-dir` | `al_work` | 主动学习工作目录 |
 | `--data-dir` | `data` | 训练数据目录（含 processed_train.h5 或 train.xyz） |
-| `--init-structure` | 自动从 data-dir 提取 | 初始结构 XYZ 路径 |
+| `--init-structure` | 自动从 data-dir 提取 | 一个或多个初始结构路径，或包含 .xyz 文件的目录（多结构并行探索） |
 | `--n-models` | 4 | 集成模型数量 |
 | `--n-iterations` | 20 | 单阶段最大迭代次数（不用 stages 时） |
 | `--explore-type` | 必选 | 探索后端：`ase` 或 `lammps` |
@@ -68,11 +106,81 @@ mff-active-learn --explore-type ase --label-type local-script \
 | `--level-f-lo` / `--level-f-hi` | 0.05 / 0.5 | 力偏差筛选阈值 (eV/Å) |
 | `--conv-accuracy` | 0.9 | 收敛判定比例 |
 | `--epochs` | 由 mff-train 默认 | 每轮每个模型的训练 epoch 数 |
+| `--train-n-gpu` | 1 | 每个集成模型训练使用的 GPU 数（每节点）。1=单卡/CPU，>1 自动用 torchrun DDP |
+| `--train-max-parallel` | 0 (auto) | 同时训练的最大模型数。0=自动（可用GPU÷n_gpu），1=串行。多节点时强制为1 |
+| `--train-nnodes` | 1 | 每个模型使用的节点数。1=单节点，>1=多节点 DDP |
+| `--train-master-addr` | auto | rendezvous 地址（auto=从 SLURM 或本机 hostname 解析） |
+| `--train-master-port` | 29500 | 基础端口（并行模型自动偏移避免冲突） |
+| `--train-launcher` | auto | 启动器：auto / local / slurm（SLURM 下自动分配节点子集并行训练） |
 | `--stages` | 无 | 多阶段 JSON 文件路径 |
 | `--device` | `cuda` | 推理设备 |
 | `--max-radius` | 5.0 | 邻居搜索最大半径 (Å) |
 | `--atomic-energy-file` | `data/fitted_E0.csv` | 原子参考能量 CSV |
 | `--neb-initial` / `--neb-final` | 无 | NEB 模式下的初/末结构 |
+
+---
+
+## 多层筛选
+
+候选构型经过三层筛选后再送标注，显著降低 DFT 成本并提升训练集多样性。
+
+| 层 | 名称 | 说明 |
+|----|------|------|
+| **Layer 0** | 失败帧恢复 | 可选地将部分 `fail` 帧（`max_devi_f ≥ level_f_hi`）中最不极端的构型纳入候选 |
+| **Layer 1** | 不确定性门控 | 保留 `level_f_lo ≤ max_devi_f < level_f_hi` 的帧（DPGen2 信任窗口） |
+| **Layer 2** | 多样性筛选 | 用结构指纹（SOAP / deviation 直方图）+ FPS 选取最大化多样性的子集 |
+
+### 多样性筛选参数
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--diversity-metric` | `soap` | 指纹类型：`soap`（需 dscribe）、`devi_hist`（零额外推理）、`none`（不筛） |
+| `--max-candidates-per-iter` | 50 | 每轮多样性筛选后最多保留的候选数 |
+| `--soap-rcut` | 5.0 | SOAP 截断半径 (Å) |
+| `--soap-nmax` | 8 | SOAP 径向基展开阶数 |
+| `--soap-lmax` | 6 | SOAP 角向展开阶数 |
+| `--soap-sigma` | 0.5 | SOAP 高斯展宽 |
+| `--devi-hist-bins` | 32 | `devi_hist` 直方图桶数 |
+
+### 失败帧处理参数
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--fail-strategy` | `discard` | `discard`（丢弃所有 fail 帧）或 `sample_topk`（取最温和的 fail 帧加入候选） |
+| `--fail-max-select` | 10 | `sample_topk` 时最多纳入的 fail 帧数 |
+
+> **依赖**：SOAP 指纹需要 `dscribe`。安装：`pip install dscribe` 或 `pip install molecular_force_field[al]`。
+> 若未安装 dscribe，`--diversity-metric soap` 会自动回退为 `devi_hist`。
+
+---
+
+## 多结构并行探索
+
+当训练集包含多种不同结构（如不同分子、不同晶体构型、不同组分）时，可传入多个初始结构，
+每次迭代会分别从每个结构出发做 MD 探索，然后将所有轨迹合并后统一进行偏差计算和多层筛选。
+
+### 用法
+
+```bash
+# 直接传入多个文件
+mff-active-learn --init-structure struct_A.xyz struct_B.xyz struct_C.xyz \
+    --explore-type ase --label-type pyscf ...
+
+# 传入一个目录（自动收集所有 .xyz / .cif 文件）
+mff-active-learn --init-structure structures/ \
+    --explore-type ase --label-type pyscf ...
+```
+
+### 工作流程
+
+每次迭代中：
+
+1. **并行探索**：对每个初始结构分别运行 MD，生成独立子轨迹（`explore_traj_0.xyz`, `explore_traj_1.xyz`, ...）
+2. **轨迹合并**：合并所有子轨迹为 `explore_traj.xyz`
+3. **统一筛选**：对合并轨迹做模型偏差计算 → Layer 0/1 不确定性门控 → Layer 2 多样性筛选
+4. **标注与合并**：筛选后的候选帧统一标注并合入训练集
+
+多样性筛选（SOAP / devi_hist）会自动平衡来自不同结构的构型，确保训练集覆盖所有系统类型。
 
 ---
 
@@ -302,6 +410,16 @@ mff-active-learn --explore-type ase --label-type slurm \
     --stages stages.json --label-error-handling skip
 ```
 
+**多结构并行探索（不同构型/分子共同学习）：**
+
+```bash
+mff-active-learn --explore-type ase --label-type pyscf \
+    --init-structure mol_A.xyz mol_B.xyz mol_C.xyz \
+    --pyscf-method b3lyp --pyscf-basis 6-31g* \
+    --diversity-metric soap --max-candidates-per-iter 50 \
+    --md-steps 1000 --n-iterations 10
+```
+
 **NEB 探索：**
 
 ```bash
@@ -317,6 +435,7 @@ mff-active-learn --explore-type ase --explore-mode neb \
 ### Q: 初始结构从哪里来？
 
 若未指定 `--init-structure`，会从 `--data-dir` 的 `train.xyz` 或 `processed_train.h5` 取第一个结构。
+支持传入多个文件或一个目录实现**多结构并行探索**——详见上方「多结构并行探索」一节。
 
 ### Q: 如何从上次中断处继续？
 

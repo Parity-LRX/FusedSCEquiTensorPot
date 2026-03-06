@@ -61,11 +61,23 @@ setup(
             "torch-cluster>=1.6.0",
             "cuequivariance-torch>=0.8.1",
             "cuequivariance-ops-torch-cu12>=0.8.1; platform_system=='Linux'",
+            # Active learning diversity (SOAP, FPS helpers)
+            "dscribe>=2.0.0",
+            "scikit-learn>=1.0.0",
         ],
         # Active learning (PES coverage, etc.)
         "al": [
             "dscribe>=2.0.0",
             "scikit-learn>=1.0.0",
+        ],
+        # Alias for users who only want SOAP deps
+        "soap": [
+            "dscribe>=2.0.0",
+        ],
+        # Thermal transport (IFC2/IFC3 -> phono3py BTE -> Callaway engineering scattering)
+        "thermal": [
+            "phono3py>=2.0.0",
+            "scipy>=1.0.0",
         ],
     },
     entry_points={
@@ -77,6 +89,7 @@ setup(
             "mff-export-core=molecular_force_field.cli.export_libtorch_core:main",
             "mff-evaluate-pes-coverage=molecular_force_field.cli.evaluate_pes_coverage:main",
             "mff-active-learn=molecular_force_field.cli.active_learning:main",
+            "mff-init-data=molecular_force_field.cli.init_data:main",
         ],
     },
 )

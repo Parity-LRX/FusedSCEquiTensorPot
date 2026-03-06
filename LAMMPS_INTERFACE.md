@@ -29,7 +29,7 @@ FusedEquiTensorPot 提供三种 LAMMPS 集成方式：
    ```bash
    python -m molecular_force_field.cli.export_libtorch_core \
      --checkpoint model.pth --elements H O --device cuda \
-     --max-radius 5.0 --embed-e0 --e0-csv fitted_E0.csv --out core.pt
+     --e0-csv fitted_E0.csv --out core.pt
    ```
 
 2. **编译 LAMMPS**：启用 `PKG_KOKKOS`、`PKG_USER-MFFTORCH`，详见 BUILD_AND_RUN.md。
@@ -52,8 +52,8 @@ pair_coeff * * /path/to/core.pt H O
 - 导出命令示例：
   ```bash
   python -m molecular_force_field.cli.export_libtorch_core \
-    --checkpoint model.pth --elements H O --max-radius 5.0 \
-    --embed-e0 --e0-csv fitted_E0.csv --out core.pt
+    --checkpoint model.pth --elements H O \
+    --e0-csv fitted_E0.csv --out core.pt
   ```
 - 一键测试（dummy 模型）：
   ```bash

@@ -23,6 +23,8 @@ cuequivariance-ops-torch-cu12>=0.8.1
 torch-scatter>=2.0.9
 torch-cluster>=1.6.0
 cuequivariance-torch>=0.8.1
+dscribe>=2.0.0
+scikit-learn>=1.0.0
 
 [full:platform_system == "Linux"]
 cuequivariance-ops-torch-cu12>=0.8.1
@@ -30,3 +32,10 @@ cuequivariance-ops-torch-cu12>=0.8.1
 [pyg]
 torch-scatter>=2.0.9
 torch-cluster>=1.6.0
+
+[soap]
+dscribe>=2.0.0
+
+[thermal]
+phono3py>=2.0.0
+scipy>=1.0.0

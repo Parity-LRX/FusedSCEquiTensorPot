@@ -232,9 +232,7 @@ mff-export-core \
   --checkpoint /path/to/model.pth \
   --elements H O \
   --device cuda \
-  --max-radius 5.0 \
   --dtype float32 \
-  --embed-e0 \
   --e0-csv /path/to/fitted_E0.csv \
   --out core.pt
 ```
@@ -248,6 +246,13 @@ mff-export-core \
 **max-radius 如何确定**：
 - **新训练的 checkpoint**（mff-train 会保存 max_radius）：脚本会自动从 checkpoint 读取，无需手动指定。
 - **旧 checkpoint 或未保存**：必须与训练时 `mff-train --max-radius` 一致（默认 5.0），且与 LAMMPS `pair_style mff/torch CUTOFF` 的 cutoff 一致。
+
+**E0 默认行为**：
+- `mff-export-core` 现在默认会把 E0 一起嵌入导出的 `core.pt`
+- 若显式传 `--e0-csv`，则优先使用该文件
+- 若不传 `--e0-csv`，新 checkpoint 会优先使用 checkpoint 中保存的 `atomic_energy_keys/atomic_energy_values`
+- 若是老 checkpoint 且未保存 E0，则回退到本地 `fitted_E0.csv`
+- 只有显式传 `--no-embed-e0` 时，才导出不带 E0 的纯网络能量
 
 ### 7.2 方式 B：生成 dummy 模型（用于测试）
 

@@ -34,6 +34,7 @@ mff-train --help
 mff-evaluate --help
 mff-export-core --help   # LAMMPS LibTorch export
 mff-lammps --help        # LAMMPS fix external interface
+mff-init-data --help     # Initial dataset generation (cold start)
 mff-active-learn --help  # Active learning workflow
 python -m molecular_force_field.cli.export_mliap --help  # LAMMPS ML-IAP export
 ```
@@ -883,6 +884,27 @@ pip install scipy  # Required for phonon spectrum calculation (for matrix diagon
 pip install ase    # Structure processing and neighbor lists (usually already installed)
 ```
 
+## Cold Start: Generate Initial Dataset (mff-init-data)
+
+When you only have seed structures and no labeled data, `mff-init-data` generates an initial dataset in one step: **perturb → DFT label → preprocess**:
+
+```bash
+mff-init-data --structures water.xyz ethanol.xyz \
+    --n-perturb 15 --rattle-std 0.05 \
+    --label-type pyscf --pyscf-method b3lyp --pyscf-basis 6-31g* \
+    --output-dir data
+
+# Periodic systems
+mff-init-data --structures POSCAR.vasp \
+    --n-perturb 20 --rattle-std 0.02 --cell-scale-range 0.03 \
+    --label-type vasp --vasp-xc PBE --vasp-encut 500 \
+    --output-dir data
+```
+
+Key parameters: `--n-perturb` (perturbation count), `--rattle-std` (displacement σ, Å), `--cell-scale-range` (cell scaling range for periodic systems), `--min-dist` (minimum interatomic distance filter). See [ACTIVE_LEARNING.md](ACTIVE_LEARNING.md) for full details.
+
+---
+
 ## Active Learning (mff-active-learn)
 
 The active learning module implements a DPGen2-style workflow: **Train ensemble → Explore (MD/NEB) → Select by force deviation → Label (DFT) → Merge data → Repeat**, to automatically sample under-sampled regions of the potential energy surface and expand the training set. It supports **single-node** (parallel labeling with multiple workers) and **HPC** (SLURM: one job per structure). The same DFT script template can be used for local runs (`local-script`) and cluster runs (`slurm`).
@@ -909,7 +931,7 @@ mff-active-learn --help
 |-----------|---------|-------------|
 | `--work-dir` | `al_work` | Active learning working directory |
 | `--data-dir` | `data` | Training data directory (must contain processed_train.h5 or train.xyz) |
-| `--init-structure` | Auto from data-dir | Path to initial structure XYZ |
+| `--init-structure` | Auto from data-dir | One or more initial structure paths (multi-structure parallel exploration), or a directory of .xyz files |
 | `--n-models` | 4 | Number of ensemble models |
 | `--n-iterations` | 20 | Max iterations per stage (when not using --stages) |
 | `--explore-type` | Required | Exploration backend: `ase` or `lammps` |
@@ -924,11 +946,41 @@ mff-active-learn --help
 | `--level-f-lo` / `--level-f-hi` | 0.05 / 0.5 | Force deviation selection thresholds (eV/Å) |
 | `--conv-accuracy` | 0.9 | Convergence criterion ratio |
 | `--epochs` | mff-train default | Training epochs per model per iteration |
+| `--train-n-gpu` | 1 | GPUs per ensemble model per node. 1=single process (CPU/single GPU compatible), >1=torchrun DDP |
+| `--train-max-parallel` | 0 (auto) | Max models trained simultaneously. 0=auto (available_gpus // train_n_gpu), 1=sequential. Forced to 1 for multi-node |
+| `--train-nnodes` | 1 | Nodes **per model**. SLURM auto-computes `total_nodes // nnodes` for parallel training |
+| `--train-master-addr` | auto | Rendezvous address. `auto`=resolve from SLURM or local hostname |
+| `--train-master-port` | 29500 | Base port. Parallel models auto-offset (`+slot`) to avoid collisions |
+| `--train-launcher` | auto | Launcher: `auto` / `local` / `slurm`. SLURM auto-assigns disjoint `--nodelist` per model |
 | `--stages` | None | Path to multi-stage JSON file |
 | `--device` | `cuda` | Inference device |
 | `--max-radius` | 5.0 | Neighbor search cutoff (Å) |
 | `--atomic-energy-file` | `data/fitted_E0.csv` | Atomic reference energy CSV |
 | `--neb-initial` / `--neb-final` | None | Initial/final structures for NEB mode |
+
+### Multi-layer candidate filtering
+
+Candidates pass through three filtering layers before labeling, significantly reducing DFT cost and improving training-set diversity:
+
+| Layer | Name | Description |
+|-------|------|-------------|
+| **Layer 0** | Fail recovery | Optionally promote the least extreme `fail` frames into the candidate pool |
+| **Layer 1** | Uncertainty gate | Keep frames with `level_f_lo ≤ max_devi_f < level_f_hi` (DPGen2 trust window) |
+| **Layer 2** | Diversity selection | Structural fingerprint (SOAP / deviation histogram) + FPS for maximum coverage |
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--diversity-metric` | `soap` | Fingerprint: `soap` (requires dscribe), `devi_hist` (zero extra inference), `none` (skip) |
+| `--max-candidates-per-iter` | 50 | Max candidates to keep after diversity selection |
+| `--soap-rcut` | 5.0 | SOAP cutoff radius (Å) |
+| `--soap-nmax` | 8 | SOAP radial expansion order |
+| `--soap-lmax` | 6 | SOAP angular expansion order |
+| `--soap-sigma` | 0.5 | SOAP Gaussian smearing width |
+| `--devi-hist-bins` | 32 | Number of bins for `devi_hist` fingerprint |
+| `--fail-strategy` | `discard` | `discard` (drop fail frames) or `sample_topk` (promote mildest fail frames) |
+| `--fail-max-select` | 10 | Number of fail frames to promote with `sample_topk` |
+
+> SOAP requires `dscribe`: `pip install dscribe` or `pip install molecular_force_field[al]`. Falls back to `devi_hist` if not installed.
 
 ### Label types (--label-type)
 
@@ -1043,6 +1095,59 @@ mff-active-learn --explore-type ase --explore-mode neb \
     --label-type pyscf --pyscf-method b3lyp --n-iterations 5
 ```
 
+**Parallel ensemble training (auto GPU assignment):**
+
+```bash
+# 8 GPUs, 4 models × 1 GPU each → 4 models in parallel (auto)
+mff-active-learn --explore-type ase --explore-mode md --label-type pyscf \
+    --n-models 4 --train-n-gpu 1 --md-steps 500 --n-iterations 5
+
+# 8 GPUs, 4 models × 2 GPUs DDP each → 4 models in parallel (auto 8÷2=4)
+mff-active-learn --explore-type ase --explore-mode md --label-type pyscf \
+    --n-models 4 --train-n-gpu 2 --md-steps 500 --n-iterations 5
+
+# Manually cap parallelism: 8 GPUs, 1 GPU/model, max 2 concurrent
+mff-active-learn --explore-type ase --explore-mode md --label-type pyscf \
+    --n-models 4 --train-n-gpu 1 --train-max-parallel 2
+```
+
+**Multi-node DDP training (HPC/SLURM):**
+
+```bash
+# Scenario 1: 2 SLURM nodes × 4 GPUs, 4 models × 2 nodes each → sequential (2÷2=1)
+#SBATCH --nodes=2 --gres=gpu:4
+mff-active-learn --explore-type ase --label-type vasp \
+    --train-n-gpu 4 --train-nnodes 2 --n-models 4
+
+# Scenario 2: 8 SLURM nodes × 4 GPUs, 4 models × 2 nodes each → 4 in parallel (8÷2=4)
+#SBATCH --nodes=8 --gres=gpu:4
+mff-active-learn --explore-type ase --label-type vasp \
+    --train-n-gpu 4 --train-nnodes 2 --n-models 4
+
+# Scenario 3: 2 nodes × 8 GPUs, 4 models × 4 GPUs each → 4 in parallel (cross-node)
+# 2 models per node (8÷4=2), 2 nodes × 2 = 4 parallel slots
+#SBATCH --nodes=2 --gres=gpu:8
+mff-active-learn --explore-type ase --label-type vasp \
+    --train-n-gpu 4 --train-nnodes 1 --n-models 4
+```
+
+> **Resource assignment (three auto-switching modes):**
+>
+> | Condition | Mode | Strategy |
+> |-----------|------|----------|
+> | `nnodes=1`, no SLURM or single-node | **Local** | Local GPU pool split by `n_gpu` |
+> | `nnodes=1`, SLURM multi-node | **Cross-node** | Each node's GPUs split by `n_gpu`, models dispatched via `srun --nodelist` |
+> | `nnodes>1` | **Multi-node DDP** | SLURM nodes grouped by `nnodes`, each group trains one model |
+>
+> - Each concurrent model gets unique port `master_port + slot`
+> - Cross-node mode uses `srun --nodes=1 --nodelist=<node>` with `CUDA_VISIBLE_DEVICES` per model
+> - Without SLURM (`launcher=local`), multi-node defaults to sequential
+>
+> **DDP safety guarantees:**
+> - Only rank 0 writes checkpoints (`is_main_process` guard)
+> - All ranks synchronize via `dist.barrier()` after checkpoint writes
+> - `dist.destroy_process_group()` is called on all ranks at exit
+
 ### Concurrency and error handling
 
 | Parameter | Default | Description |
@@ -1059,7 +1164,10 @@ Each iteration (until the stage’s `max_iters` or convergence) roughly does:
 
 1. **Train ensemble**: Train `n_models` models (different seeds) on current `data_dir`, save checkpoints to `work_dir/checkpoint/`.
 2. **Explore**: Run MD (or NEB) from the initial structure using one model; trajectory written to `work_dir/iterations/iter_<i>/explore_traj.xyz`.
-3. **Select**: Compute force deviation (ensemble vs mean) on trajectory frames; select “uncertain” configurations between `level_f_lo` and `level_f_hi`.
+3. **Select (multi-layer)**:
+   - **Layer 0** (fail recovery): if `--fail-strategy sample_topk`, promote the mildest fail frames.
+   - **Layer 1** (uncertainty gate): keep frames with `level_f_lo ≤ max_devi_f < level_f_hi`.
+   - **Layer 2** (diversity): SOAP / deviation-histogram fingerprint + FPS, capped at `--max-candidates-per-iter`.
 4. **Label**: Run DFT (or identity/script) on selected configs; write extended XYZ (energy, forces) to `iterations/iter_<i>/labeled/`.
 5. **Merge**: Merge new labeled data into `data_dir` (update processed_train.h5 / train.xyz) for the next round.
 
@@ -1075,7 +1183,9 @@ al_work/
 ├── init.xyz              # Initial structure (from --init-structure or data_dir)
 └── iterations/
     ├── iter_0/
-    │   ├── explore_traj.xyz   # This iteration’s trajectory
+    │   ├── explore_traj_0.xyz # Multi-structure: sub-trajectory for structure 0
+    │   ├── explore_traj_1.xyz # Multi-structure: sub-trajectory for structure 1
+    │   ├── explore_traj.xyz   # Combined trajectory (all structures)
     │   └── labeled/           # This iteration’s DFT-labeled extended XYZs
     ├── iter_1/
     │   └── ...
@@ -1162,7 +1272,7 @@ ORCA and QE can use `--orca-command` / `--qe-command` or have executables on PAT
 
 ### FAQ
 
-- **Where does the initial structure come from?** If `--init-structure` is not set, the first structure is taken from `train.xyz` or `processed_train.h5` in `--data-dir`.
+- **Where does the initial structure come from?** If `--init-structure` is not set, the first structure is taken from `train.xyz` or `processed_train.h5` in `--data-dir`. You can pass multiple files or a directory for **multi-structure parallel exploration**: `--init-structure A.xyz B.xyz` or `--init-structure structures/`.
 - **How to resume after interruption?** In SLURM mode, structures with existing `output.xyz` are skipped. Locally, use `--label-error-handling skip` to skip failed structures and continue.
 - **Output XYZ format?** Labeler output must be extended XYZ with `Properties=species:S:1:pos:R:3:energy:R:1:forces:R:3`, energy in eV, forces in eV/Å.
 - **Training hyperparameters?** `--epochs` is passed to the internal `mff-train`; the CLI currently only exposes `--epochs` (see training section for others).
@@ -1578,12 +1688,20 @@ mff-export-core \
   --checkpoint model.pth \
   --elements H O \
   --device cuda \
-  --max-radius 5.0 \
   --dtype float32 \
-  --embed-e0 \
   --e0-csv fitted_E0.csv \
   --out core.pt
 ```
+
+**Checkpoint auto-restore notes:**
+
+- `mff-export-core` now restores model-structure hyperparameters from the checkpoint by default, such as `tensor_product_mode`, `max_radius`, and `num_interaction`
+- `mff-export-core` now **embeds E0 by default**; only `--no-embed-e0` disables it and exports pure network energy
+- New checkpoints also store `atomic_energy_keys/atomic_energy_values`, so checkpoint E0 is usually enough; if `--e0-csv` is passed explicitly, `--e0-csv` wins
+- If you pass conflicting CLI values explicitly, the **CLI wins**
+- Recommended practice: only pass these structure arguments when you intentionally want to override the checkpoint configuration
+- Older checkpoints without saved E0 still fall back to the legacy local `fitted_E0.csv` path
+- This does not modify the checkpoint itself; it only changes parameter-resolution priority during export
 
 **Step 2: Build LAMMPS**: Enable `PKG_KOKKOS` and `PKG_USER-MFFTORCH`. See [lammps_user_mfftorch/docs/BUILD_AND_RUN.md](lammps_user_mfftorch/docs/BUILD_AND_RUN.md).
 
@@ -1630,9 +1748,19 @@ python -m molecular_force_field.cli.export_mliap your_checkpoint.pth \
     --elements H O \
     --atomic-energy-keys 1 8 \
     --atomic-energy-values -13.6 -75.0 \
-    --max-radius 5.0 \
     --output model-mliap.pt
 ```
+
+**Automatic TorchScript behavior (important)**:
+
+- For `spherical-save-cue`, `python -m molecular_force_field.cli.export_mliap` now **automatically enables TorchScript export**, even if `--torchscript` is not specified explicitly.
+- This is the default safe behavior because the plain Python pickle path is not stable for that mode.
+- You can therefore use the normal export command directly; if the checkpoint mode is `spherical-save-cue`, the CLI will switch to the safe TorchScript-backed export path automatically.
+- For `pure-cartesian-ictd` and `pure-cartesian-ictd-save`, you may still pass `--torchscript` explicitly when desired.
+- `export_mliap` also restores model-structure hyperparameters from the checkpoint by default; if conflicting CLI arguments are passed explicitly, the **CLI wins**
+- For new checkpoints, `export_mliap` also restores `atomic_energy_keys/atomic_energy_values` from the checkpoint by default; if `--atomic-energy-keys/--atomic-energy-values` are passed explicitly, the CLI wins
+- Older checkpoints without saved E0 still fall back to the legacy local `fitted_E0.csv` path
+- This does not change export capability itself; it simply makes the no-manual-architecture-arguments path safe by default
 
 **Step 2: Drive LAMMPS from Python**
 ```python
@@ -1718,6 +1846,138 @@ torchrun --nproc_per_node=2 -m molecular_force_field.cli.inference_ddp \
 - `--checkpoint`: Model checkpoint path
 - `--forces`: Also compute and output forces
 - `--partition`: Graph partition strategy, `modulo` (default) or `spatial`
+
+### Example 5d: Thermal Conductivity Workflow (MLFF -> IFC2/IFC3 -> intrinsic BTE -> Callaway)
+
+This workflow targets **crystalline systems** and does not use Green-Kubo integration. The recommended route is:
+
+1. Use the MLFF to compute displaced-supercell forces and build `IFC2/IFC3`
+2. Use `phono3py` to solve the intrinsic lattice thermal conductivity (`intrinsic BTE`)
+3. Add Callaway-style engineering scattering on top of the intrinsic result for grain-size, defect, and interface studies
+
+This has a different purpose from `mff-evaluate --phonon`:
+
+- `mff-evaluate --phonon`: Hessian, stability, imaginary modes, and frequency sanity checks
+- `thermal_transport bte`: actual thermal-transport workflow
+
+#### Install dependencies
+
+```bash
+pip install -e ".[thermal]"
+```
+
+Or manually: `pip install phonopy phono3py spglib scipy`
+
+#### Entry point
+
+```bash
+python -m molecular_force_field.cli.thermal_transport --help
+```
+
+Two subcommands are provided:
+
+- `bte`: generate `IFC2/IFC3` and run intrinsic BTE
+- `callaway`: add engineering scattering on top of the intrinsic `phono3py` result
+
+#### Step 1: Run intrinsic BTE
+
+```bash
+python -m molecular_force_field.cli.thermal_transport bte \
+  --checkpoint best_model.pth \
+  --structure relaxed.cif \
+  --supercell 4 4 4 \
+  --phonon-supercell 4 4 4 \
+  --mesh 16 16 16 \
+  --temperatures 300 400 500 600 700 \
+  --output-dir thermal_bte \
+  --device cuda \
+  --atomic-energy-file fitted_E0.csv
+```
+
+**What this does**:
+
+1. Restores model hyperparameters and `tensor_product_mode` from the checkpoint
+2. Reads the crystal structure and optionally relaxes it first with `--relax-fmax`
+3. Uses `phono3py` to generate FC2/FC3 displaced supercells
+4. Evaluates MLFF forces for all displaced supercells through the existing ASE calculator
+5. Produces `fc2.hdf5` and `fc3.hdf5`
+6. Runs intrinsic BTE in `RTA` by default, or iterative `LBTE` with `--lbte`
+
+**Main outputs**:
+
+- `fc2.hdf5`
+- `fc3.hdf5`
+- `fc2_forces.hdf5`
+- `fc3_forces.hdf5`
+- `fc2_forces.txt`
+- `fc3_forces.txt`
+- `thermal_workflow_metadata.json`
+- `kappa-*.hdf5`
+
+**Recommended practice**:
+
+- Start from a structure already close to the target equilibrium phase
+- Check phonon stability first with `mff-evaluate --phonon`
+- Converge `--supercell`, `--phonon-supercell`, and `--mesh`
+- Start with `RTA`, then move to `LBTE` once the workflow is stable
+
+#### Step 2: Add Callaway engineering scattering on top of intrinsic BTE
+
+```bash
+python -m molecular_force_field.cli.thermal_transport callaway \
+  --kappa-hdf5 thermal_bte/kappa-m161616.hdf5 \
+  --output-prefix thermal_bte/callaway \
+  --component xx \
+  --grain-size-nm 200 \
+  --point-defect-coeff 1.0e-4
+```
+
+The current post-process uses `phono3py` mode conductivity and linewidths, then applies Matthiessen-style engineering scattering:
+
+- boundary scattering from `grain_size_nm` and `specularity`
+- point-defect scattering via `point_defect_coeff * omega^4`
+- dislocation scattering via `dislocation_coeff * omega^2`
+- interface scattering via `interface_coeff * omega`
+
+**Outputs**:
+
+- `<prefix>.csv`
+- `<prefix>.json`
+- `<prefix>_summary.json`
+
+#### Step 3: Fit engineering scattering parameters to experiment
+
+If experimental thermal-conductivity data already exists, fit only the extrinsic scattering terms instead of rerunning BTE:
+
+```bash
+python -m molecular_force_field.cli.thermal_transport callaway \
+  --kappa-hdf5 thermal_bte/kappa-m161616.hdf5 \
+  --output-prefix thermal_bte/callaway_fit \
+  --fit-experiment-csv exp_kappa.csv \
+  --fit-component xx \
+  --fit-parameters grain_size_nm,point_defect_coeff
+```
+
+The experiment CSV should contain at least:
+
+- `temperature`
+- one conductivity column such as `xx`, `yy`, `zz`, or a custom column passed by `--fit-column`
+
+Physical interpretation:
+
+- intrinsic BTE remains fixed
+- only extrinsic scattering parameters are fitted
+- the fitted parameters can then be reused to scan grain size, defect level, and interface quality
+
+#### Recommended engineering workflow
+
+1. Validate MLFF phonon stability near equilibrium
+2. Run `bte` to obtain intrinsic `kappa(T)`
+3. Fit only the Callaway extrinsic parameters to experiment
+4. Reuse those parameters to scan process windows
+5. Export the resulting `k(T)` curves into COMSOL, ANSYS, or your own thermal design workflow
+
+For the standalone detailed document, see `THERMAL_TRANSPORT.md`.
 
 ### Example 6: Phonon Spectrum Calculation (Hessian and Frequencies)
 
@@ -1856,7 +2116,7 @@ python -m molecular_force_field.cli.export_mliap --help  # LAMMPS ML-IAP export
 LAMMPS LibTorch interface (USER-MFFTORCH) loads TorchScript models via `pair_style mff/torch` in C++ with LibTorch. **No Python at runtime**, suitable for HPC and production.
 
 **Quick steps**:
-1. Export: `mff-export-core --checkpoint model.pth --elements H O --max-radius 5.0 --embed-e0 --e0-csv fitted_E0.csv --out core.pt`
+1. Export: `mff-export-core --checkpoint model.pth --elements H O --e0-csv fitted_E0.csv --out core.pt`
 2. Build LAMMPS: Enable `PKG_KOKKOS`, `PKG_USER-MFFTORCH`. See [lammps_user_mfftorch/docs/BUILD_AND_RUN.md](lammps_user_mfftorch/docs/BUILD_AND_RUN.md)
 3. Run: `lmp -k on g 1 -sf kk -pk kokkos newton off neigh full -in in.mfftorch`
 
@@ -1869,10 +2129,56 @@ ML-IAP is used for LAMMPS `pair_style mliap unified`, faster than fix external a
 ```bash
 python -m molecular_force_field.cli.export_mliap checkpoint.pth \
   --elements H O --atomic-energy-keys 1 8 --atomic-energy-values -13.6 -75.0 \
-  --max-radius 5.0 --output model-mliap.pt
+  --output model-mliap.pt
 ```
 
 Supported models: `spherical`, `spherical-save`, `spherical-save-cue`, `pure-cartesian-ictd`, `pure-cartesian-ictd-save`. See [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md).
+
+Additional notes:
+
+- For `spherical-save-cue`, the CLI now auto-enables TorchScript export; you do not need to add `--torchscript` manually
+- `pure-cartesian` and `pure-cartesian-sparse` are still not supported by `export_mliap`
+- `export_mliap` restores model-structure hyperparameters from the checkpoint by default; if conflicting CLI arguments are passed explicitly, the **CLI wins**
+
+### Q: How do I compute thermal conductivity?
+
+The recommended crystalline workflow is:
+
+1. `MLFF -> IFC2/IFC3`
+2. `IFC2/IFC3 -> intrinsic BTE`
+3. `intrinsic BTE -> Callaway engineering scattering`
+
+Entry point:
+
+```bash
+python -m molecular_force_field.cli.thermal_transport --help
+```
+
+Typical commands:
+
+```bash
+python -m molecular_force_field.cli.thermal_transport bte \
+  --checkpoint best_model.pth \
+  --structure relaxed.cif \
+  --supercell 4 4 4 \
+  --phonon-supercell 4 4 4 \
+  --mesh 16 16 16 \
+  --temperatures 300 400 500 600 700 \
+  --output-dir thermal_bte \
+  --device cuda \
+  --atomic-energy-file fitted_E0.csv
+```
+
+```bash
+python -m molecular_force_field.cli.thermal_transport callaway \
+  --kappa-hdf5 thermal_bte/kappa-m161616.hdf5 \
+  --output-prefix thermal_bte/callaway \
+  --component xx \
+  --grain-size-nm 200 \
+  --point-defect-coeff 1.0e-4
+```
+
+See `THERMAL_TRANSPORT.md` for the detailed workflow.
 
 ### Q: How to resume training from a previous checkpoint?
 
@@ -1885,6 +2191,14 @@ The trainer will **automatically detect and load** checkpoint files. If the file
 - ✅ Loss weights `a` and `b`
 - ✅ Best validation loss (for early stopping, based on `a × energy loss + b × force loss`)
 - ✅ Early stopping counter (patience counter)
+- ✅ Model-structure hyperparameters (priority: `explicit CLI > checkpoint.model_hyperparameters / checkpoint top-level metadata > defaults`)
+
+**Recommended usage:**
+
+- When resuming training, you usually only need to keep passing `--checkpoint` plus runtime/training options; most model-structure arguments can be omitted
+- Only pass `--embedding-dim`, `--output-size`, `--lmax`, `--num-interaction`, `--max-radius`, `--tensor-product-mode`, etc. when you intentionally want to override the checkpoint config
+- If CLI and checkpoint conflict, the current behavior is: **CLI overrides checkpoint**
+- Very old checkpoints without `model_hyperparameters` may still require some manual arguments
 
 **Usage example:**
 
@@ -1916,10 +2230,31 @@ mff-train \
 ```
 
 **Notes:**
-1. Ensure using **the same hyperparameters** (`--max-atomvalue`, `--lmax`, `--function-type`, etc.)
+1. If you do not override them explicitly, training now restores model-structure hyperparameters from the checkpoint automatically
 2. Ensure using **the same data directory** and **the same device**
 3. You can adjust `--epochs` to extend training (e.g., from 100 to 200)
 4. **Cannot** change learning rate scheduler initial settings when resuming (will reinitialize)
+
+### Q: How should `mff-evaluate` be used now?
+
+The recommended default is the minimal command:
+
+```bash
+mff-evaluate \
+    --checkpoint best_model.pth \
+    --test-prefix test \
+    --output-prefix test \
+    --use-h5
+```
+
+Notes:
+
+- `mff-evaluate` now restores `tensor_product_mode` and model-structure hyperparameters from the checkpoint by default
+- For new checkpoints, `mff-evaluate` also restores `atomic_energy_keys/atomic_energy_values` from the checkpoint by default
+- If you explicitly pass conflicting options such as `--tensor-product-mode`, `--embedding-dim`, or `--output-size`, the **CLI wins**
+- If you explicitly pass `--atomic-energy-file` or `--atomic-energy-keys/--atomic-energy-values`, those E0 inputs also override the checkpoint
+- Older checkpoints without saved E0 still follow the legacy local `fitted_E0.csv` fallback path
+- Therefore, only pass those structure parameters when you intentionally want to override the checkpoint configuration
 
 **How to restart training from scratch (ignore existing checkpoint):**
 ```bash
@@ -2210,24 +2545,34 @@ Input XYZ files need to contain:
 
 ### Q: How to use multi-GPU parallel training?
 
-Multi-GPU training can significantly accelerate training, especially on large datasets. Steps:
+Multi-GPU training can significantly accelerate training, especially on large datasets.
 
-**1. Use torchrun (recommended, PyTorch 1.9+):**
+**Method 1: Use `--n-gpu` (recommended, simplest):**
+
 ```bash
-# Use 4 GPUs
-torchrun --nproc_per_node=4 \
-    -m molecular_force_field.cli.train \
-    --distributed \
-    --data-dir data \
-    --epochs 1000 \
-    --batch-size 8
+# 4-GPU training, auto-launches torchrun DDP
+mff-train --n-gpu 4 --data-dir data --epochs 1000 --batch-size 8
+
+# Multi-node: 2 nodes × 4 GPUs (auto-detects SLURM)
+mff-train --n-gpu 4 --nnodes 2 --data-dir data --epochs 1000
 ```
 
-**2. Use torch.distributed.launch (compatible with older versions):**
+> `--n-gpu 1` (default): behavior is identical to the original `mff-train`.
+> `--n-gpu N` (N > 1) or `--nnodes > 1`: auto-relaunches via `torchrun --nproc_per_node=N --distributed ...`.
+> Manual `torchrun ... --distributed` usage is still fully supported.
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `--n-gpu` | 1 | GPUs to use. >1 auto-launches torchrun DDP |
+| `--nnodes` | 1 | Number of nodes. >1 multi-node DDP |
+| `--master-addr` | auto | Rendezvous address |
+| `--master-port` | 29500 | Rendezvous port |
+| `--launcher` | auto | auto / local / slurm |
+
+**Method 2: Manual torchrun (fully backward-compatible):**
+
 ```bash
-python -m torch.distributed.launch \
-    --nproc_per_node=4 \
-    --master_port=29500 \
+torchrun --nproc_per_node=4 \
     -m molecular_force_field.cli.train \
     --distributed \
     --data-dir data \
@@ -2236,21 +2581,15 @@ python -m torch.distributed.launch \
 ```
 
 **Notes:**
-- `--nproc_per_node` specifies the number of GPUs to use
-- Must add `--distributed` parameter
-- Effective batch size per GPU = `--batch-size`, total effective batch size = `--batch-size × number of GPUs`
-- Recommend adjusting learning rate based on total effective batch size (usually linear scaling)
-- All logs, checkpoints, and CSV files are only saved on main process (rank 0)
-- Validation results are automatically aggregated from all processes
+- Effective batch size per GPU = `--batch-size`, total = `--batch-size × GPUs`
+- Recommend scaling learning rate with total batch size (linear scaling)
+- Logs, checkpoints, CSV files only saved on rank 0
+- Validation results auto-aggregated across all ranks
+- `dist.barrier()` ensures checkpoint write completion before proceeding
 
-**Example: 4-GPU training, batch size=8 per GPU, total effective batch size=32**
+**Example: 4-GPU training, batch size=8 per GPU, total=32**
 ```bash
-torchrun --nproc_per_node=4 \
-    -m molecular_force_field.cli.train \
-    --distributed \
-    --data-dir data \
-    --batch-size 8 \
-    --learning-rate 4e-3  # Can appropriately increase learning rate (4x batch size)
+mff-train --n-gpu 4 --data-dir data --batch-size 8 --learning-rate 4e-3
 ```
 
 ### Q: How to accelerate training?

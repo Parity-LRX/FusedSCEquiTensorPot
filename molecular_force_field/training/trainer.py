@@ -208,13 +208,13 @@ class Trainer:
         
         self.model = model
         self.e3trans = e3trans
-        self.e3_arch_metadata = self._collect_e3_arch_metadata()
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
         self.device = device
         self.config = config
+        self.e3_arch_metadata = self._collect_e3_arch_metadata()
         self.learning_rate = learning_rate
         self.min_learning_rate = min_learning_rate
         self.initial_learning_rate_for_weight = initial_learning_rate_for_weight
@@ -529,6 +529,40 @@ class Trainer:
         """
         base = self.e3trans.module if (self.distributed and hasattr(self.e3trans, "module")) else self.e3trans
         meta = {}
+
+        cfg = self.config
+        if cfg is not None:
+            model_hparams = {
+                "dtype": str(getattr(cfg, "dtype", torch.float64)).replace("torch.", ""),
+                "channel_in": int(getattr(cfg, "channel_in", 64)),
+                "channel_in2": int(getattr(cfg, "channel_in2", 32)),
+                "channel_in3": int(getattr(cfg, "channel_in3", 32)),
+                "channel_in4": int(getattr(cfg, "channel_in4", 32)),
+                "channel_in5": int(getattr(cfg, "channel_in5", 32)),
+                "max_atomvalue": int(getattr(cfg, "max_atomvalue", 10)),
+                "embedding_dim": int(getattr(cfg, "embedding_dim", 16)),
+                "embed_size": list(getattr(cfg, "embed_size", [128, 128, 128])),
+                "output_size": int(getattr(cfg, "output_size", 8)),
+                "lmax": int(getattr(cfg, "lmax", 2)),
+                "irreps_output_conv_channels": getattr(cfg, "irreps_output_conv_channels", None),
+                "function_type": str(getattr(cfg, "function_type", "gaussian")),
+                "max_radius": float(getattr(cfg, "max_radius", 5.0)),
+                "max_radius_main": float(getattr(cfg, "max_radius_main", getattr(cfg, "max_radius", 5.0))),
+                "number_of_basis": int(getattr(cfg, "number_of_basis", 8)),
+                "number_of_basis_main": int(getattr(cfg, "number_of_basis_main", 8)),
+                "num_layers": int(getattr(cfg, "num_layers", 1)),
+                "main_hidden_sizes3": list(getattr(cfg, "main_hidden_sizes3", [64, 32])),
+                "emb_number_main_2": list(getattr(cfg, "emb_number_main_2", [64, 64, 64])),
+            }
+            num_interaction = getattr(base, "num_interaction", None)
+            if num_interaction is not None:
+                model_hparams["num_interaction"] = int(num_interaction)
+            for attr_name in ("max_rank_other", "k_policy", "ictd_tp_path_policy", "ictd_tp_max_rank_other"):
+                if hasattr(base, attr_name):
+                    value = getattr(base, attr_name)
+                    if value is not None:
+                        model_hparams[attr_name] = value
+            meta["model_hyperparameters"] = model_hparams
 
         phys_specs = getattr(base, "_physical_tensor_specs", None)
         if phys_specs:
@@ -1539,6 +1573,8 @@ class Trainer:
                     'tensor_product_mode': self.tensor_product_mode,
                     'inference_output_physical_tensors': self.inference_output_physical_tensors,
                     'physical_tensor_weights': self.physical_tensor_weights,
+                    'atomic_energy_keys': self.keys.detach().cpu(),
+                    'atomic_energy_values': self.values.detach().cpu(),
                 }
                 best_checkpoint_dict.update(self.e3_arch_metadata)
                 if self.config is not None:
@@ -1551,6 +1587,10 @@ class Trainer:
                 self.best_checkpoint_path = os.path.join(self.checkpoint_dir, 'best_model_temp.pth')
                 torch.save(best_checkpoint_dict, self.best_checkpoint_path)
                 logging.info(f"New best validation metric: {self.best_val_loss:.6f} - Best checkpoint saved")
+
+            # Barrier: ensure rank 0 finishes writing before others proceed
+            if self.distributed:
+                dist.barrier()
         else:
             self.patience_counter += 1
         
@@ -1645,6 +1685,8 @@ class Trainer:
                 'tensor_product_mode': self.tensor_product_mode,
                 'inference_output_physical_tensors': self.inference_output_physical_tensors,
                 'physical_tensor_weights': self.physical_tensor_weights,
+                'atomic_energy_keys': self.keys.detach().cpu(),
+                'atomic_energy_values': self.values.detach().cpu(),
             }
             checkpoint_dict.update(self.e3_arch_metadata)
             if self.config is not None:
@@ -1658,7 +1700,10 @@ class Trainer:
             checkpoint_filename = f'{base_filename}{self.tensor_product_suffix}.pth'
             checkpoint_filepath = os.path.join(self.checkpoint_dir, checkpoint_filename)
             torch.save(checkpoint_dict, checkpoint_filepath)
-        
+
+        if self.distributed:
+            dist.barrier()
+
         self.model.train()
         self.e3trans.train()
 
@@ -2016,6 +2061,8 @@ class Trainer:
                     'tensor_product_mode': self.tensor_product_mode,
                     'inference_output_physical_tensors': self.inference_output_physical_tensors,
                     'physical_tensor_weights': self.physical_tensor_weights,
+                    'atomic_energy_keys': self.keys.detach().cpu(),
+                    'atomic_energy_values': self.values.detach().cpu(),
                 }
                 checkpoint_dict.update(self.e3_arch_metadata)
                 if self.config is not None:
@@ -2025,3 +2072,7 @@ class Trainer:
 
                 torch.save(checkpoint_dict, self.checkpoint_save_path)
                 logging.info(f"Training completed! Final model saved to {self.checkpoint_save_path}")
+
+        # Barrier: all ranks wait for rank 0 to finish writing final checkpoint
+        if self.distributed:
+            dist.barrier()

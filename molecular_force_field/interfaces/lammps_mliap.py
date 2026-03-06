@@ -415,14 +415,14 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         cls,
         checkpoint_path: str,
         element_types: List[str],
-        max_radius: float = 5.0,
+        max_radius: Optional[float] = None,
         atomic_energy_keys: Optional[List[int]] = None,
         atomic_energy_values: Optional[List[float]] = None,
         device: str = "cpu",
         embed_size: Optional[List[int]] = None,
-        output_size: int = 8,
+        output_size: Optional[int] = None,
         tensor_product_mode: Optional[str] = None,
-        num_interaction: int = 2,
+        num_interaction: Optional[int] = None,
         ictd_tp_path_policy: Optional[str] = None,
         ictd_tp_max_rank_other: Optional[int] = None,
         torchscript: bool = False,
@@ -439,22 +439,53 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         """
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-        dtype_raw = ckpt.get("dtype", torch.float64)
+        arch_meta = ckpt.get("model_hyperparameters", {})
+
+        dtype_raw = ckpt.get("dtype", arch_meta.get("dtype", torch.float64))
         if isinstance(dtype_raw, str):
             dtype = torch.float64 if dtype_raw in ("float64", "double") else torch.float32
         else:
             dtype = dtype_raw
 
         mode = tensor_product_mode or ckpt.get("tensor_product_mode", "spherical")
-        # Use max_radius from checkpoint if saved (mff-train saves it), else from argument.
-        radius = float(ckpt.get("max_radius", max_radius))
+        # Use max_radius from checkpoint if saved; otherwise use CLI override; finally fall back to 5.0.
+        radius = float(ckpt.get("max_radius", max_radius if max_radius is not None else 5.0))
         if "max_radius" in ckpt:
             print(f"[LAMMPS_MLIAP_MFF] 使用 checkpoint 中的 max_radius: {radius:.2f} Å")
-        config = ModelConfig(dtype=dtype, embed_size=embed_size, output_size=output_size, max_radius=radius, max_radius_main=radius)
+        config = ModelConfig(
+            dtype=dtype,
+            channel_in=int(arch_meta.get("channel_in", 64)),
+            channel_in2=int(arch_meta.get("channel_in2", 32)),
+            channel_in3=int(arch_meta.get("channel_in3", 32)),
+            channel_in4=int(arch_meta.get("channel_in4", 32)),
+            channel_in5=int(arch_meta.get("channel_in5", 32)),
+            max_atomvalue=int(arch_meta.get("max_atomvalue", 10)),
+            embedding_dim=int(arch_meta.get("embedding_dim", 16)),
+            main_hidden_sizes3=list(arch_meta.get("main_hidden_sizes3", [64, 32])),
+            embed_size=embed_size if embed_size is not None else list(arch_meta.get("embed_size", [128, 128, 128])),
+            output_size=int(output_size if output_size is not None else arch_meta.get("output_size", 8)),
+            irreps_output_conv_channels=arch_meta.get("irreps_output_conv_channels"),
+            lmax=int(arch_meta.get("lmax", 2)),
+            function_type=str(arch_meta.get("function_type", "gaussian")),
+            num_layers=int(arch_meta.get("num_layers", 1)),
+            number_of_basis=int(arch_meta.get("number_of_basis", 8)),
+            number_of_basis_main=int(arch_meta.get("number_of_basis_main", 8)),
+            emb_number_main_2=list(arch_meta.get("emb_number_main_2", [64, 64, 64])),
+            max_radius=radius,
+            max_radius_main=float(arch_meta.get("max_radius_main", radius)),
+        )
+        if num_interaction is None:
+            num_interaction = int(arch_meta.get("num_interaction", 2))
 
         if atomic_energy_keys is not None and atomic_energy_values is not None:
             aek = torch.tensor(atomic_energy_keys, dtype=torch.long)
             aev = torch.tensor(atomic_energy_values, dtype=dtype)
+        elif ckpt.get("atomic_energy_keys") is not None and ckpt.get("atomic_energy_values") is not None:
+            aek_raw = ckpt.get("atomic_energy_keys")
+            aev_raw = ckpt.get("atomic_energy_values")
+            aek = aek_raw.detach().cpu().to(dtype=torch.long) if isinstance(aek_raw, torch.Tensor) else torch.tensor(aek_raw, dtype=torch.long)
+            aev = aev_raw.detach().cpu().to(dtype=dtype) if isinstance(aev_raw, torch.Tensor) else torch.tensor(aev_raw, dtype=dtype)
+            print("[LAMMPS_MLIAP_MFF] 使用 checkpoint 中的 atomic_energy_keys/atomic_energy_values")
         else:
             config.load_atomic_energies_from_file("fitted_E0.csv")
             aek = config.atomic_energy_keys
@@ -482,8 +513,12 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 device=torch.device(device),
             ).to(device)
         elif mode == "pure-cartesian-ictd-save":
-            ictd_tp_path_policy = ictd_tp_path_policy or ckpt.get("ictd_tp_path_policy", "full")
-            ictd_tp_max_rank_other = ictd_tp_max_rank_other if ictd_tp_max_rank_other is not None else ckpt.get("ictd_tp_max_rank_other")
+            ictd_tp_path_policy = ictd_tp_path_policy or ckpt.get("ictd_tp_path_policy") or arch_meta.get("ictd_tp_path_policy", "full")
+            ictd_tp_max_rank_other = (
+                ictd_tp_max_rank_other
+                if ictd_tp_max_rank_other is not None
+                else ckpt.get("ictd_tp_max_rank_other", arch_meta.get("ictd_tp_max_rank_other"))
+            )
             model = PureCartesianICTDTransformerLayerSave(
                 max_embed_radius=config.max_radius,
                 main_max_radius=config.max_radius_main,
@@ -632,7 +667,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         return cls(
             model=model,
             element_types=element_types,
-            max_radius=max_radius,
+            max_radius=radius,
             atomic_energy_keys=aek,
             atomic_energy_values=aev,
             device=device,

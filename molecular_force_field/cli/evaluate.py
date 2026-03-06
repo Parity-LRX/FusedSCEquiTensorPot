@@ -27,14 +27,23 @@ from molecular_force_field.data.collate import on_the_fly_collate, collate_fn_h5
 from molecular_force_field.data.preprocessing import extract_data_blocks, compute_correction, save_set
 from molecular_force_field.evaluation.evaluator import Evaluator
 from molecular_force_field.evaluation.calculator import MyE3NNCalculator, DDPCalculator
+from molecular_force_field.utils.checkpoint_metadata import (
+    get_checkpoint_atomic_energies,
+    maybe_load_checkpoint,
+    resolve_model_architecture,
+)
 from molecular_force_field.utils.config import ModelConfig
 
 
 def main():
     """Main evaluation function."""
-    parser = argparse.ArgumentParser(description='Evaluate molecular force field model')
+    parser = argparse.ArgumentParser(
+        description='Evaluate molecular force field model. Model-structure hyperparameters default to '
+                    'checkpoint metadata and explicit CLI values override.'
+    )
     parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Path to model checkpoint')
+                        help='Path to model checkpoint. Model-structure hyperparameters are restored with priority: '
+                             'explicit CLI > checkpoint metadata > defaults.')
     parser.add_argument('--input-file', type=str, default=None,
                         help='Path to input XYZ file. If provided, will automatically convert to read/energy/cell files for test set evaluation. '
                              'Note: When using this option, you MUST provide atomic reference energies via --atomic-energy-file or --atomic-energy-keys/--atomic-energy-values '
@@ -54,8 +63,9 @@ def main():
     parser.add_argument('--elements', type=str, nargs='+', default=None,
                         help='Element symbols to recognize (default: None, recognizes all elements from periodic table). '
                              'Used when --input-file is provided.')
-    parser.add_argument('--max-radius', type=float, default=5.0,
-                        help='Maximum radius for neighbor search')
+    parser.add_argument('--max-radius', type=float, default=None,
+                        help='Maximum radius for neighbor search. '
+                             'If not set, prefer checkpoint metadata; otherwise use the built-in default.')
     parser.add_argument('--batch-size', type=int, default=1,
                         help='Batch size')
     parser.add_argument('--device', type=str, default=None,
@@ -70,7 +80,7 @@ def main():
                         help='Run NEB calculation')
     parser.add_argument('--phonon', action='store_true',
                         help='Calculate phonon spectrum (Hessian matrix)')
-    parser.add_argument('--dtype', type=str, default='float64',
+    parser.add_argument('--dtype', type=str, default=None,
                         choices=['float32', 'float64', 'float', 'double'],
                         help='Default dtype for tensors (float32 or float64, default: float64)')
 
@@ -151,24 +161,25 @@ def main():
                         help='Skip structure relaxation before phonon calculation')
     
     # Model architecture hyperparameters
-    parser.add_argument('--max-atomvalue', type=int, default=10,
-                        help='Maximum atomic number in atom embedding (default: 10)')
-    parser.add_argument('--embedding-dim', type=int, default=16,
-                        help='Atom embedding dimension (default: 16)')
-    parser.add_argument('--embed-size', type=int, nargs='+', default=[128, 128, 128],
-                        help='Hidden layer sizes for readout MLP (default: 128 128 128)')
-    parser.add_argument('--output-size', type=int, default=8,
-                        help='Output size for atom readout MLP (default: 8)')
-    parser.add_argument('--lmax', type=int, default=2,
-                        help='Maximum L value for spherical harmonics in irreps (default: 2). Controls the highest order of irreducible representations.')
+    parser.add_argument('--max-atomvalue', type=int, default=None,
+                        help='Maximum atomic number in atom embedding. If not set, restore from checkpoint when available, else use 10.')
+    parser.add_argument('--embedding-dim', type=int, default=None,
+                        help='Atom embedding dimension. If not set, restore from checkpoint when available, else use 16.')
+    parser.add_argument('--embed-size', type=int, nargs='+', default=None,
+                        help='Hidden layer sizes for readout MLP. If not set, restore from checkpoint when available, else use 128 128 128.')
+    parser.add_argument('--output-size', type=int, default=None,
+                        help='Output size for atom readout MLP. If not set, restore from checkpoint when available, else use 8.')
+    parser.add_argument('--lmax', type=int, default=None,
+                        help='Maximum L value for spherical harmonics in irreps. If not set, restore from checkpoint when available, else use 2.')
     parser.add_argument('--irreps-output-conv-channels', type=int, default=None,
                         help='Number of channels for irreps_output_conv (e.g., 64 for lmax=2 gives "64x0e + 64x1o + 64x2e"). If not set, uses channel_in from config (default: 64)')
-    parser.add_argument('--function-type', type=str, default='gaussian',
+    parser.add_argument('--function-type', type=str, default=None,
                         choices=['gaussian', 'bessel', 'fourier', 'cosine', 'smooth_finite'],
-                        help='Basis function type for radial basis (default: gaussian). Options: gaussian, bessel, fourier, cosine, smooth_finite')
-    parser.add_argument('--tensor-product-mode', type=str, default='spherical',
+                        help='Basis function type for radial basis. If not set, restore from checkpoint when available, else use gaussian.')
+    parser.add_argument('--tensor-product-mode', type=str, default=None,
                         choices=['spherical', 'spherical-save', 'spherical-save-cue', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-ictd', 'pure-cartesian-ictd-save'],
-                        help='Tensor product mode: "spherical" uses e3nn spherical harmonics (default), '
+                        help='Tensor product mode. If not set, restore from checkpoint when available, else use spherical. '
+                             '"spherical" uses e3nn spherical harmonics (default), '
                              '"spherical-save" uses channelwise edge convolution (e3nn backend; fewer params). '
                              '"spherical-save-cue" uses channelwise edge convolution (cuEquivariance backend; requires cuequivariance-torch). '
                              '"partial-cartesian" uses Cartesian tensor products (strictly equivariant), '
@@ -178,9 +189,24 @@ def main():
                              '"pure-cartesian-ictd" uses pure_cartesian_ictd_layers_full (ICTD, DDP supported). '
                              '"pure-cartesian-ictd-save" uses pure_cartesian_ictd_layers (original ICTD, DDP supported). '
                              'Note: ICTD inference is typically ~3x faster than spherical-save.')
-    parser.add_argument('--num-interaction', type=int, default=2,
-                        help='Number of message-passing steps per block (default: 2). '
+    parser.add_argument('--max-rank-other', type=int, default=None,
+                        help='Max rank for sparse tensor product in pure-cartesian-sparse mode. '
+                             'If not set, restore from checkpoint when available, else use 1.')
+    parser.add_argument('--k-policy', type=str, default=None,
+                        choices=['k0', 'k1', 'both'],
+                        help='K policy for sparse tensor product in pure-cartesian-sparse mode. '
+                             'If not set, restore from checkpoint when available, else use k0.')
+    parser.add_argument('--num-interaction', type=int, default=None,
+                        help='Number of message-passing steps per block. '
+                             'If not set, restore from checkpoint when available, else use 2. '
                              'Used by all tensor-product modes. Must match the value used at training. Must be >= 2.')
+    parser.add_argument('--ictd-tp-path-policy', type=str, default=None,
+                        choices=['full', 'max_rank_other'],
+                        help='Path policy for ICTD tensor products in pure-cartesian-ictd mode. '
+                             'If not set, restore from checkpoint when available, else use full.')
+    parser.add_argument('--ictd-tp-max-rank-other', type=int, default=None,
+                        help='Used when --ictd-tp-path-policy=max_rank_other. '
+                             'If not set, prefer checkpoint metadata when available.')
 
     parser.add_argument('--mp-context', type=str, default='auto',
                         choices=['auto', 'fork', 'spawn'],
@@ -191,15 +217,52 @@ def main():
     # Atomic reference energies (E0)
     parser.add_argument('--atomic-energy-file', type=str, default=None,
                         help='CSV file with columns Atom,E0 to load atomic reference energies. '
-                             'If not set, defaults to fitted_E0.csv in the current directory. '
+                             'If set, this explicit CLI value overrides checkpoint E0. '
+                             'If not set, prefer checkpoint E0 when available; otherwise defaults to fitted_E0.csv in the current directory. '
                              'Note: When using --input-file, this file is REQUIRED (cannot fit from test data). '
                              'Typically generated during preprocessing/training via least-squares fitting.')
     parser.add_argument('--atomic-energy-keys', type=int, nargs='+', default=None,
-                        help='Atomic numbers for custom atomic reference energies (must match --atomic-energy-values length).')
+                        help='Atomic numbers for custom atomic reference energies (must match --atomic-energy-values length). Highest priority override.')
     parser.add_argument('--atomic-energy-values', type=float, nargs='+', default=None,
-                        help='Atomic reference energies (E0) in eV corresponding to --atomic-energy-keys.')
+                        help='Atomic reference energies (E0) in eV corresponding to --atomic-energy-keys. Highest priority override.')
     
     args = parser.parse_args()
+    checkpoint = maybe_load_checkpoint(args.checkpoint, map_location='cpu')
+    resolved_arch = resolve_model_architecture(
+        checkpoint,
+        overrides={
+            "dtype": args.dtype,
+            "max_radius": args.max_radius,
+            "max_atomvalue": args.max_atomvalue,
+            "embedding_dim": args.embedding_dim,
+            "embed_size": args.embed_size,
+            "output_size": args.output_size,
+            "lmax": args.lmax,
+            "irreps_output_conv_channels": args.irreps_output_conv_channels,
+            "function_type": args.function_type,
+            "tensor_product_mode": args.tensor_product_mode,
+            "num_interaction": args.num_interaction,
+            "max_rank_other": args.max_rank_other,
+            "k_policy": args.k_policy,
+            "ictd_tp_path_policy": args.ictd_tp_path_policy,
+            "ictd_tp_max_rank_other": args.ictd_tp_max_rank_other,
+        },
+    )
+    args.dtype = resolved_arch["dtype"]
+    args.max_radius = resolved_arch["max_radius"]
+    args.max_atomvalue = resolved_arch["max_atomvalue"]
+    args.embedding_dim = resolved_arch["embedding_dim"]
+    args.embed_size = resolved_arch["embed_size"]
+    args.output_size = resolved_arch["output_size"]
+    args.lmax = resolved_arch["lmax"]
+    args.irreps_output_conv_channels = resolved_arch["irreps_output_conv_channels"]
+    args.function_type = resolved_arch["function_type"]
+    args.tensor_product_mode = resolved_arch["tensor_product_mode"]
+    args.num_interaction = resolved_arch["num_interaction"]
+    args.max_rank_other = resolved_arch["max_rank_other"]
+    args.k_policy = resolved_arch["k_policy"]
+    args.ictd_tp_path_policy = resolved_arch["ictd_tp_path_policy"]
+    args.ictd_tp_max_rank_other = resolved_arch["ictd_tp_max_rank_other"]
     
     # Setup logging
     logging.basicConfig(level=logging.INFO)
@@ -281,54 +344,12 @@ def main():
             return e3trans_module
     
     # Load checkpoint
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    if checkpoint is None:
+        checkpoint = torch.load(args.checkpoint, map_location=device)
     state_dict_ckpt = checkpoint.get("e3trans_state_dict", {})
-
-    def _infer_physical_tensor_outputs_from_state_dict(sd: dict) -> dict | None:
-        """
-        Backward compatibility fallback for older checkpoints that have physical heads
-        in state_dict but did not save physical_tensor_outputs config.
-        """
-        per_name: dict[str, dict[int, int]] = {}
-        pat = re.compile(r"^physical_tensor_heads\.([^.]+)\.(\d+)\.weight$")
-        for k, v in sd.items():
-            m = pat.match(k)
-            if not m:
-                continue
-            name = m.group(1)
-            l = int(m.group(2))
-            # weight shape: (channels_out, channels_in)
-            ch_out = int(v.shape[0]) if hasattr(v, "shape") and len(v.shape) >= 1 else 1
-            per_name.setdefault(name, {})[l] = ch_out
-
-        if not per_name:
-            return None
-
-        out = {}
-        for name, ch_by_l in per_name.items():
-            ls = sorted(ch_by_l.keys())
-            out[name] = {
-                "ls": ls,
-                "channels_out": {l: ch_by_l[l] for l in ls},
-                # reduce 不影响参数结构；旧 checkpoint 无法可靠恢复，默认用 sum
-                "reduce": "sum",
-            }
-        return out
-
-    physical_tensor_outputs_ckpt = checkpoint.get("physical_tensor_outputs")
-    if physical_tensor_outputs_ckpt is None:
-        physical_tensor_outputs_ckpt = _infer_physical_tensor_outputs_from_state_dict(state_dict_ckpt)
-
-    external_tensor_rank_ckpt = checkpoint.get("external_tensor_rank")
-    if external_tensor_rank_ckpt is None and "e3_conv_emb.external_tensor_scale_by_l" in state_dict_ckpt:
-        # 旧 checkpoint 兼容：若检测到 external tensor scale 参数，则按 rank=1 恢复（当前 CLI 支持的外场）
-        external_tensor_rank_ckpt = 1
-
-    # Use tensor_product_mode from checkpoint if saved (backward compat: old checkpoints may not have it)
-    tensor_product_mode = checkpoint.get('tensor_product_mode') or args.tensor_product_mode
-    if checkpoint.get('tensor_product_mode') and checkpoint['tensor_product_mode'] != args.tensor_product_mode:
-        logging.info("Using tensor_product_mode=%s from checkpoint (override --tensor-product-mode=%s)",
-                     checkpoint['tensor_product_mode'], args.tensor_product_mode)
+    physical_tensor_outputs_ckpt = resolved_arch["physical_tensor_outputs"]
+    external_tensor_rank_ckpt = resolved_arch["external_tensor_rank"]
+    tensor_product_mode = args.tensor_product_mode
     
     # Model configuration
     # Convert dtype string to torch.dtype
@@ -344,30 +365,44 @@ def main():
         function_type=args.function_type,
         max_radius=args.max_radius
     )
+    checkpoint_atomic_energies = get_checkpoint_atomic_energies(checkpoint, dtype=config.dtype)
     
     # Atomic reference energies (E0)
     # If --input-file is provided, atomic energies are required (cannot fit from data)
     if args.input_file is not None:
         if args.atomic_energy_keys is None or args.atomic_energy_values is None:
-            # Try to load from file
-            e0_path = args.atomic_energy_file or 'fitted_E0.csv'
-            if not os.path.exists(e0_path):
-                raise ValueError(
-                    f"When using --input-file, atomic reference energies are REQUIRED. Use one of the following:\n"
-                    f"  1. Use --atomic-energy-file to specify a CSV file path (typically use fitted_E0.csv generated during training/preprocessing)\n"
-                    f"  2. Use --atomic-energy-keys and --atomic-energy-values to provide directly\n"
-                    f"  File not found: {e0_path}\n"
-                    f"  Note: fitted_E0.csv is typically auto-generated during preprocessing (mff-preprocess) or training (mff-train)."
-                )
-            # Load from file and verify it was successful (not using defaults)
-            loaded_successfully = config.load_atomic_energies_from_file(e0_path)
-            if not loaded_successfully:
-                raise ValueError(
-                    f"When using --input-file, atomic reference energy file must be loaded successfully.\n"
-                    f"File {e0_path} exists but has incorrect format or failed to load.\n"
-                    f"Please ensure the file contains 'Atom' and 'E0' columns, or use --atomic-energy-keys and --atomic-energy-values to provide directly."
-                )
-            logging.info(f"Loaded atomic reference energies from file: {e0_path}")
+            if args.atomic_energy_file is not None:
+                loaded_successfully = config.load_atomic_energies_from_file(args.atomic_energy_file)
+                if not loaded_successfully:
+                    raise ValueError(
+                        f"When using --input-file, atomic reference energy file must be loaded successfully.\n"
+                        f"File {args.atomic_energy_file} exists but has incorrect format or failed to load.\n"
+                        f"Please ensure the file contains 'Atom' and 'E0' columns, or use --atomic-energy-keys and --atomic-energy-values to provide directly."
+                    )
+                logging.info(f"Loaded atomic reference energies from file: {args.atomic_energy_file}")
+            elif checkpoint_atomic_energies is not None:
+                config.atomic_energy_keys, config.atomic_energy_values = checkpoint_atomic_energies
+                logging.info("Loaded atomic reference energies from checkpoint.")
+            else:
+                # Try to load from file
+                e0_path = 'fitted_E0.csv'
+                if not os.path.exists(e0_path):
+                    raise ValueError(
+                        f"When using --input-file, atomic reference energies are REQUIRED. Use one of the following:\n"
+                        f"  1. Use --atomic-energy-file to specify a CSV file path (typically use fitted_E0.csv generated during training/preprocessing)\n"
+                        f"  2. Use --atomic-energy-keys and --atomic-energy-values to provide directly\n"
+                        f"  3. Use a checkpoint that already stores atomic_energy_keys/atomic_energy_values\n"
+                        f"  File not found: {e0_path}\n"
+                        f"  Note: fitted_E0.csv is typically auto-generated during preprocessing (mff-preprocess) or training (mff-train)."
+                    )
+                loaded_successfully = config.load_atomic_energies_from_file(e0_path)
+                if not loaded_successfully:
+                    raise ValueError(
+                        f"When using --input-file, atomic reference energy file must be loaded successfully.\n"
+                        f"File {e0_path} exists but has incorrect format or failed to load.\n"
+                        f"Please ensure the file contains 'Atom' and 'E0' columns, or use --atomic-energy-keys and --atomic-energy-values to provide directly."
+                    )
+                logging.info(f"Loaded atomic reference energies from file: {e0_path}")
         else:
             if len(args.atomic_energy_keys) != len(args.atomic_energy_values):
                 raise ValueError("--atomic-energy-keys and --atomic-energy-values must have the same length.")
@@ -384,6 +419,12 @@ def main():
             config.atomic_energy_keys = torch.tensor(args.atomic_energy_keys, dtype=torch.long)
             config.atomic_energy_values = torch.tensor(args.atomic_energy_values, dtype=config.dtype)
             logging.info("Using custom atomic reference energies from CLI.")
+        elif args.atomic_energy_file is not None:
+            config.load_atomic_energies_from_file(args.atomic_energy_file)
+            logging.info(f"Loaded atomic reference energies from file: {args.atomic_energy_file}")
+        elif checkpoint_atomic_energies is not None:
+            config.atomic_energy_keys, config.atomic_energy_values = checkpoint_atomic_energies
+            logging.info("Loaded atomic reference energies from checkpoint.")
         else:
             e0_path = args.atomic_energy_file or 'fitted_E0.csv'
             config.load_atomic_energies_from_file(e0_path)

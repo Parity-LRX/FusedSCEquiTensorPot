@@ -64,6 +64,7 @@ from molecular_force_field.active_learning.labeling import (
     SlurmLabeler,
     VaspLabeler,
 )
+from molecular_force_field.active_learning.diversity_selector import DiversitySelector
 from molecular_force_field.active_learning.loop import run_active_learning_loop
 from molecular_force_field.active_learning.stage_scheduler import (
     StageScheduler,
@@ -71,10 +72,26 @@ from molecular_force_field.active_learning.stage_scheduler import (
 )
 
 
-def _resolve_init_struct(args) -> str:
-    """Resolve or extract initial structure from data_dir."""
-    if args.init_structure and os.path.exists(args.init_structure):
-        return args.init_structure
+def _resolve_init_structs(args):
+    """Resolve one or more initial structures from CLI args or data_dir.
+
+    Returns a list of structure file paths.
+    """
+    from typing import List
+
+    if args.init_structure:
+        structures: List[str] = []
+        for path in args.init_structure:
+            if os.path.isdir(path):
+                for f in sorted(os.listdir(path)):
+                    if f.endswith((".xyz", ".extxyz", ".cif", ".vasp")):
+                        structures.append(os.path.join(path, f))
+            elif os.path.exists(path):
+                structures.append(path)
+            else:
+                raise FileNotFoundError(f"Init structure not found: {path}")
+        if structures:
+            return structures
 
     train_xyz = os.path.join(args.data_dir, "train.xyz")
     if os.path.exists(train_xyz):
@@ -84,7 +101,7 @@ def _resolve_init_struct(args) -> str:
             init_struct = os.path.join(args.work_dir, "init.xyz")
             os.makedirs(args.work_dir, exist_ok=True)
             write(init_struct, atoms_list[0])
-            return init_struct
+            return [init_struct]
 
     proc_h5 = os.path.join(args.data_dir, "processed_train.h5")
     if os.path.exists(proc_h5):
@@ -100,7 +117,7 @@ def _resolve_init_struct(args) -> str:
         init_struct = os.path.join(args.work_dir, "init.xyz")
         os.makedirs(args.work_dir, exist_ok=True)
         write(init_struct, atoms)
-        return init_struct
+        return [init_struct]
 
     raise ValueError(
         "Provide --init-structure or ensure data_dir has train.xyz / processed_train.h5"
@@ -117,7 +134,15 @@ def main():
     # ---- common ----
     parser.add_argument("--work-dir", type=str, default="al_work")
     parser.add_argument("--data-dir", type=str, default="data")
-    parser.add_argument("--init-structure", type=str, default=None)
+    parser.add_argument(
+        "--init-structure", type=str, nargs="+", default=None,
+        help=(
+            "One or more initial structure files for MD exploration, "
+            "or a directory containing .xyz/.cif files. "
+            "When multiple structures are given, each iteration explores "
+            "all structures in parallel and merges the trajectories."
+        ),
+    )
     parser.add_argument("--n-models", type=int, default=4)
     parser.add_argument("--no-pre-eval", action="store_true")
     parser.add_argument("--explore-type", type=str, required=True, choices=["ase", "lammps"])
@@ -162,6 +187,52 @@ def main():
     parser.add_argument("--neb-initial", type=str, default=None)
     parser.add_argument("--neb-final", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument(
+        "--train-n-gpu", type=int, default=1,
+        help=(
+            "Number of GPUs for training each ensemble model. "
+            "1 (default): single-process training (CPU or single GPU). "
+            ">1: launches torchrun --nproc_per_node=N with --distributed."
+        ),
+    )
+    parser.add_argument(
+        "--train-max-parallel", type=int, default=0,
+        help=(
+            "Max ensemble models trained simultaneously. "
+            "0 (default): auto = available_gpus // train_n_gpu. "
+            "1: sequential (one model at a time). "
+            "E.g. 8 GPUs + --train-n-gpu 2 → auto parallel = 4 models."
+        ),
+    )
+    parser.add_argument(
+        "--train-nnodes", type=int, default=1,
+        help=(
+            "Number of nodes for multi-node DDP training. "
+            "1 (default): single-node. "
+            ">1: multi-node (uses torchrun rendezvous; auto-detects SLURM)."
+        ),
+    )
+    parser.add_argument(
+        "--train-master-addr", type=str, default="auto",
+        help=(
+            "Master/rendezvous address for multi-node DDP. "
+            "'auto' (default): resolves from SLURM or local hostname."
+        ),
+    )
+    parser.add_argument(
+        "--train-master-port", type=int, default=29500,
+        help="Base rendezvous port for DDP (default: 29500).",
+    )
+    parser.add_argument(
+        "--train-launcher", type=str, default="auto",
+        choices=["auto", "local", "slurm"],
+        help=(
+            "Launcher for multi-node training. "
+            "'auto' (default): uses 'slurm' if SLURM detected + nnodes>1, else 'local'. "
+            "'slurm': wraps torchrun with 'srun --nodes=N --ntasks-per-node=1'. "
+            "'local': torchrun only (user must start workers on other nodes)."
+        ),
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
 
     # ---- PySCF labeler options ----
@@ -345,6 +416,50 @@ def main():
     parser.add_argument("--md-relax-fmax", type=float, default=0.05)
     parser.add_argument("--md-log-interval", type=int, default=10)
 
+    # ---- diversity selection (Layer 2) ----
+    parser.add_argument(
+        "--diversity-metric", type=str, default="soap",
+        choices=["soap", "devi_hist", "none"],
+        help=(
+            "Fingerprint for diversity sub-selection of candidates. "
+            "'soap' (default, requires dscribe): SOAP average descriptor + FPS. "
+            "'devi_hist': per-atom force-deviation histogram + FPS (zero extra inference). "
+            "'none': disable diversity filtering."
+        ),
+    )
+    parser.add_argument(
+        "--max-candidates-per-iter", type=int, default=50,
+        help=(
+            "Max candidates to keep per iteration after diversity selection. "
+            "Only effective when --diversity-metric is not 'none'. (default: 50)"
+        ),
+    )
+    parser.add_argument("--soap-rcut", type=float, default=5.0,
+                        help="SOAP cutoff radius in Angstrom (default: 5.0)")
+    parser.add_argument("--soap-nmax", type=int, default=8,
+                        help="SOAP radial basis expansion order (default: 8)")
+    parser.add_argument("--soap-lmax", type=int, default=6,
+                        help="SOAP angular expansion order (default: 6)")
+    parser.add_argument("--soap-sigma", type=float, default=0.5,
+                        help="SOAP Gaussian smearing width (default: 0.5)")
+    parser.add_argument("--devi-hist-bins", type=int, default=32,
+                        help="Number of bins for devi_hist fingerprint (default: 32)")
+
+    # ---- fail frame handling (Layer 0) ----
+    parser.add_argument(
+        "--fail-strategy", type=str, default="discard",
+        choices=["discard", "sample_topk"],
+        help=(
+            "How to handle fail frames (max_devi_f >= level_f_hi). "
+            "'discard' (default): drop all fail frames. "
+            "'sample_topk': promote the least extreme fail frames into candidates."
+        ),
+    )
+    parser.add_argument(
+        "--fail-max-select", type=int, default=10,
+        help="Number of fail frames to promote when --fail-strategy=sample_topk (default: 10)"
+    )
+
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -353,7 +468,7 @@ def main():
     )
 
     e0_path = args.atomic_energy_file or os.path.join(args.data_dir, "fitted_E0.csv")
-    init_struct = _resolve_init_struct(args)
+    init_structs = _resolve_init_structs(args)
 
     # ------------------------------------------------------------------ #
     # Build StageScheduler
@@ -381,18 +496,24 @@ def main():
         )
 
     # ------------------------------------------------------------------ #
-    # Build explore_fn (3-arg: global_iter, ckpt, stage)
+    # Build explore_fn
+    # Accepts **kwargs so loop.py can pass input_structure / output_traj
+    # for multi-structure parallel exploration.
     # ------------------------------------------------------------------ #
-    def explore_fn(iter_idx, checkpoint_path, stage):
-        out_traj = os.path.join(
-            args.work_dir, "iterations", f"iter_{iter_idx}", "explore_traj.xyz"
+    def explore_fn(iter_idx, checkpoint_path, stage, **kwargs):
+        struct = kwargs.get("input_structure", init_structs[0])
+        out_traj = kwargs.get(
+            "output_traj",
+            os.path.join(
+                args.work_dir, "iterations", f"iter_{iter_idx}", "explore_traj.xyz"
+            ),
         )
         os.makedirs(os.path.dirname(out_traj), exist_ok=True)
         if args.explore_type == "ase":
             if args.explore_mode == "md":
                 return run_ase_md(
                     checkpoint_path=checkpoint_path,
-                    input_structure=init_struct,
+                    input_structure=struct,
                     output_traj=out_traj,
                     device=args.device,
                     max_radius=args.max_radius,
@@ -596,6 +717,22 @@ def main():
         train_args.extend(["--epochs", str(args.epochs)])
 
     # ------------------------------------------------------------------ #
+    # Build DiversitySelector (Layer 2)
+    # ------------------------------------------------------------------ #
+    if args.diversity_metric != "none":
+        diversity_selector = DiversitySelector(
+            metric=args.diversity_metric,
+            max_select=args.max_candidates_per_iter,
+            soap_rcut=args.soap_rcut,
+            soap_nmax=args.soap_nmax,
+            soap_lmax=args.soap_lmax,
+            soap_sigma=args.soap_sigma,
+            devi_hist_bins=args.devi_hist_bins,
+        )
+    else:
+        diversity_selector = None
+
+    # ------------------------------------------------------------------ #
     # Run
     # ------------------------------------------------------------------ #
     run_active_learning_loop(
@@ -605,12 +742,22 @@ def main():
         label_fn=label_fn,
         n_models=args.n_models,
         pre_eval=not args.no_pre_eval,
-        explore_structure=init_struct,
+        explore_structure=init_structs[0],
         device=args.device,
         atomic_energy_file=e0_path,
         max_radius=args.max_radius,
         train_args=train_args if train_args else None,
         scheduler=scheduler,
+        diversity_selector=diversity_selector,
+        fail_strategy=args.fail_strategy,
+        fail_max_select=args.fail_max_select,
+        explore_structures=init_structs,
+        n_gpu=args.train_n_gpu,
+        max_parallel=args.train_max_parallel,
+        nnodes=args.train_nnodes,
+        master_addr=args.train_master_addr,
+        master_port=args.train_master_port,
+        launcher=args.train_launcher,
     )
 
 

@@ -3,6 +3,7 @@
 import argparse
 import os
 import random
+import sys
 import torch
 import torch.distributed as dist
 import numpy as np
@@ -32,6 +33,11 @@ from molecular_force_field.data import H5Dataset
 from molecular_force_field.data.collate import collate_fn_h5
 from molecular_force_field.training.trainer import Trainer
 from molecular_force_field.data.preprocessing import save_to_h5_parallel
+from molecular_force_field.utils.checkpoint_metadata import (
+    get_checkpoint_atomic_energies,
+    maybe_load_checkpoint,
+    resolve_model_architecture,
+)
 from molecular_force_field.utils.config import ModelConfig
 
 
@@ -220,15 +226,103 @@ def setup_logging():
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
+def _relaunch_with_torchrun(args):
+    """Re-launch the current process via ``torchrun`` (and optionally ``srun``).
+
+    Called when ``--n-gpu > 1`` or ``--nnodes > 1`` is given without
+    ``--distributed``.  The function rebuilds ``sys.argv`` stripping out
+    the launcher-specific flags, adds ``--distributed``, and wraps the
+    command with ``torchrun`` / ``srun`` as needed.
+    """
+    import socket
+    import subprocess
+
+    # ---- Resolve launcher ----
+    launcher = args.launcher
+    if launcher == "auto":
+        if args.nnodes > 1 and os.environ.get("SLURM_JOB_ID"):
+            launcher = "slurm"
+        else:
+            launcher = "local"
+
+    # ---- Resolve master address ----
+    master_addr = args.master_addr
+    if master_addr == "auto":
+        nodelist = os.environ.get("SLURM_NODELIST", "")
+        if nodelist:
+            try:
+                r = subprocess.run(
+                    ["scontrol", "show", "hostnames", nodelist],
+                    capture_output=True, text=True,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    master_addr = r.stdout.strip().split("\n")[0]
+            except FileNotFoundError:
+                pass
+        if master_addr == "auto":
+            master_addr = socket.gethostname()
+
+    # ---- Rebuild argv: strip launcher-only flags, add --distributed ----
+    _launcher_flags = {
+        "--n-gpu", "--nnodes", "--master-addr", "--master-port", "--launcher",
+    }
+    new_argv = []
+    skip_next = False
+    for i, tok in enumerate(sys.argv[1:]):
+        if skip_next:
+            skip_next = False
+            continue
+        bare = tok.split("=")[0]
+        if bare in _launcher_flags:
+            if "=" not in tok:
+                skip_next = True
+            continue
+        new_argv.append(tok)
+    if "--distributed" not in new_argv:
+        new_argv.append("--distributed")
+
+    # ---- Build torchrun command ----
+    torchrun_cmd = [
+        sys.executable, "-m", "torch.distributed.run",
+        "--nproc_per_node", str(args.n_gpu),
+        "--nnodes", str(args.nnodes),
+        "--rdzv_backend", "c10d",
+        "--rdzv_endpoint", f"{master_addr}:{args.master_port}",
+        "-m", "molecular_force_field.cli.train",
+    ] + new_argv
+
+    # ---- Wrap with srun for multi-node SLURM ----
+    if launcher == "slurm" and args.nnodes > 1:
+        torchrun_cmd = [
+            "srun",
+            "--nodes", str(args.nnodes),
+            "--ntasks-per-node", "1",
+        ] + torchrun_cmd
+
+    logging.basicConfig(level=logging.INFO)
+    logging.info(
+        f"Auto-launching DDP: {args.n_gpu} GPU(s) × {args.nnodes} node(s), "
+        f"launcher={launcher}"
+    )
+    logging.info(f"Command: {' '.join(torchrun_cmd)}")
+
+    ret = subprocess.run(torchrun_cmd)
+    sys.exit(ret.returncode)
+
+
 def main():
     """Main training function."""
-    parser = argparse.ArgumentParser(description='Train molecular force field model')
+    parser = argparse.ArgumentParser(
+        description='Train molecular force field model. When --checkpoint already exists, '
+                    'model-structure hyperparameters default to checkpoint metadata and explicit CLI values override.'
+    )
     parser.add_argument('--train-prefix', type=str, default='train',
                         help='Prefix for training data files')
     parser.add_argument('--val-prefix', type=str, default='val',
                         help='Prefix for validation data files')
-    parser.add_argument('--max-radius', type=float, default=5.0,
-                        help='Maximum radius for neighbor search')
+    parser.add_argument('--max-radius', type=float, default=None,
+                        help='Maximum radius for neighbor search. '
+                             'If not set, prefer checkpoint metadata when --checkpoint exists; otherwise use the built-in default.')
     parser.add_argument('--batch-size', type=int, default=8,
                         help='Batch size')
     parser.add_argument('--epochs', type=int, default=1000,
@@ -246,7 +340,8 @@ def main():
     parser.add_argument('--warmup-start-ratio', type=float, default=0.1,
                         help='Starting learning rate ratio during warmup (0.1 means start at 10%% of target LR, default: 0.1)')
     parser.add_argument('--checkpoint', type=str, default='combined_model.pth',
-                        help='Checkpoint path')
+                        help='Checkpoint path. If the file already exists, training resumes from it and model-structure '
+                             'hyperparameters are restored with priority: explicit CLI > checkpoint metadata > defaults.')
     parser.add_argument('--reset-loss-weights', action='store_true', default=False,
                         help='When loading checkpoint, ignore saved loss weights (a, b) and use '
                              'values from command line arguments (--a, --b) instead. '
@@ -260,7 +355,7 @@ def main():
                              'otherwise uses the default OS method (often "fork" on Linux, faster).')
     parser.add_argument('--device', type=str, default=None,
                         help='Device to use (cuda/cpu)')
-    parser.add_argument('--dtype', type=str, default='float64',
+    parser.add_argument('--dtype', type=str, default=None,
                         choices=['float32', 'float64', 'float', 'double'],
                         help='Default dtype for tensors (float32 or float64, default: float64)')
     parser.add_argument('--matmul-precision', type=str, default='high',
@@ -333,13 +428,14 @@ def main():
     # Atomic reference energies (E0)
     parser.add_argument('--atomic-energy-file', type=str, default=None,
                         help='CSV file with columns Atom,E0 to load atomic reference energies. '
-                             'If not set, defaults to <data-dir>/fitted_E0.csv (generated by least squares on train set).')
+                             'If set, this explicit CLI value overrides checkpoint E0. '
+                             'If not set, prefer checkpoint E0 when available; otherwise default to <data-dir>/fitted_E0.csv.')
     parser.add_argument('--atomic-energy-keys', type=int, nargs='+', default=None,
                         help='Atomic numbers for custom atomic reference energies (must match --atomic-energy-values length). '
-                             'Example: --atomic-energy-keys 1 6 7 8')
+                             'Highest priority override. Example: --atomic-energy-keys 1 6 7 8')
     parser.add_argument('--atomic-energy-values', type=float, nargs='+', default=None,
                         help='Atomic reference energies (E0) in eV corresponding to --atomic-energy-keys. '
-                             'Example: --atomic-energy-values -430.53 -821.03 -1488.19 -2044.35')
+                             'Highest priority override. Example: --atomic-energy-values -430.53 -821.03 -1488.19 -2044.35')
     parser.add_argument('--patience', type=int, default=20,
                         help='Early stopping patience in epochs (default: 20)')
     parser.add_argument('--vhat-clamp-interval', type=int, default=2000,
@@ -408,24 +504,25 @@ def main():
                         help='Random seed for reproducibility (default: 42)')
     
     # Model architecture hyperparameters
-    parser.add_argument('--max-atomvalue', type=int, default=10,
-                        help='Maximum atomic number in atom embedding (default: 10)')
-    parser.add_argument('--embedding-dim', type=int, default=16,
-                        help='Atom embedding dimension (default: 16)')
-    parser.add_argument('--embed-size', type=int, nargs='+', default=[128, 128, 128],
-                        help='Hidden layer sizes for readout MLP (default: 128 128 128)')
-    parser.add_argument('--output-size', type=int, default=8,
-                        help='Output size for atom readout MLP (default: 8)')
-    parser.add_argument('--lmax', type=int, default=2,
-                        help='Maximum L value for spherical harmonics in irreps (default: 2). Controls the highest order of irreducible representations.')
+    parser.add_argument('--max-atomvalue', type=int, default=None,
+                        help='Maximum atomic number in atom embedding. If not set, restore from checkpoint when available, else use 10.')
+    parser.add_argument('--embedding-dim', type=int, default=None,
+                        help='Atom embedding dimension. If not set, restore from checkpoint when available, else use 16.')
+    parser.add_argument('--embed-size', type=int, nargs='+', default=None,
+                        help='Hidden layer sizes for readout MLP. If not set, restore from checkpoint when available, else use 128 128 128.')
+    parser.add_argument('--output-size', type=int, default=None,
+                        help='Output size for atom readout MLP. If not set, restore from checkpoint when available, else use 8.')
+    parser.add_argument('--lmax', type=int, default=None,
+                        help='Maximum L value for spherical harmonics in irreps. If not set, restore from checkpoint when available, else use 2.')
     parser.add_argument('--irreps-output-conv-channels', type=int, default=None,
                         help='Number of channels for irreps_output_conv (e.g., 64 for lmax=2 gives "64x0e + 64x1o + 64x2e"). If not set, uses channel_in from config (default: 64)')
-    parser.add_argument('--function-type', type=str, default='gaussian',
+    parser.add_argument('--function-type', type=str, default=None,
                         choices=['gaussian', 'bessel', 'fourier', 'cosine', 'smooth_finite'],
-                        help='Basis function type for radial basis (default: gaussian). Options: gaussian, bessel, fourier, cosine, smooth_finite')
-    parser.add_argument('--tensor-product-mode', type=str, default='spherical',
+                        help='Basis function type for radial basis. If not set, restore from checkpoint when available, else use gaussian.')
+    parser.add_argument('--tensor-product-mode', type=str, default=None,
                         choices=['spherical', 'spherical-save', 'spherical-save-cue', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-ictd', 'pure-cartesian-ictd-save'],
-                        help='Tensor product mode: "spherical" uses e3nn spherical harmonics (default), '
+                        help='Tensor product mode. If not set, restore from checkpoint when available, else use spherical. '
+                             '"spherical" uses e3nn spherical harmonics (default), '
                              '"spherical-save" uses channelwise edge convolution (e3nn backend; fewer params, same irreps), '
                              '"spherical-save-cue" uses channelwise edge convolution (cuEquivariance backend; requires cuequivariance-torch), '
                              '"partial-cartesian" uses Cartesian tensor products with EquivariantTensorProduct (strictly equivariant), '
@@ -435,27 +532,32 @@ def main():
                              '"pure-cartesian-ictd" uses pure_cartesian_ictd_layers_full (ICTD, DDP supported). '
                              '"pure-cartesian-ictd-save" uses pure_cartesian_ictd_layers (original ICTD, same readout, DDP supported). '
                              'Note: ICTD inference is typically ~3x faster than spherical-save.')
-    parser.add_argument('--max-rank-other', type=int, default=1,
-                        help='Max rank for sparse tensor product in pure-cartesian-sparse mode (default: 1). '
+    parser.add_argument('--max-rank-other', type=int, default=None,
+                        help='Max rank for sparse tensor product in pure-cartesian-sparse mode. '
+                             'If not set, restore from checkpoint when available, else use 1. '
                              'Only interactions where min(L1, L2) <= max_rank_other are allowed. '
                              'Larger values allow more interactions but increase parameters and computation.')
-    parser.add_argument('--k-policy', type=str, default='k0',
+    parser.add_argument('--k-policy', type=str, default=None,
                         choices=['k0', 'k1', 'both'],
-                        help='K policy for sparse tensor product in pure-cartesian-sparse mode (default: k0). '
+                        help='K policy for sparse tensor product in pure-cartesian-sparse mode. '
+                             'If not set, restore from checkpoint when available, else use k0. '
                              'k0: only k=0 (promotes higher rank), k1: only k=1 (contracts to lower rank), both: keep both')
-    parser.add_argument('--num-interaction', type=int, default=2,
-                        help='Number of message-passing steps (conv layers) per block (default: 2). '
+    parser.add_argument('--num-interaction', type=int, default=None,
+                        help='Number of message-passing steps (conv layers) per block. '
+                             'If not set, restore from checkpoint when available, else use 2. '
                              'Used by: pure-cartesian, pure-cartesian-ictd, pure-cartesian-ictd-save, pure-cartesian-sparse, '
                              'partial-cartesian, partial-cartesian-loose, spherical, spherical-save, spherical-save-cue. Must be >= 2.')
 
     # ICTD path pruning controls (pure-cartesian-ictd and pure-cartesian-ictd-save)
-    parser.add_argument('--ictd-tp-path-policy', type=str, default='full',
+    parser.add_argument('--ictd-tp-path-policy', type=str, default=None,
                         choices=['full', 'max_rank_other'],
-                        help='Path policy for ICTD tensor products in pure-cartesian-ictd mode (default: full). '
+                        help='Path policy for ICTD tensor products in pure-cartesian-ictd mode. '
+                             'If not set, restore from checkpoint when available, else use full. '
                              'full: keep all CG-allowed (l1,l2->l3) paths; '
                              'max_rank_other: keep only paths with min(l1,l2) <= --ictd-tp-max-rank-other.')
     parser.add_argument('--ictd-tp-max-rank-other', type=int, default=None,
                         help='Used when --ictd-tp-path-policy=max_rank_other. '
+                             'If not set, prefer checkpoint metadata when available. '
                              'Keeps only paths with min(l1,l2) <= this value (e.g. 1 keeps scalar/vector couplings).')
 
     # Validation acceleration (evaluation-only; training uses double backward and is NOT compiled)
@@ -478,8 +580,72 @@ def main():
     parser.add_argument('--inference-output-physical-tensors', action='store_true',
                         help='Save in checkpoint: inference should output physical tensors (dipole, polarizability, etc.). '
                              'Default False: MD/LAMMPS 接口仅需能量和力，不输出物理张量。')
-    
+
+    # ---- Auto-launch parameters (self-relaunch via torchrun / srun) ----
+    parser.add_argument('--n-gpu', type=int, default=1,
+                        help='Number of GPUs to use. 1 (default): single-process training. '
+                             '>1: auto-relaunch via torchrun --nproc_per_node=N --distributed. '
+                             'Backward compatible: manual "torchrun ... --distributed" still works.')
+    parser.add_argument('--nnodes', type=int, default=1,
+                        help='Number of nodes for multi-node DDP. 1 (default): single-node. '
+                             '>1: multi-node via torchrun rendezvous.')
+    parser.add_argument('--master-addr', type=str, default='auto',
+                        help='Rendezvous address for DDP. "auto" (default): resolve from SLURM or hostname.')
+    parser.add_argument('--master-port', type=int, default=29500,
+                        help='Rendezvous port for DDP (default: 29500).')
+    parser.add_argument('--launcher', type=str, default='auto',
+                        choices=['auto', 'local', 'slurm'],
+                        help='Multi-node launcher. "auto": detect SLURM. "slurm": wrap with srun. '
+                             '"local": torchrun only.')
+
     args = parser.parse_args()
+
+    # ---- Auto-relaunch via torchrun when --n-gpu > 1 or --nnodes > 1 ----
+    # Skip if already inside a torchrun worker (--distributed is set by the
+    # relaunched command, so we never relaunch twice).
+    if (args.n_gpu > 1 or args.nnodes > 1) and not args.distributed:
+        _relaunch_with_torchrun(args)
+        return  # unreachable when _relaunch exits, but defensive
+
+    checkpoint_arch = maybe_load_checkpoint(args.checkpoint, map_location='cpu')
+    resolved_arch = resolve_model_architecture(
+        checkpoint_arch,
+        overrides={
+            "dtype": args.dtype,
+            "max_radius": args.max_radius,
+            "max_atomvalue": args.max_atomvalue,
+            "embedding_dim": args.embedding_dim,
+            "embed_size": args.embed_size,
+            "output_size": args.output_size,
+            "lmax": args.lmax,
+            "irreps_output_conv_channels": args.irreps_output_conv_channels,
+            "function_type": args.function_type,
+            "tensor_product_mode": args.tensor_product_mode,
+            "num_interaction": args.num_interaction,
+            "max_rank_other": args.max_rank_other,
+            "k_policy": args.k_policy,
+            "ictd_tp_path_policy": args.ictd_tp_path_policy,
+            "ictd_tp_max_rank_other": args.ictd_tp_max_rank_other,
+        },
+    )
+    args.dtype = resolved_arch["dtype"]
+    args.max_radius = resolved_arch["max_radius"]
+    args.max_atomvalue = resolved_arch["max_atomvalue"]
+    args.embedding_dim = resolved_arch["embedding_dim"]
+    args.embed_size = resolved_arch["embed_size"]
+    args.output_size = resolved_arch["output_size"]
+    args.lmax = resolved_arch["lmax"]
+    args.irreps_output_conv_channels = resolved_arch["irreps_output_conv_channels"]
+    args.function_type = resolved_arch["function_type"]
+    args.tensor_product_mode = resolved_arch["tensor_product_mode"]
+    args.num_interaction = resolved_arch["num_interaction"]
+    args.max_rank_other = resolved_arch["max_rank_other"]
+    args.k_policy = resolved_arch["k_policy"]
+    args.ictd_tp_path_policy = resolved_arch["ictd_tp_path_policy"]
+    args.ictd_tp_max_rank_other = resolved_arch["ictd_tp_max_rank_other"]
+    if args.external_tensor_rank is None:
+        args.external_tensor_rank = resolved_arch["external_tensor_rank"]
+    restored_physical_tensor_outputs = resolved_arch["physical_tensor_outputs"]
 
     # --- Dataset option validation (pairs must be both set or both unset) ---
     if (args.train_data is None) != (args.valid_data is None):
@@ -797,6 +963,7 @@ def main():
         function_type=args.function_type,
         max_radius=args.max_radius
     )
+    checkpoint_atomic_energies = get_checkpoint_atomic_energies(checkpoint_arch, dtype=config.dtype)
     
     # --- Atomic reference energies (E0) ---
     if args.atomic_energy_keys is not None or args.atomic_energy_values is not None:
@@ -811,9 +978,18 @@ def main():
             for k, v in zip(args.atomic_energy_keys, args.atomic_energy_values):
                 logging.info(f"  Atom {k}: {v:.8f} eV")
     else:
-        # Default behavior: load least-squares fitted E0 from fitted_E0.csv
-        e0_path = args.atomic_energy_file or os.path.join(args.data_dir, 'fitted_E0.csv')
-        config.load_atomic_energies_from_file(e0_path)
+        if args.atomic_energy_file is not None:
+            config.load_atomic_energies_from_file(args.atomic_energy_file)
+            if rank == 0:
+                logging.info(f"Loaded atomic reference energies from file: {args.atomic_energy_file}")
+        elif checkpoint_atomic_energies is not None:
+            config.atomic_energy_keys, config.atomic_energy_values = checkpoint_atomic_energies
+            if rank == 0:
+                logging.info("Loaded atomic reference energies from checkpoint.")
+        else:
+            # Default behavior: load least-squares fitted E0 from fitted_E0.csv
+            e0_path = os.path.join(args.data_dir, 'fitted_E0.csv')
+            config.load_atomic_energies_from_file(e0_path)
     
     # --- Log hyperparameters ---
     if rank == 0:
@@ -863,7 +1039,7 @@ def main():
         logging.info("Using PURE Cartesian ICTD mode (pure_cartesian_ictd_layers_full, DDP sync), num_interaction=%d", args.num_interaction)
         logging.info(f"  ictd_tp_path_policy={args.ictd_tp_path_policy}, ictd_tp_max_rank_other={args.ictd_tp_max_rank_other}")
 
-        # Build physical_tensor_outputs from CLI
+        # Build physical_tensor_outputs from CLI, or restore them from checkpoint when resuming.
         _phys_specs = {"charge": [0], "dipole": [1], "polarizability": [0, 2], "quadrupole": [2]}
         physical_tensor_outputs = {}
         if args.physical_tensors:
@@ -887,7 +1063,7 @@ def main():
                     }
                 else:
                     raise ValueError(f"Unknown --physical-tensors-per-node {name!r}; supported: charge_per_atom, dipole_per_atom, polarizability_per_atom, quadrupole_per_atom")
-        physical_tensor_outputs = physical_tensor_outputs if physical_tensor_outputs else None
+        physical_tensor_outputs = physical_tensor_outputs if physical_tensor_outputs else restored_physical_tensor_outputs
 
         if physical_tensor_outputs and rank == 0:
             logging.info("  physical_tensor_outputs: %s", list(physical_tensor_outputs.keys()))

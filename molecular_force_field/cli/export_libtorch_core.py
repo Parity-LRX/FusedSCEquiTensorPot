@@ -14,6 +14,11 @@ This script exports core.pt with:
 - **Optional embedded E0** (option B): embed per-element constant energy (E0) from preprocessing/fitting
   into TorchScript; exported core.pt outputs per-atom energy as "network energy + E0(Z)".
   Note: E0 does not affect forces (constant gradient w.r.t. coordinates is zero).
+
+Recommended usage:
+- Usually pass only `--checkpoint`, `--elements`, and export/runtime options.
+- Model-structure hyperparameters default to checkpoint metadata.
+- If explicit CLI values conflict with checkpoint metadata, the CLI wins.
 """
 
 from __future__ import annotations
@@ -110,8 +115,8 @@ def export_core(
     checkpoint: str,
     elements: List[str],
     device: str,
-    max_radius: float,
-    num_interaction: int,
+    max_radius: Optional[float],
+    num_interaction: Optional[int],
     out_pt: str,
     tensor_product_mode: Optional[str] = None,
     force_dtype: Optional[torch.dtype] = None,
@@ -124,7 +129,7 @@ def export_core(
 
     _ts_supported = ("pure-cartesian-ictd", "pure-cartesian-ictd-save", "spherical-save-cue")
 
-    # Resolve mode: explicit arg > checkpoint > error
+    # Resolve mode and metadata: explicit CLI override > checkpoint > fallback.
     if tensor_product_mode is not None:
         mode = tensor_product_mode
     else:
@@ -137,6 +142,11 @@ def export_core(
                 f"\nTorchScript-supported modes: {_ts_supported}"
             )
         print(f"[export_core] Read tensor_product_mode={mode!r} from checkpoint")
+    ckpt_peek = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    effective_radius = float(ckpt_peek.get("max_radius", max_radius if max_radius is not None else 5.0))
+    if num_interaction is None:
+        num_interaction = int(ckpt_peek.get("model_hyperparameters", {}).get("num_interaction", 2))
+    del ckpt_peek
     if mode not in _ts_supported:
         raise ValueError(
             f"Mode {mode!r} does not support TorchScript export."
@@ -173,7 +183,7 @@ def export_core(
     obj = LAMMPS_MLIAP_MFF.from_checkpoint(
         checkpoint_path=checkpoint,
         element_types=elements,
-        max_radius=max_radius,
+        max_radius=effective_radius,
         atomic_energy_keys=atomic_energy_keys,
         atomic_energy_values=atomic_energy_values,
         device=build_device,
@@ -223,8 +233,8 @@ def export_core(
         "elements": elements,
         "tensor_product_mode": mode,
         "device_exported_from": device,
-        "max_radius": float(max_radius),
-        "num_interaction": int(num_interaction),
+        "max_radius": float(effective_radius),
+        "num_interaction": int(num_interaction) if num_interaction is not None else None,
         "dtype": str(actual_dtype).replace("torch.", ""),
         "embed_e0": bool(embed_e0),
         "e0_source": (str(e0_csv) if e0_csv else "from_checkpoint_or_default"),
@@ -252,21 +262,31 @@ def export_core(
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Export LibTorch-loadable TorchScript core model")
-    p.add_argument("--checkpoint", type=str, required=True, help="checkpoint (.pth)")
+    p = argparse.ArgumentParser(
+        description="Export LibTorch-loadable TorchScript core model. "
+                    "Model-structure hyperparameters default to checkpoint metadata; explicit CLI values override."
+    )
+    p.add_argument("--checkpoint", type=str, required=True,
+                   help="Checkpoint (.pth). Structure hyperparameters are resolved with priority: "
+                        "explicit CLI > checkpoint metadata > defaults.")
     p.add_argument("--elements", nargs="+", default=["H", "O"], help="Element order (LAMMPS type order)")
     p.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
     p.add_argument("--mode", type=str, default=None,
-                   help="Model mode. If not set, read from checkpoint. "
+                   help="Model mode. If not set, restore from checkpoint metadata. "
                         "Supported: pure-cartesian-ictd, pure-cartesian-ictd-save, spherical-save-cue")
-    p.add_argument("--max-radius", type=float, default=5.0,
-                   help="Cutoff radius (Å). Auto-read from checkpoint if saved; else use this. Must match training and LAMMPS pair_style cutoff.")
-    p.add_argument("--num-interaction", type=int, default=2)
+    p.add_argument("--max-radius", type=float, default=None,
+                   help="Override checkpoint cutoff radius (Å). If not set, restore from checkpoint metadata.")
+    p.add_argument("--num-interaction", type=int, default=None,
+                   help="Override checkpoint num_interaction. If not set, restore from checkpoint metadata.")
     p.add_argument("--dtype", type=str, default=None,
-                   help="Force export precision: float32 or float64. If not set, follow checkpoint.")
-    p.add_argument("--embed-e0", action="store_true", help="Embed per-element E0(Z) constant bias into TorchScript (option B)")
+                   help="Force export precision: float32 or float64. If not set, follow checkpoint metadata.")
+    p.add_argument("--embed-e0", action="store_true",
+                   help="Backward-compatible alias. E0 embedding is now enabled by default unless --no-embed-e0 is passed. "
+                        "When enabled, E0 is taken from --e0-csv if provided, else from checkpoint when available.")
     p.add_argument("--no-embed-e0", action="store_true", help="Do not embed E0 into TorchScript (export network energy only)")
-    p.add_argument("--e0-csv", type=str, default=None, help="E0 CSV path (Atom,E0 columns). Takes precedence if provided.")
+    p.add_argument("--e0-csv", type=str, default=None,
+                   help="E0 CSV path (Atom,E0 columns). Highest priority override for E0; "
+                        "if not set, prefer checkpoint E0 when available.")
     p.add_argument("--native-ops", action="store_true",
                    help="spherical-save-cue: keep native cuEquivariance CUDA ops (faster, but LAMMPS requires MFF_CUSTOM_OPS_LIB). "
                         "Default: pure PyTorch ops (portable, no extra deps).")
@@ -275,13 +295,13 @@ def main() -> None:
 
     device = _pick_device(args.device)
     force_dtype = _parse_dtype(args.dtype)
-    embed_e0 = bool(args.embed_e0) and not bool(args.no_embed_e0)
+    embed_e0 = not bool(args.no_embed_e0)
     export_core(
         checkpoint=args.checkpoint,
         elements=list(args.elements),
         device=device,
-        max_radius=float(args.max_radius),
-        num_interaction=int(args.num_interaction),
+        max_radius=(float(args.max_radius) if args.max_radius is not None else None),
+        num_interaction=(int(args.num_interaction) if args.num_interaction is not None else None),
         out_pt=str(args.out),
         tensor_product_mode=args.mode,
         force_dtype=force_dtype,

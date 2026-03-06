@@ -35,9 +35,16 @@ Requires-Dist: torch-scatter>=2.0.9; extra == "full"
 Requires-Dist: torch-cluster>=1.6.0; extra == "full"
 Requires-Dist: cuequivariance-torch>=0.8.1; extra == "full"
 Requires-Dist: cuequivariance-ops-torch-cu12>=0.8.1; platform_system == "Linux" and extra == "full"
+Requires-Dist: dscribe>=2.0.0; extra == "full"
+Requires-Dist: scikit-learn>=1.0.0; extra == "full"
 Provides-Extra: al
 Requires-Dist: dscribe>=2.0.0; extra == "al"
 Requires-Dist: scikit-learn>=1.0.0; extra == "al"
+Provides-Extra: soap
+Requires-Dist: dscribe>=2.0.0; extra == "soap"
+Provides-Extra: thermal
+Requires-Dist: phono3py>=2.0.0; extra == "thermal"
+Requires-Dist: scipy>=1.0.0; extra == "thermal"
 Dynamic: author
 Dynamic: author-email
 Dynamic: classifier
@@ -55,7 +62,7 @@ Dynamic: summary
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.12%2B-orange)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-**FusedSCEquiTensorPot** is an E(3)-equivariant neural potential for predicting molecular energies and forces. Built with PyTorch, it supports **eight equivariant tensor product modes**, including e3nn-based spherical harmonics, channelwise spherical backends, and multiple self-implemented Cartesian tensor product methods.
+**FusedSCEquiTensorPot** is an E(3)-equivariant neural potential for predicting molecular energies and forces. Built with PyTorch, it supports **eight equivariant tensor product modes**, including e3nn-based spherical harmonics, channelwise spherical backends, and multiple self-implemented Cartesian tensor product methods. **Highlights**: embed **external fields** (e.g., electric field) into the equivariant message passing, and train **physical tensors** (charge, dipole, polarizability, quadrupole) as supervised outputs—both supported in `pure-cartesian-ictd` mode.
 
 ## ✨ Features
 
@@ -70,6 +77,11 @@ Dynamic: summary
   - `pure-cartesian-ictd`: ICTD irreps internal representation (strictly equivariant, -72.1% params, fastest, best for memory)
   
 - **E(3)-Equivariant**: All modes maintain rotational equivariance and parity conservation
+
+- **External Fields & Physical Tensors** (pure-cartesian-ictd):
+  - **External field embedding**: Inject global tensors (e.g., electric field, rank-1) into conv1 for field-dependent potentials
+  - **Physical tensor training**: Supervised outputs for charge, dipole, polarizability, quadrupole (per-structure or per-atom)
+  - Configurable loss weights, checkpoint-based inference mode; LAMMPS/TorchScript export outputs energy+forces only
   
 - **Complete Workflow**:
   - Data preprocessing from Extended XYZ format with PBC support
@@ -77,13 +89,22 @@ Dynamic: summary
   - Evaluation: static metrics, MD, NEB, phonon spectrum
   - LAMMPS integration: LibTorch (USER-MFFTORCH), ML-IAP, fix external
   
+- **🔄 Active Learning** — *automatically grow your training set where the model is uncertain*:
+  - **One command** runs the full loop: **Train (ensemble) → Explore (MD/NEB) → Select (force deviation) → Label (DFT) → Merge → repeat**.
+  - **10+ label backends**: PySCF (no binary), VASP / CP2K / QE / Gaussian / ORCA via ASE; user script; **one script template for both local and SLURM**.
+  - **Single-node**: `--label-n-workers 8` for parallel DFT; **HPC**: one sbatch job per structure, throttle & resume.
+  - **Multi-stage**: JSON config (e.g. 300K → 600K); optional PES coverage (SOAP).
+  - **Docs**: [USAGE](USAGE.md#主动学习-mff-active-learn) (中文) · [USAGE_EN](USAGE_EN.md#active-learning-mff-active-learn) (English) · [ACTIVE_LEARNING.md](ACTIVE_LEARNING.md) (FAQ & backends).
+  
 - **CLI Commands**:
   - `mff-preprocess` - Data preprocessing
   - `mff-train` - Training
   - `mff-evaluate` - Evaluation (static/MD/NEB/phonon)
+  - `mff-active-learn` - Active learning loop (explore, select, label, merge)
   - `mff-export-core` - Export LibTorch core.pt (USER-MFFTORCH)
   - `mff-lammps` - Generate LAMMPS fix external script
   - `python -m molecular_force_field.cli.export_mliap` - Export ML-IAP format
+- `python -m molecular_force_field.cli.thermal_transport` - IFC2/IFC3, intrinsic BTE, and Callaway thermal workflow
   - `torchrun -m molecular_force_field.cli.inference_ddp` - Large-scale multi-GPU inference (pure-cartesian-ictd only)
   
 - **Easy to Use**:
@@ -199,6 +220,17 @@ mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-pr
 mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode pure-cartesian-ictd
 ```
 
+Train with external field and physical tensors (pure-cartesian-ictd only):
+
+```bash
+# External electric field + dipole/polarizability training
+mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd \
+  --external-tensor-rank 1 --external-field-file data/efield.npy \
+  --physical-tensors dipole,polarizability \
+  --dipole-file data/dipole.npy --polarizability-file data/pol.npy \
+  --physical-tensor-weights "dipole:2.0,polarizability:1.0"
+```
+
 By default, dynamic loss weights `a/b` are clamped to `[1, 1000]` (they change during training). You can override the range:
 
 ```bash
@@ -217,24 +249,13 @@ mff-train --data-dir data --atomic-energy-keys 1 6 7 8 --atomic-energy-values -4
 
 ### 3. Evaluation
 
-Evaluate a trained model (use the same tensor-product-mode as training):
+Evaluate a trained model. The recommended default is to let `mff-evaluate` restore model-structure hyperparameters and `tensor_product_mode` from the checkpoint automatically:
 
 ```bash
-# For spherical mode (default)
-mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode spherical --use-h5
-
-# For partial-cartesian mode
-mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode partial-cartesian --use-h5
-
-# For partial-cartesian-loose mode
-mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode partial-cartesian-loose --use-h5
-
-# For pure-cartesian-sparse mode
-mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode pure-cartesian-sparse --use-h5
-
-# For pure-cartesian-ictd mode
-mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --tensor-product-mode pure-cartesian-ictd --use-h5
+mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --use-h5
 ```
+
+If you explicitly pass conflicting structure arguments such as `--tensor-product-mode`, `--embedding-dim`, or `--output-size`, the CLI takes precedence over the checkpoint. For new checkpoints, `mff-evaluate` can also restore `atomic_energy_keys/atomic_energy_values` directly from the checkpoint; older checkpoints still fall back to local `fitted_E0.csv` behavior. Only pass those arguments when you intentionally want to override the checkpoint configuration.
 
 Outputs include:
 - `test_loss.csv`
@@ -267,6 +288,24 @@ Optional: stress training (PBC with stress/virial in XYZ):
 mff-train --data-dir data -c 0.1 --input-file pbc_with_stress.xyz
 ```
 
+### 4. Active Learning (Optional) 🔄
+
+> **Grow your training set automatically** where the potential is under-sampled: one CLI runs the full **train → explore → select → label (DFT) → merge** loop. Works on a single machine (PySCF, VASP, …) or on HPC (SLURM, one job per structure).
+
+```bash
+# Local: PySCF, 8 parallel workers
+mff-active-learn --explore-type ase --explore-mode md --label-type pyscf \
+    --pyscf-method b3lyp --pyscf-basis 6-31g* \
+    --label-n-workers 8 --md-steps 500 --n-iterations 5
+
+# HPC: SLURM, one job per structure
+mff-active-learn --explore-type ase --label-type slurm \
+    --slurm-template dft_job.sh --slurm-partition cpu \
+    --slurm-nodes 1 --slurm-ntasks 32 --slurm-time 04:00:00
+```
+
+📖 **Full CLI & options**: [USAGE.md](USAGE.md#主动学习-mff-active-learn) (中文) · [USAGE_EN.md](USAGE_EN.md#active-learning-mff-active-learn) (English) · [ACTIVE_LEARNING.md](ACTIVE_LEARNING.md) (backends, multi-stage, FAQ).
+
 ## LAMMPS Integration
 
 FusedSCEquiTensorPot supports three LAMMPS integration methods:
@@ -284,8 +323,10 @@ FusedSCEquiTensorPot supports three LAMMPS integration methods:
 1. **Export core.pt** (one-time, requires Python):
    ```bash
    mff-export-core --checkpoint model.pth --elements H O --device cuda \
-     --max-radius 5.0 --embed-e0 --e0-csv fitted_E0.csv --out core.pt
+     --e0-csv fitted_E0.csv --out core.pt
    ```
+
+   `mff-export-core` restores structure hyperparameters such as `tensor_product_mode`, `max_radius`, and `num_interaction` from the checkpoint by default. It now embeds E0 by default as well. New checkpoints store `atomic_energy_keys/atomic_energy_values`, so checkpoint E0 is usually enough; if `--e0-csv` is passed explicitly, the CLI wins. Older checkpoints still fall back to local `fitted_E0.csv`. Use `--no-embed-e0` only if you explicitly want to export network energy without E0.
 
 2. **Build LAMMPS**: Enable `PKG_KOKKOS` and `PKG_USER-MFFTORCH`. See [lammps_user_mfftorch/docs/BUILD_AND_RUN.md](lammps_user_mfftorch/docs/BUILD_AND_RUN.md).
 
@@ -308,10 +349,59 @@ Export ML-IAP format (requires LAMMPS built with ML-IAP):
 
 ```bash
 python -m molecular_force_field.cli.export_mliap checkpoint.pth --elements H O \
-  --atomic-energy-keys 1 8 --atomic-energy-values -13.6 -75.0 --max-radius 5.0 --output model-mliap.pt
+  --atomic-energy-keys 1 8 --atomic-energy-values -13.6 -75.0 --output model-mliap.pt
 ```
 
 Supported models: `spherical`, `spherical-save`, `spherical-save-cue`, `pure-cartesian-ictd`, `pure-cartesian-ictd-save`.
+
+Notes:
+
+- `spherical-save-cue` is automatically exported through the TorchScript path in `export_mliap`, even if `--torchscript` is not specified explicitly. This is now the default safe behavior because the plain Python pickle path is not stable for this mode.
+- `pure-cartesian` and `pure-cartesian-sparse` are still not supported by `export_mliap`.
+- `export_mliap` also restores structure hyperparameters from the checkpoint by default. If conflicting CLI values are passed explicitly, the CLI wins.
+- For new checkpoints, `export_mliap` can also restore `atomic_energy_keys/atomic_energy_values` directly from the checkpoint. Older checkpoints still fall back to local `fitted_E0.csv`.
+
+### Thermal Transport Workflow
+
+For crystalline systems, the recommended thermal-conductivity route is:
+
+1. `MLFF -> IFC2/IFC3`
+2. `IFC2/IFC3 -> intrinsic lattice thermal conductivity` via `phono3py`
+3. `intrinsic BTE -> engineering scattering / fast generalization` via a Callaway-style post-process
+
+This workflow is intentionally separate from `mff-evaluate --phonon`. The phonon mode is useful for Hessian and stability checks, while the thermal workflow is meant for actual transport calculations.
+
+Install thermal deps: `pip install -e ".[thermal]"`
+
+Minimal intrinsic BTE example:
+
+```bash
+python -m molecular_force_field.cli.thermal_transport bte \
+  --checkpoint best_model.pth \
+  --structure relaxed.cif \
+  --supercell 4 4 4 \
+  --phonon-supercell 4 4 4 \
+  --mesh 16 16 16 \
+  --temperatures 300 400 500 600 700 \
+  --output-dir thermal_bte \
+  --device cuda \
+  --atomic-energy-file fitted_E0.csv
+```
+
+Minimal Callaway post-process example:
+
+```bash
+python -m molecular_force_field.cli.thermal_transport callaway \
+  --kappa-hdf5 thermal_bte/kappa-m161616.hdf5 \
+  --output-prefix thermal_bte/callaway \
+  --component xx \
+  --grain-size-nm 200 \
+  --point-defect-coeff 1.0e-4
+```
+
+Outputs include `fc2.hdf5`, `fc3.hdf5`, `kappa-*.hdf5`, and Callaway CSV/JSON summaries.
+
+For the detailed workflow, fitting strategy, and engineering notes, see [`THERMAL_TRANSPORT.md`](THERMAL_TRANSPORT.md).
 
 See [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md) for full documentation.
 
@@ -700,6 +790,7 @@ For detailed performance comparison and recommendations, see [USAGE.md](USAGE.md
 - [USAGE.md](USAGE.md) - Full CLI and hyperparameter reference (Chinese)
 - [USAGE_EN.md](USAGE_EN.md) - Full CLI and hyperparameter reference (English)
 - [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md) - LAMMPS integration guide (LibTorch, ML-IAP, fix external)
+- [THERMAL_TRANSPORT.md](THERMAL_TRANSPORT.md) - MLFF thermal conductivity workflow (`IFC2/IFC3 -> BTE -> Callaway`)
 - [lammps_user_mfftorch/docs/BUILD_AND_RUN.md](lammps_user_mfftorch/docs/BUILD_AND_RUN.md) - LibTorch interface build and run
 
 
