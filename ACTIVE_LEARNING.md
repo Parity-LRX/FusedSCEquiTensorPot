@@ -92,10 +92,12 @@ mff-active-learn --explore-type ase --label-type local-script \
 | `--work-dir` | `al_work` | 主动学习工作目录 |
 | `--data-dir` | `data` | 训练数据目录（含 processed_train.h5 或 train.xyz） |
 | `--init-structure` | 自动从 data-dir 提取 | 一个或多个初始结构路径，或包含 .xyz 文件的目录（多结构并行探索） |
+| `--init-checkpoint` | 无 | 可选 warm start checkpoint。第 0 轮可跳过训练直接探索；1 个 checkpoint=bootstrap 模式，`n_models` 个 checkpoint=完整集成 |
 | `--n-models` | 4 | 集成模型数量 |
 | `--n-iterations` | 20 | 单阶段最大迭代次数（不用 stages 时） |
 | `--explore-type` | 必选 | 探索后端：`ase` 或 `lammps` |
 | `--explore-mode` | `md` | 探索方式：`md`（分子动力学）或 `neb`（弹性带） |
+| `--explore-n-workers` | 1 | 多结构并行探索线程数；`1`=顺序，`>1`=并发（ThreadPoolExecutor） |
 | `--label-type` | 必选 | 标注方式，见下表 |
 | `--md-temperature` | 300 | MD 温度 (K) |
 | `--md-steps` | 10000 | MD 步数 |
@@ -112,6 +114,7 @@ mff-active-learn --explore-type ase --label-type local-script \
 | `--train-master-addr` | auto | rendezvous 地址（auto=从 SLURM 或本机 hostname 解析） |
 | `--train-master-port` | 29500 | 基础端口（并行模型自动偏移避免冲突） |
 | `--train-launcher` | auto | 启动器：auto / local / slurm（SLURM 下自动分配节点子集并行训练） |
+| `--resume` | 关闭 | 从 `work_dir/al_state.json` 和已有 `iterations/iter_*` 产物恢复主动学习 |
 | `--stages` | 无 | 多阶段 JSON 文件路径 |
 | `--device` | `cuda` | 推理设备 |
 | `--max-radius` | 5.0 | 邻居搜索最大半径 (Å) |
@@ -162,20 +165,35 @@ mff-active-learn --explore-type ase --label-type local-script \
 ### 用法
 
 ```bash
-# 直接传入多个文件
+# 直接传入多个文件，顺序执行（默认）
 mff-active-learn --init-structure struct_A.xyz struct_B.xyz struct_C.xyz \
     --explore-type ase --label-type pyscf ...
 
-# 传入一个目录（自动收集所有 .xyz / .cif 文件）
+# 并行探索：同时跑 3 个 MD（每个结构占一个线程）
+mff-active-learn --init-structure struct_A.xyz struct_B.xyz struct_C.xyz \
+    --explore-n-workers 3 \
+    --explore-type ase --label-type pyscf ...
+
+# 传入一个目录（自动收集所有 .xyz / .cif 文件），并行 4 个线程
 mff-active-learn --init-structure structures/ \
+    --explore-n-workers 4 \
     --explore-type ase --label-type pyscf ...
 ```
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--explore-n-workers` | `1` | 多结构探索并行线程数；`1` = 顺序执行；`>1` 启用 `ThreadPoolExecutor` |
+
+> **注意**：每个线程会独立加载模型并占用显存/内存。GPU 机器上建议
+> `explore_n_workers × 每个 MD 的显存 ≤ 总显存`，否则请用 CPU 做 MD
+> 或减小 `--explore-n-workers`。
 
 ### 工作流程
 
 每次迭代中：
 
-1. **并行探索**：对每个初始结构分别运行 MD，生成独立子轨迹（`explore_traj_0.xyz`, `explore_traj_1.xyz`, ...）
+1. **并行探索**：`--explore-n-workers` 个线程同时从各自初始结构出发运行 MD，
+   生成独立子轨迹（`explore_traj_0.xyz`, `explore_traj_1.xyz`, ...）
 2. **轨迹合并**：合并所有子轨迹为 `explore_traj.xyz`
 3. **统一筛选**：对合并轨迹做模型偏差计算 → Layer 0/1 不确定性门控 → Layer 2 多样性筛选
 4. **标注与合并**：筛选后的候选帧统一标注并合入训练集
@@ -410,15 +428,54 @@ mff-active-learn --explore-type ase --label-type slurm \
     --stages stages.json --label-error-handling skip
 ```
 
-**多结构并行探索（不同构型/分子共同学习）：**
+**多结构并行探索（不同构型/分子共同学习，并发 3 线程）：**
 
 ```bash
 mff-active-learn --explore-type ase --label-type pyscf \
     --init-structure mol_A.xyz mol_B.xyz mol_C.xyz \
+    --explore-n-workers 3 \
     --pyscf-method b3lyp --pyscf-basis 6-31g* \
     --diversity-metric soap --max-candidates-per-iter 50 \
     --md-steps 1000 --n-iterations 10
 ```
+
+**从已有 checkpoint 直接开始第 0 轮探索（跳过首轮训练）：**
+
+```bash
+# 单 checkpoint：bootstrap 模式
+# 第 0 轮直接 MD -> 候选/多样性 -> 标注，不走 uncertainty gate
+mff-active-learn --explore-type ase --label-type pyscf \
+    --init-structure seed.xyz \
+    --init-checkpoint warm_start.pth \
+    --n-models 4 \
+    --md-steps 1000 --n-iterations 10
+
+# 完整集成 warm start：提供 n_models 个 checkpoint
+# 第 0 轮仍跳过训练，但可直接计算 ensemble deviation
+mff-active-learn --explore-type ase --label-type pyscf \
+    --init-structure seed.xyz \
+    --init-checkpoint model_0.pth model_1.pth model_2.pth model_3.pth \
+    --n-models 4 \
+    --md-steps 1000 --n-iterations 10
+```
+
+**主动学习中断后恢复：**
+
+```bash
+mff-active-learn --work-dir al_work --data-dir data \
+    --explore-type ase --label-type pyscf \
+    --init-structure seed.xyz \
+    --resume
+```
+
+恢复时会自动读取 `al_state.json`，并尽量复用已有的：
+
+1. `checkpoint/` 训练结果
+2. `explore_traj.xyz`
+3. `model_devi.out`
+4. `candidate.xyz`
+5. `labeled.xyz`
+6. `merge.done`
 
 **NEB 探索：**
 
@@ -439,7 +496,26 @@ mff-active-learn --explore-type ase --explore-mode neb \
 
 ### Q: 如何从上次中断处继续？
 
-SLURM 模式下，若某结构的 `output.xyz` 已存在，会自动跳过该结构的提交。本地模式下，需手动处理或使用 `--label-error-handling skip` 跳过失败结构。
+直接加 `--resume` 重新运行即可。主动学习会读取 `work_dir/al_state.json`，并自动复用当前 `iterations/iter_*` 下已存在的训练 checkpoint、探索轨迹、`model_devi.out`、候选集、标注结果和 `merge.done` 标记。
+
+这意味着：
+
+1. 若上次中断在训练后、探索前，会复用已训练好的 checkpoint
+2. 若中断在探索后、标注前，会复用轨迹和 `model_devi.out`
+3. 若中断在 merge 过程中，成功 merge 后会写 `merge.done`，下次 resume 不会重复 merge
+
+对于 `slurm` 标注器，其内部也仍然会跳过已有 `output.xyz` 的结构任务。
+
+### Q: 只有一个初始 checkpoint，也能直接开始主动学习吗？
+
+可以。传 `--init-checkpoint warm_start.pth` 后，第 0 轮会进入 **bootstrap 模式**：
+
+1. 跳过训练
+2. 直接用该 checkpoint 跑 MD 探索
+3. 将探索帧直接送入候选池，再做可选多样性筛选和标注
+
+由于单 checkpoint 无法计算 ensemble deviation，第 0 轮不会走 Layer 0/1 uncertainty gate。
+从第 1 轮开始会恢复正常的“训练集成 -> deviation -> 筛样”流程。
 
 ### Q: 输出 extended XYZ 格式要求？
 
@@ -454,3 +530,78 @@ mff-active-learn --help
 ### Q: 训练超参数如何传递？
 
 `--epochs` 会传给内部 `mff-train`。其他训练参数可通过扩展 `train_args` 传入（当前 CLI 仅暴露 `--epochs`）。
+
+---
+
+## ASE Calculator 进阶用法
+
+`MyE3NNCalculator` 支持当前实现中的全部 `tensor_product_mode`，还提供外场和物理张量输出的扩展接口。
+
+### 1. 所有张量积模式
+
+以下模式均可通过 `build_e3trans_from_checkpoint` 加载后传给 `MyE3NNCalculator`：
+
+| 模式 | 说明 |
+|------|------|
+| `spherical` | 标准球谐 TP |
+| `spherical-save` | 节省显存版球谐 TP |
+| `spherical-save-cue` | CUE 算子加速版球谐 TP（新增） |
+| `partial-cartesian` | 部分笛卡尔 TP |
+| `partial-cartesian-loose` | 宽松版部分笛卡尔 TP |
+| `pure-cartesian` | 纯笛卡尔 TP |
+| `pure-cartesian-sparse` | 稀疏纯笛卡尔 TP |
+| `pure-cartesian-ictd` | ICTD 纯笛卡尔 TP（支持外场和物理张量） |
+| `pure-cartesian-ictd-save` | 节省显存版 ICTD |
+
+### 2. 外场支持（ICTD 模型）
+
+若模型训练时启用了 `--external-tensor-rank`（如电场、磁场），需在 Calculator 中传入 `external_tensor`：
+
+```python
+import torch
+from molecular_force_field.evaluation.calculator import MyE3NNCalculator
+from molecular_force_field.active_learning.model_loader import build_e3trans_from_checkpoint
+
+device = torch.device("cuda")
+model, config = build_e3trans_from_checkpoint("checkpoint.pt", device)
+ref_dict = dict(zip(
+    [k.item() for k in config.atomic_energy_keys],
+    [v.item() for v in config.atomic_energy_values],
+))
+
+# 电场向量 (3,)，单位 V/Å
+E_field = torch.tensor([0.0, 0.0, 0.01], device=device, dtype=torch.float64)
+
+calc = MyE3NNCalculator(
+    model, ref_dict, device, max_radius=5.0,
+    external_tensor=E_field,
+)
+atoms.calc = calc
+energy = atoms.get_potential_energy()  # 含电场项
+```
+
+`external_tensor=None`（默认）表示无外场，与非 ICTD 模型完全兼容。
+
+### 3. 物理张量输出（如偶极矩、极化率）
+
+ICTD 模型可选择性地输出多极矩或极化率等物理张量：
+
+```python
+calc = MyE3NNCalculator(
+    model, ref_dict, device, max_radius=5.0,
+    return_physical_tensors=True,
+)
+atoms.calc = calc
+atoms.get_potential_energy()
+
+# 结果存储在 results["physical_tensors"]：
+# 格式：{名称: {l阶: np.ndarray(...)}}
+pt = calc.results["physical_tensors"]
+dipole = pt["dipole"][1]      # l=1 张量（3 个分量）
+polar  = pt["polarizability"][2]  # l=2 张量（5 个分量）
+```
+
+> **注意**：只有使用 `--physical-tensors` 训练的 ICTD 检查点才有物理张量输出头。
+> 普通模型传入 `return_physical_tensors=True` 会引发错误。
+
+

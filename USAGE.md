@@ -941,10 +941,12 @@ mff-active-learn --help
 | `--work-dir` | `al_work` | 主动学习工作目录 |
 | `--data-dir` | `data` | 训练数据目录（需含 processed_train.h5 或 train.xyz） |
 | `--init-structure` | 从 data-dir 自动提取 | 一个或多个初始结构路径（多结构并行探索），或包含 .xyz 文件的目录 |
+| `--init-checkpoint` | 无 | 可选 warm start checkpoint。第 0 轮可跳过训练直接探索；1 个 checkpoint=bootstrap，`n_models` 个 checkpoint=完整集成 |
 | `--n-models` | 4 | 集成模型数量 |
 | `--n-iterations` | 20 | 单阶段最大迭代次数（未用 --stages 时） |
 | `--explore-type` | 必选 | 探索后端：`ase` 或 `lammps` |
 | `--explore-mode` | `md` | 探索方式：`md`（分子动力学）或 `neb`（弹性带） |
+| `--explore-n-workers` | `1` | 多结构并行探索线程数；`1`=顺序，`>1`=并发（ThreadPoolExecutor） |
 | `--label-type` | 必选 | 标注方式，见下表 |
 | `--md-temperature` | 300 | MD 温度 (K) |
 | `--md-steps` | 10000 | MD 步数 |
@@ -961,6 +963,7 @@ mff-active-learn --help
 | `--train-master-addr` | auto | rendezvous 地址。`auto`=从 SLURM 或本机 hostname 解析 |
 | `--train-master-port` | 29500 | 基础端口。并行模型自动偏移 (`+slot`) 避免端口冲突 |
 | `--train-launcher` | auto | 启动器：`auto` / `local` / `slurm`。SLURM 下自动按节点子集分配 `--nodelist` |
+| `--resume` | 关闭 | 从 `work_dir/al_state.json` 和已有 `iterations/iter_*` 产物恢复主动学习 |
 | `--stages` | 无 | 多阶段 JSON 文件路径 |
 | `--device` | `cuda` | 推理设备 |
 | `--max-radius` | 5.0 | 邻居搜索最大半径 (Å) |
@@ -1021,6 +1024,33 @@ mff-active-learn --explore-type ase --explore-mode md --label-type identity \
 mff-active-learn --explore-type ase --explore-mode md --label-type pyscf \
     --pyscf-method b3lyp --pyscf-basis 6-31g* \
     --label-n-workers 8 --md-steps 500 --n-iterations 5
+```
+
+**从已有 checkpoint 直接开始第 0 轮探索：**
+
+```bash
+# 单 checkpoint bootstrap：第 0 轮跳过训练，直接 MD -> 候选/多样性 -> 标注
+mff-active-learn --explore-type ase --label-type pyscf \
+    --init-structure seed.xyz \
+    --init-checkpoint warm_start.pth \
+    --n-models 4 \
+    --md-steps 1000 --n-iterations 10
+
+# 若已有完整集成，可直接给 n_models 个 checkpoint
+mff-active-learn --explore-type ase --label-type pyscf \
+    --init-structure seed.xyz \
+    --init-checkpoint model_0.pth model_1.pth model_2.pth model_3.pth \
+    --n-models 4 \
+    --md-steps 1000 --n-iterations 10
+```
+
+**主动学习中断后恢复：**
+
+```bash
+mff-active-learn --work-dir al_work --data-dir data \
+    --explore-type ase --label-type pyscf \
+    --init-structure seed.xyz \
+    --resume
 ```
 
 **VASP（单节点，ASE 接口）：**
@@ -1300,7 +1330,8 @@ ORCA 和 QE 可通过 `--orca-command`、`--qe-command` 指定，或确保可执
 ### 常见问题（FAQ）
 
 - **初始结构从哪里来？** 未指定 `--init-structure` 时，从 `--data-dir` 的 `train.xyz` 或 `processed_train.h5` 取第一个结构。支持传入多个文件或一个目录实现**多结构并行探索**：`--init-structure A.xyz B.xyz` 或 `--init-structure structures/`。
-- **如何从上次中断处继续？** SLURM 模式下，若某结构的 `output.xyz` 已存在会自动跳过；本地模式可用 `--label-error-handling skip` 跳过失败结构继续。
+- **如何从已有 checkpoint 直接开始主动学习？** 用 `--init-checkpoint`。若只给 1 个 checkpoint，第 0 轮进入 bootstrap 模式：跳过训练，直接 MD 采样并把探索帧送去多样性筛选/标注；若给 `n_models` 个 checkpoint，则第 0 轮仍跳过训练，但可以直接计算 ensemble deviation。
+- **如何从中断处继续？** 重新执行同一条命令并加 `--resume`。程序会读取 `work_dir/al_state.json`，并复用已有的 checkpoint、`explore_traj.xyz`、`model_devi.out`、`candidate.xyz`、`labeled.xyz` 和 `merge.done`，避免重复训练/探索/标注/merge。对标注阶段而言，`slurm` 和 `local-script` 标注器还会进一步按结构级别检查已有的 `output.xyz` 并跳过已完成任务；其他本地标注器不做 `output.xyz` 级 resume，但仍可通过 `--label-error-handling skip` 在单个结构失败后继续剩余任务。
 - **输出 XYZ 格式要求？** 标注器输出的 XYZ 需包含 `Properties=species:S:1:pos:R:3:energy:R:1:forces:R:3`，能量 eV，力 eV/Å。
 - **训练超参数？** `--epochs` 会传给内部 `mff-train`；当前 CLI 仅暴露 `--epochs`，其余见训练章节。
 

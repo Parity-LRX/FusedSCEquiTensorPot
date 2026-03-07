@@ -932,10 +932,12 @@ mff-active-learn --help
 | `--work-dir` | `al_work` | Active learning working directory |
 | `--data-dir` | `data` | Training data directory (must contain processed_train.h5 or train.xyz) |
 | `--init-structure` | Auto from data-dir | One or more initial structure paths (multi-structure parallel exploration), or a directory of .xyz files |
+| `--init-checkpoint` | None | Optional warm-start checkpoint(s). Iteration 0 can skip training and explore directly; 1 checkpoint=bootstrap mode, `n_models` checkpoints=full ensemble |
 | `--n-models` | 4 | Number of ensemble models |
 | `--n-iterations` | 20 | Max iterations per stage (when not using --stages) |
 | `--explore-type` | Required | Exploration backend: `ase` or `lammps` |
 | `--explore-mode` | `md` | Exploration mode: `md` (molecular dynamics) or `neb` (elastic band) |
+| `--explore-n-workers` | `1` | Parallel workers for multi-structure exploration; `1`=sequential, `>1`=concurrent threads (ThreadPoolExecutor) |
 | `--label-type` | Required | Labeling method, see table below |
 | `--md-temperature` | 300 | MD temperature (K) |
 | `--md-steps` | 10000 | MD steps |
@@ -952,6 +954,7 @@ mff-active-learn --help
 | `--train-master-addr` | auto | Rendezvous address. `auto`=resolve from SLURM or local hostname |
 | `--train-master-port` | 29500 | Base port. Parallel models auto-offset (`+slot`) to avoid collisions |
 | `--train-launcher` | auto | Launcher: `auto` / `local` / `slurm`. SLURM auto-assigns disjoint `--nodelist` per model |
+| `--resume` | Off | Resume active learning from `work_dir/al_state.json` and existing `iterations/iter_*` artifacts |
 | `--stages` | None | Path to multi-stage JSON file |
 | `--device` | `cuda` | Inference device |
 | `--max-radius` | 5.0 | Neighbor search cutoff (Å) |
@@ -1012,6 +1015,35 @@ mff-active-learn --explore-type ase --explore-mode md --label-type identity \
 mff-active-learn --explore-type ase --explore-mode md --label-type pyscf \
     --pyscf-method b3lyp --pyscf-basis 6-31g* \
     --label-n-workers 8 --md-steps 500 --n-iterations 5
+```
+
+**Start iteration 0 directly from an existing checkpoint:**
+
+```bash
+# Single-checkpoint bootstrap:
+# iteration 0 skips training and goes directly to MD -> candidate/diversity -> labeling
+mff-active-learn --explore-type ase --label-type pyscf \
+    --init-structure seed.xyz \
+    --init-checkpoint warm_start.pth \
+    --n-models 4 \
+    --md-steps 1000 --n-iterations 10
+
+# Full warm-start ensemble:
+# provide n_models checkpoints to keep ensemble deviation in iteration 0
+mff-active-learn --explore-type ase --label-type pyscf \
+    --init-structure seed.xyz \
+    --init-checkpoint model_0.pth model_1.pth model_2.pth model_3.pth \
+    --n-models 4 \
+    --md-steps 1000 --n-iterations 10
+```
+
+**Resume interrupted active learning:**
+
+```bash
+mff-active-learn --work-dir al_work --data-dir data \
+    --explore-type ase --label-type pyscf \
+    --init-structure seed.xyz \
+    --resume
 ```
 
 **VASP (single-node, ASE interface):**
@@ -1256,7 +1288,8 @@ The script must produce `{output_xyz}` as extended XYZ with `Properties=species:
 | `--slurm-extra` | None | Extra sbatch args, e.g. `--account=myproject` |
 | `--slurm-cleanup` | False | Remove run dirs after success |
 
-If a structure’s `output.xyz` already exists (e.g. after resume), that structure is skipped.
+For `slurm` and `local-script` labelers, if a structure’s `output.xyz` already exists
+(e.g. after resume), that structure is skipped.
 
 ### Environment variables
 
@@ -1273,7 +1306,8 @@ ORCA and QE can use `--orca-command` / `--qe-command` or have executables on PAT
 ### FAQ
 
 - **Where does the initial structure come from?** If `--init-structure` is not set, the first structure is taken from `train.xyz` or `processed_train.h5` in `--data-dir`. You can pass multiple files or a directory for **multi-structure parallel exploration**: `--init-structure A.xyz B.xyz` or `--init-structure structures/`.
-- **How to resume after interruption?** In SLURM mode, structures with existing `output.xyz` are skipped. Locally, use `--label-error-handling skip` to skip failed structures and continue.
+- **How do I start active learning from an existing checkpoint?** Use `--init-checkpoint`. With a single checkpoint, iteration 0 enters bootstrap mode: training is skipped, MD exploration starts immediately, and explored frames are sent directly to candidate/diversity/labeling. With `n_models` checkpoints, iteration 0 still skips training but keeps full ensemble deviation.
+- **How to resume after interruption?** Re-run the command with `--resume`. The loop loads `work_dir/al_state.json` and reuses existing checkpoints, `explore_traj.xyz`, `model_devi.out`, `candidate.xyz`, `labeled.xyz`, and `merge.done`, so completed steps are not repeated. SLURM labelers still skip structures whose `output.xyz` already exists.
 - **Output XYZ format?** Labeler output must be extended XYZ with `Properties=species:S:1:pos:R:3:energy:R:1:forces:R:3`, energy in eV, forces in eV/Å.
 - **Training hyperparameters?** `--epochs` is passed to the internal `mff-train`; the CLI currently only exposes `--epochs` (see training section for others).
 

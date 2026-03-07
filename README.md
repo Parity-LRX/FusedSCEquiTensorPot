@@ -583,29 +583,60 @@ model = MainNet(
 
 ```
 rebuild/
-├── molecular_force_field/         # Main package
-│   ├── models/                    # Model definitions (eight tensor product modes)
-│   │   ├── e3nn_layers.py        # Spherical mode (e3nn-based)
-│   │   ├── cartesian_e3_layers.py    # Partial-cartesian modes
-│   │   ├── pure_cartesian*.py    # Pure-cartesian modes
+├── molecular_force_field/              # Main package
+│   ├── models/                          # Model definitions (eight tensor product modes)
+│   │   ├── e3nn_layers.py              # Spherical mode (e3nn-based)
+│   │   ├── e3nn_layers_channelwise.py  # spherical-save
+│   │   ├── cartesian_e3_layers.py      # partial-cartesian, partial-cartesian-loose
+│   │   ├── pure_cartesian*.py          # pure-cartesian, pure-cartesian-sparse
+│   │   ├── pure_cartesian_ictd*.py      # pure-cartesian-ictd
+│   │   ├── cue_layers*.py              # spherical-save-cue (cuEquivariance)
 │   │   ├── mlp.py, losses.py
 │   │   └── ...
-│   ├── data/                      # Dataset and preprocessing
-│   ├── utils/                     # Configuration, graph utilities
-│   ├── training/                  # Trainer
-│   ├── evaluation/                # Evaluator, ASE Calculator
-│   ├── interfaces/                # LAMMPS potential, ML-IAP
-│   │   ├── lammps_potential.py   # fix external / pair_style python
-│   │   └── lammps_mliap.py      # ML-IAP unified
-│   └── cli/                       # Command-line interfaces
-│       ├── train.py, evaluate.py, preprocess.py
-│       ├── lammps_interface.py   # fix external interface
-│       ├── export_libtorch_core.py  # Export LibTorch core.pt
-│       ├── export_mliap.py        # Export ML-IAP format
-│       └── inference_ddp.py      # Large-scale multi-GPU inference
-└── lammps_user_mfftorch/          # LAMMPS LibTorch package (USER-MFFTORCH)
-    ├── src/USER-MFFTORCH/         # pair_style mff/torch source
-    └── docs/BUILD_AND_RUN.md      # Build and run guide
+│   ├── data/                            # Dataset and preprocessing
+│   │   ├── datasets.py, preprocessing.py, collate.py
+│   │   └── ...
+│   ├── utils/                           # Configuration, graph utilities
+│   │   ├── config.py, graph_utils.py, scatter.py, checkpoint_metadata.py
+│   │   └── ...
+│   ├── training/                        # Trainer
+│   │   ├── trainer.py, schedulers.py
+│   │   └── ...
+│   ├── evaluation/                      # Evaluator, ASE Calculator
+│   │   ├── evaluator.py, calculator.py
+│   │   └── ...
+│   ├── active_learning/                 # Active learning loop
+│   │   ├── loop.py                     # Main AL loop (train → explore → select → label → merge)
+│   │   ├── train_ensemble.py           # Multi-model parallel training (DDP, cross-node)
+│   │   ├── labeling.py                 # DFT labelers (PySCF, VASP, script, SLURM, ...)
+│   │   ├── diversity_selector.py       # SOAP / devi_hist + FPS
+│   │   ├── exploration.py, model_devi.py, data_merge.py, stage_scheduler.py
+│   │   ├── init_data.py                # Cold-start perturbation
+│   │   └── ...
+│   ├── thermal/                         # Thermal transport (IFC2/IFC3, BTE, Callaway)
+│   │   ├── model_loader.py, callaway.py
+│   │   └── ...
+│   ├── interfaces/                      # LAMMPS potential, ML-IAP
+│   │   ├── lammps_potential.py         # fix external / pair_style python
+│   │   └── lammps_mliap.py             # ML-IAP unified
+│   └── cli/                             # Command-line interfaces
+│       ├── train.py                     # mff-train (supports --n-gpu, --nnodes)
+│       ├── preprocess.py                # mff-preprocess
+│       ├── evaluate.py                  # mff-evaluate (static/MD/NEB/phonon)
+│       ├── active_learning.py           # mff-active-learn
+│       ├── init_data.py                 # mff-init-data (cold-start)
+│       ├── lammps_interface.py          # mff-lammps (fix external)
+│       ├── export_libtorch_core.py      # mff-export-core
+│       ├── export_mliap.py              # ML-IAP export
+│       ├── inference_ddp.py             # Large-scale multi-GPU inference
+│       ├── thermal_transport.py         # IFC2/IFC3, BTE, Callaway
+│       └── evaluate_pes_coverage.py     # PES coverage (SOAP)
+├── lammps_user_mfftorch/                # LAMMPS LibTorch package (USER-MFFTORCH)
+│   ├── src/USER-MFFTORCH/               # pair_style mff/torch source
+│   └── docs/BUILD_AND_RUN.md            # Build and run guide
+├── scripts/                             # Install scripts, smoke tests
+├── test/                                # Unit tests, benchmarks
+└── docs/                                # Additional docs (LAMMPS, thermal)
 ```
 
 ## Requirements

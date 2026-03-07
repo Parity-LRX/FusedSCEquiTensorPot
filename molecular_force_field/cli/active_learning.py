@@ -181,12 +181,40 @@ def main():
     )
     parser.add_argument("--label-script", type=str, default=None)
     parser.add_argument("--identity-checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--init-checkpoint", type=str, nargs="+", default=None,
+        help=(
+            "One or more checkpoints used to bootstrap active learning. "
+            "When provided, iteration 0 skips training and directly explores "
+            "with these checkpoint(s). Provide either 1 checkpoint "
+            "(bootstrap iteration 0 will skip uncertainty gating and promote "
+            "explored frames directly), or exactly --n-models checkpoints "
+            "(full ensemble deviation is available in iteration 0)."
+        ),
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help=(
+            "Resume an interrupted active-learning run from work_dir/al_state.json "
+            "and reuse existing checkpoints / trajectories / labeled files under "
+            "iterations/iter_*."
+        ),
+    )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--max-radius", type=float, default=5.0)
     parser.add_argument("--atomic-energy-file", type=str, default=None)
     parser.add_argument("--neb-initial", type=str, default=None)
     parser.add_argument("--neb-final", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument(
+        "--explore-n-workers", type=int, default=1,
+        help=(
+            "Number of parallel workers for multi-structure exploration. "
+            "1 (default): sequential. "
+            ">1: launch that many concurrent threads via ThreadPoolExecutor. "
+            "Only has effect when multiple --init-structure paths are given."
+        ),
+    )
     parser.add_argument(
         "--train-n-gpu", type=int, default=1,
         help=(
@@ -752,6 +780,9 @@ def main():
         fail_strategy=args.fail_strategy,
         fail_max_select=args.fail_max_select,
         explore_structures=init_structs,
+        explore_n_workers=args.explore_n_workers,
+        initial_checkpoint_paths=args.init_checkpoint,
+        resume=args.resume,
         n_gpu=args.train_n_gpu,
         max_parallel=args.train_max_parallel,
         nnodes=args.train_nnodes,
