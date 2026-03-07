@@ -28,6 +28,7 @@ class ModelDeviCalculator:
         atomic_energy_file: Optional[str] = None,
         tensor_product_mode: Optional[str] = None,
         num_interaction: int = 2,
+        external_field: Optional[list] = None,
     ):
         self.device = device
         self.models = []
@@ -46,6 +47,13 @@ class ModelDeviCalculator:
         self.max_radius = self.config.max_radius
         self.keys = self.config.atomic_energy_keys.to(device)
         self.values = self.config.atomic_energy_values.to(device)
+        self.external_tensor = None
+        if external_field is not None:
+            from molecular_force_field.active_learning.data_merge import external_field_tensor_shape
+            shape = external_field_tensor_shape(len(external_field))
+            self.external_tensor = torch.tensor(
+                external_field, dtype=torch.float64, device=device
+            ).reshape(shape)
 
     def _predict_one(self, atoms, model_idx: int) -> tuple:
         """Return (energy, forces) for one model."""
@@ -73,7 +81,10 @@ class ModelDeviCalculator:
         model = self.models[model_idx]
         mapped_A = map_tensor_values(A, self.keys, self.values)
         E_offset = mapped_A.sum()
-        atom_energies = model(pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
+        fwd_kwargs = {}
+        if self.external_tensor is not None:
+            fwd_kwargs["external_tensor"] = self.external_tensor
+        atom_energies = model(pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell, **fwd_kwargs)
         E_total = atom_energies.sum() + E_offset
         grads = torch.autograd.grad(E_total, pos)[0]
         forces = -grads.detach().cpu().numpy()

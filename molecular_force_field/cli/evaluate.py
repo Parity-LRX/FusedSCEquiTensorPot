@@ -114,7 +114,19 @@ def main():
     parser.add_argument('--quadrupole-file', type=str, default=None,
                         help='Per-structure quadrupole label file (Bx3x3)')
     parser.add_argument('--external-field-file', type=str, default=None,
-                        help='Per-structure external field file (Bx3, for pure-cartesian-ictd)')
+                        help='Per-structure external field file (Bx3, for pure-cartesian-ictd). '
+                             'Mutually exclusive with --external-field-value.')
+    parser.add_argument('--external-field-value', type=float, nargs='+', default=None,
+                        metavar='V',
+                        help=(
+                            'Uniform external field applied to ALL samples (injected into H5). '
+                            'Number of values must equal 3^rank (Cartesian tensor, row-major). '
+                            'Mutually exclusive with --external-field-file.\n'
+                            '  rank 0 (1 value):  scalar field strength\n'
+                            '  rank 1 (3 values): Fx  Fy  Fz  (Cartesian x/y/z, e.g. electric field V/Å)\n'
+                            '  rank 2 (9 values): Txx Txy Txz  Tyx Tyy Tyz  Tzx Tzy Tzz  (3×3 row-major)\n'
+                            '  rank L (3^L values): full rank-L Cartesian tensor, row-major'
+                        ))
     parser.add_argument('--extra-per-node-file', type=str, default=None,
                         help='Per-node label HDF5 (charge_per_atom, dipole_per_atom, etc.)')
     
@@ -748,6 +760,14 @@ def main():
             logging.info(f"  - {args.cell_file}")
         
         # Static evaluation
+        if args.external_field_file and args.external_field_value:
+            raise ValueError("--external-field-file and --external-field-value are mutually exclusive")
+        if args.external_field_value:
+            from molecular_force_field.active_learning.data_merge import _inject_external_field_into_h5
+            h5_path = os.path.join(args.data_dir, f"processed_{args.test_prefix}.h5")
+            if os.path.exists(h5_path):
+                _inject_external_field_into_h5(h5_path, args.external_field_value)
+
         extra_label_paths = {}
         if args.charge_file:
             extra_label_paths["charge"] = args.charge_file

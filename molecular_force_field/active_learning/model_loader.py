@@ -32,6 +32,12 @@ def build_e3trans_from_checkpoint(
         )
     max_radius = float(ckpt.get("max_radius", 5.0))
 
+    external_tensor_rank = ckpt.get("external_tensor_rank")
+    if external_tensor_rank is None:
+        state = ckpt.get("e3trans_state_dict", {})
+        if "e3_conv_emb.external_tensor_scale_by_l" in state:
+            external_tensor_rank = 1
+
     config = ModelConfig(dtype=torch.float64, max_radius=max_radius)
     if atomic_energy_file and os.path.exists(atomic_energy_file):
         config.load_atomic_energies_from_file(atomic_energy_file)
@@ -122,11 +128,16 @@ def build_e3trans_from_checkpoint(
             **k_cartesian, max_rank_other=1, k_policy="k0"
         )
     elif mode == "pure-cartesian-ictd":
-        e3trans = PureCartesianICTDTransformerLayerFull(
-            **k_cartesian,
+        ictd_kwargs = dict(
             ictd_tp_path_policy="full",
             ictd_tp_max_rank_other=None,
             internal_compute_dtype=dtype,
+        )
+        if external_tensor_rank is not None:
+            ictd_kwargs["external_tensor_rank"] = external_tensor_rank
+        e3trans = PureCartesianICTDTransformerLayerFull(
+            **k_cartesian,
+            **ictd_kwargs,
         )
     elif mode == "pure-cartesian-ictd-save":
         e3trans = PureCartesianICTDTransformerLayer(

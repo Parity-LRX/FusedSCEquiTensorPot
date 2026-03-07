@@ -207,6 +207,42 @@ def main():
     parser.add_argument("--neb-final", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument(
+        "--tensor-product-mode", type=str, default=None,
+        help=(
+            "Tensor product mode for training (e.g. pure-cartesian-ictd, spherical). "
+            "Passed to mff-train. If not set, mff-train uses its default."
+        ),
+    )
+    parser.add_argument(
+        "--external-tensor-rank", type=int, default=None,
+        help=(
+            "External tensor rank for conv1 injection (e.g. 1 for electric field). "
+            "Requires --external-field-file. Only for pure-cartesian-ictd. "
+            "Passed to mff-train."
+        ),
+    )
+    parser.add_argument(
+        "--external-field-file", type=str, default=None,
+        help=(
+            "Per-structure external field file (.npy, shape N×3 for rank-1). "
+            "Requires --external-tensor-rank. Passed to mff-train."
+        ),
+    )
+    parser.add_argument(
+        "--explore-external-field", type=float, nargs='+', default=None,
+        metavar='V',
+        help=(
+            "Uniform external field applied during MD exploration, model "
+            "deviation, identity labeling, and auto-injected into H5 for "
+            "training. Number of values must equal 3^rank (Cartesian tensor, "
+            "row-major). Auto-sets --external-tensor-rank if not given.\n"
+            "  rank 0 (1 value):  scalar field strength\n"
+            "  rank 1 (3 values): Fx  Fy  Fz  (Cartesian x/y/z, e.g. electric field V/Å)\n"
+            "  rank 2 (9 values): Txx Txy Txz  Tyx Tyy Tyz  Tzx Tzy Tzz  (3×3 row-major)\n"
+            "  rank L (3^L values): full rank-L Cartesian tensor, row-major"
+        ),
+    )
+    parser.add_argument(
         "--explore-n-workers", type=int, default=1,
         help=(
             "Number of parallel workers for multi-structure exploration. "
@@ -528,6 +564,8 @@ def main():
     # Accepts **kwargs so loop.py can pass input_structure / output_traj
     # for multi-structure parallel exploration.
     # ------------------------------------------------------------------ #
+    efield = args.explore_external_field  # None or [fx, fy, fz]
+
     def explore_fn(iter_idx, checkpoint_path, stage, **kwargs):
         struct = kwargs.get("input_structure", init_structs[0])
         out_traj = kwargs.get(
@@ -552,6 +590,7 @@ def main():
                     friction=stage.friction,
                     relax_fmax=stage.relax_fmax,
                     log_interval=stage.log_interval,
+                    external_field=efield,
                 )
             else:
                 if not args.neb_initial or not args.neb_final:
@@ -564,6 +603,7 @@ def main():
                     device=args.device,
                     max_radius=args.max_radius,
                     atomic_energy_file=e0_path,
+                    external_field=efield,
                 )
         else:
             raise NotImplementedError("LAMMPS: use run_lammps_md with custom template")
@@ -734,8 +774,40 @@ def main():
                 device=args.device,
                 max_radius=args.max_radius,
                 atomic_energy_file=e0_path,
+                external_field=efield,
             )
             return labeler.label(candidate_path, output_path, work_dir, checkpoint_path)
+
+    # ------------------------------------------------------------------ #
+    # External field validation & auto-inference
+    # ------------------------------------------------------------------ #
+    if args.explore_external_field:
+        from molecular_force_field.active_learning.data_merge import (
+            external_field_tensor_shape,
+            _inject_external_field_into_h5,
+        )
+        shape = external_field_tensor_shape(len(args.explore_external_field))
+        inferred_rank = len(shape) if shape != (1,) else 0
+        if args.external_tensor_rank is None:
+            args.external_tensor_rank = inferred_rank
+            logging.info(
+                f"Auto-set --external-tensor-rank={inferred_rank} from "
+                f"--explore-external-field ({len(args.explore_external_field)} values)"
+            )
+        elif args.external_tensor_rank != inferred_rank:
+            raise ValueError(
+                f"--external-tensor-rank={args.external_tensor_rank} conflicts with "
+                f"--explore-external-field ({len(args.explore_external_field)} values → rank {inferred_rank})"
+            )
+        for prefix in ("train", "val"):
+            hp = os.path.join(args.data_dir, f"processed_{prefix}.h5")
+            if os.path.exists(hp):
+                _inject_external_field_into_h5(hp, args.explore_external_field)
+
+    if args.external_field_file and not args.external_tensor_rank:
+        raise ValueError("--external-field-file requires --external-tensor-rank (e.g. 1 for electric field)")
+    if args.external_tensor_rank and args.tensor_product_mode != "pure-cartesian-ictd":
+        raise ValueError("--external-tensor-rank only supported for --tensor-product-mode pure-cartesian-ictd")
 
     # ------------------------------------------------------------------ #
     # Extra train args
@@ -743,6 +815,12 @@ def main():
     train_args = []
     if args.epochs is not None:
         train_args.extend(["--epochs", str(args.epochs)])
+    if args.tensor_product_mode is not None:
+        train_args.extend(["--tensor-product-mode", args.tensor_product_mode])
+    if args.external_tensor_rank is not None:
+        train_args.extend(["--external-tensor-rank", str(args.external_tensor_rank)])
+    if args.external_field_file is not None:
+        train_args.extend(["--external-field-file", os.path.abspath(args.external_field_file)])
 
     # ------------------------------------------------------------------ #
     # Build DiversitySelector (Layer 2)
@@ -789,6 +867,7 @@ def main():
         master_addr=args.train_master_addr,
         master_port=args.train_master_port,
         launcher=args.train_launcher,
+        external_field=efield,
     )
 
 

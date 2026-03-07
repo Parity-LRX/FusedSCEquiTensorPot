@@ -66,6 +66,58 @@ def _read_existing_blocks(data_dir: str, prefix: str = "train"):
     return blocks, raw_E, cells, pbcs, stresses
 
 
+def external_field_tensor_shape(n_values: int) -> tuple:
+    """Infer Cartesian tensor shape from the number of flat values.
+
+    Returns
+    -------
+    tuple
+        ``(1,)`` for rank-0 (1 value),
+        ``(3,)`` for rank-1 (3 values),
+        ``(3, 3)`` for rank-2 (9 values),
+        ``(3, 3, 3)`` for rank-3 (27 values), etc.
+
+    Raises
+    ------
+    ValueError
+        If *n_values* is not a power of 3.
+    """
+    if n_values == 1:
+        return (1,)
+    rank = 0
+    p = 1
+    while p < n_values:
+        rank += 1
+        p *= 3
+    if p != n_values:
+        raise ValueError(
+            f"External field has {n_values} values; "
+            f"must be 3^L for some L >= 0 (1, 3, 9, 27, …)"
+        )
+    return (3,) * rank
+
+
+def _inject_external_field_into_h5(
+    h5_path: str,
+    external_field: list,
+) -> None:
+    """Write a uniform external_field into every sample of an H5 file.
+
+    The value is reshaped according to :func:`external_field_tensor_shape`
+    (e.g. 3 values → ``(3,)`` for rank-1, 9 values → ``(3,3)`` for rank-2).
+    """
+    import h5py
+    shape = external_field_tensor_shape(len(external_field))
+    field = np.array(external_field, dtype=np.float64).reshape(shape)
+    with h5py.File(h5_path, "a") as f:
+        for key in f.keys():
+            if key.startswith("sample_"):
+                if "external_field" in f[key]:
+                    del f[key]["external_field"]
+                f[key].create_dataset("external_field", data=field)
+    logger.info(f"Injected external_field shape={shape} into {h5_path}")
+
+
 def merge_training_data(
     data_dir: str,
     new_xyz_path: str,
@@ -74,6 +126,7 @@ def merge_training_data(
     max_radius: float = 5.0,
     num_workers: int = 8,
     max_atom: Optional[int] = None,
+    external_field: Optional[list] = None,
 ) -> int:
     """
     Merge new labeled XYZ data into existing training set.
@@ -168,5 +221,11 @@ def merge_training_data(
         output_dir=data_dir,
     )
     save_to_h5_parallel(train_prefix, max_radius, num_workers, data_dir=data_dir)
+
+    if external_field is not None:
+        h5_path = os.path.join(data_dir, f"processed_{train_prefix}.h5")
+        if os.path.exists(h5_path):
+            _inject_external_field_into_h5(h5_path, external_field)
+
     logger.info(f"Merged {len(new_blocks)} new structures into {train_prefix}")
     return len(new_blocks)

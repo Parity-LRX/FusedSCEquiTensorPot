@@ -132,6 +132,7 @@ def _run_one_stage(
     master_addr: str = "auto",
     master_port: int = 29500,
     launcher: str = "auto",
+    external_field: Optional[list] = None,
 ) -> int:
     """Run iterations for one stage until converged or max_iters reached.
 
@@ -303,6 +304,7 @@ def _run_one_stage(
                     checkpoint_paths=checkpoints,
                     device=torch.device(device),
                     atomic_energy_file=e0_path,
+                    external_field=external_field,
                 )
                 calc.compute_from_trajectory(traj_path, output_path=model_devi_path)
 
@@ -389,6 +391,7 @@ def _run_one_stage(
                 new_xyz_path=labeled_path,
                 e0_csv_path=e0_path,
                 max_radius=max_radius,
+                external_field=external_field,
             )
             with open(merge_done, "w") as f:
                 f.write("ok\n")
@@ -431,6 +434,7 @@ def run_active_learning_loop(
     master_addr: str = "auto",
     master_port: int = 29500,
     launcher: str = "auto",
+    external_field: Optional[list] = None,
 ) -> None:
     """Run DPGen2-style active learning loop with multi-layer filtering.
 
@@ -588,6 +592,7 @@ def run_active_learning_loop(
             master_addr=master_addr,
             master_port=master_port,
             launcher=launcher,
+            external_field=external_field,
         )
 
     logger.info(scheduler.summary())

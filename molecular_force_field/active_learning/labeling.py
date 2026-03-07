@@ -95,11 +95,13 @@ class IdentityLabeler(Labeler):
         device: str = "cuda",
         max_radius: float = 5.0,
         atomic_energy_file: Optional[str] = None,
+        external_field: Optional[list] = None,
     ):
         self.checkpoint_path = checkpoint_path
         self.device = device
         self.max_radius = max_radius
         self.atomic_energy_file = atomic_energy_file
+        self.external_field = external_field
 
     def label(
         self,
@@ -124,7 +126,12 @@ class IdentityLabeler(Labeler):
             k.item(): v.item()
             for k, v in zip(config.atomic_energy_keys, config.atomic_energy_values)
         }
-        calc = MyE3NNCalculator(e3trans, ref_dict, dev, self.max_radius)
+        ext_tensor = None
+        if self.external_field is not None:
+            from molecular_force_field.active_learning.data_merge import external_field_tensor_shape
+            shape = external_field_tensor_shape(len(self.external_field))
+            ext_tensor = torch.tensor(self.external_field, dtype=torch.float64, device=dev).reshape(shape)
+        calc = MyE3NNCalculator(e3trans, ref_dict, dev, self.max_radius, external_tensor=ext_tensor)
         atoms_list = read(structures_xyz_path, index=":")
         for a in atoms_list:
             a.calc = calc

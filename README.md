@@ -109,6 +109,26 @@ Faster neighbor list and scatter operations. Install via extras:
 pip install -e ".[pyg]"
 ```
 
+### Optional: Active Learning (mff-active-learn with SOAP diversity)
+
+For the active learning loop with SOAP-based diversity screening (`--diversity-metric soap`), install:
+
+```bash
+pip install -e ".[al]"
+```
+
+This pulls in `dscribe` and `scikit-learn`. Without it, `--diversity-metric soap` falls back to `devi_hist`.
+
+### Optional: Thermal Transport (IFC2/IFC3, BTE, Callaway)
+
+For the thermal conductivity workflow (`python -m molecular_force_field.cli.thermal_transport`), install:
+
+```bash
+pip install -e ".[thermal]"
+```
+
+This pulls in `phono3py` and `scipy`. See [THERMAL_TRANSPORT.md](THERMAL_TRANSPORT.md) for the full workflow.
+
 ## Quick Start
 
 ### 1. Data Preprocessing

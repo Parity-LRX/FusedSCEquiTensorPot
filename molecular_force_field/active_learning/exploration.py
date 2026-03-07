@@ -28,9 +28,17 @@ def run_ase_md(
     friction: float = 0.01,
     relax_fmax: float = 0.05,
     log_interval: int = 10,
+    external_field: Optional[list] = None,
 ) -> str:
     """
     Run MD with ASE + MyE3NNCalculator. Returns path to output trajectory.
+
+    Parameters
+    ----------
+    external_field : list or None
+        Global external field vector (e.g. ``[0, 0, 0.01]`` for a uniform
+        electric field in V/Å).  Passed to ``MyE3NNCalculator`` so the model
+        evaluates energy/forces under this field at every MD step.
     """
     import torch
     from molecular_force_field.evaluation.calculator import MyE3NNCalculator
@@ -44,7 +52,12 @@ def run_ase_md(
         k.item(): v.item()
         for k, v in zip(config.atomic_energy_keys, config.atomic_energy_values)
     }
-    calc = MyE3NNCalculator(e3trans, ref_dict, dev, max_radius)
+    ext_tensor = None
+    if external_field is not None:
+        from molecular_force_field.active_learning.data_merge import external_field_tensor_shape
+        shape = external_field_tensor_shape(len(external_field))
+        ext_tensor = torch.tensor(external_field, dtype=torch.float64, device=dev).reshape(shape)
+    calc = MyE3NNCalculator(e3trans, ref_dict, dev, max_radius, external_tensor=ext_tensor)
     atoms = read(input_structure)
     atoms.calc = calc
     if relax_fmax > 0:
@@ -73,6 +86,7 @@ def run_ase_neb(
     atomic_energy_file: Optional[str] = None,
     n_images: int = 10,
     fmax: float = 0.05,
+    external_field: Optional[list] = None,
 ) -> str:
     """Run NEB with ASE. Returns path to output trajectory."""
     import torch
@@ -89,7 +103,12 @@ def run_ase_neb(
         k.item(): v.item()
         for k, v in zip(config.atomic_energy_keys, config.atomic_energy_values)
     }
-    calc = MyE3NNCalculator(e3trans, ref_dict, dev, max_radius)
+    ext_tensor = None
+    if external_field is not None:
+        from molecular_force_field.active_learning.data_merge import external_field_tensor_shape
+        shape = external_field_tensor_shape(len(external_field))
+        ext_tensor = torch.tensor(external_field, dtype=torch.float64, device=dev).reshape(shape)
+    calc = MyE3NNCalculator(e3trans, ref_dict, dev, max_radius, external_tensor=ext_tensor)
     initial = read(initial_xyz)
     final = read(final_xyz)
     images = [initial] + [initial.copy() for _ in range(n_images)] + [final]

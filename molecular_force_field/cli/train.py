@@ -464,7 +464,7 @@ def main():
     # 外部张量 / 物理张量（仅 pure-cartesian-ictd 支持）
     parser.add_argument('--external-tensor-rank', type=int, default=None,
                         help='External tensor rank for conv1 injection (e.g. 1=electric field). '
-                             'Requires --external-field-file. Only for pure-cartesian-ictd.')
+                             'Only for pure-cartesian-ictd. Used with --external-field-file or --external-field-value.')
     parser.add_argument('--charge-file', type=str, default=None,
                         help='Per-structure charge label file (.npy/.npz/.h5, scalar per sample)')
     parser.add_argument('--dipole-file', type=str, default=None,
@@ -475,7 +475,19 @@ def main():
                         help='Per-structure quadrupole label file (.npy/.npz/.h5, shape Bx3x3)')
     parser.add_argument('--external-field-file', type=str, default=None,
                         help='Per-structure external field file (.npy/.npz/.h5, shape Bx3). '
-                             'Requires --external-tensor-rank=1 for pure-cartesian-ictd.')
+                             'Requires --external-tensor-rank. Mutually exclusive with --external-field-value.')
+    parser.add_argument('--external-field-value', type=float, nargs='+', default=None,
+                        metavar='V',
+                        help=(
+                            'Uniform external field applied to ALL samples (injected into H5). '
+                            'Number of values must equal 3^rank (Cartesian tensor, row-major). '
+                            'Mutually exclusive with --external-field-file.\n'
+                            '  rank 0 (1 value):  scalar field strength\n'
+                            '  rank 1 (3 values): Fx  Fy  Fz  (Cartesian x/y/z, e.g. electric field V/Å)\n'
+                            '  rank 2 (9 values): Txx Txy Txz  Tyx Tyy Tyz  Tzx Tzy Tzz  (3×3 row-major)\n'
+                            '  rank L (3^L values): full rank-L Cartesian tensor, row-major\n'
+                            'Auto-sets --external-tensor-rank if not given.'
+                        ))
     parser.add_argument('--extra-per-node-file', type=str, default=None,
                         help='Per-node label HDF5 (sample_0, sample_1, ... with charge_per_atom, dipole_per_atom, etc.)')
     parser.add_argument('--physical-tensors', type=str, default=None,
@@ -654,10 +666,28 @@ def main():
         raise ValueError("Must specify both --train-input-file and --valid-input-file together, or neither.")
 
     # --- External tensor / physical tensor validation ---
+    if args.external_field_file and args.external_field_value:
+        raise ValueError("--external-field-file and --external-field-value are mutually exclusive")
+    if args.external_field_value:
+        from molecular_force_field.active_learning.data_merge import external_field_tensor_shape
+        shape = external_field_tensor_shape(len(args.external_field_value))
+        inferred_rank = len(shape) if shape != (1,) else 0
+        if args.external_tensor_rank is None:
+            args.external_tensor_rank = inferred_rank
+            logging.info(f"Auto-set --external-tensor-rank={inferred_rank} from --external-field-value ({len(args.external_field_value)} values)")
+        elif args.external_tensor_rank != inferred_rank:
+            raise ValueError(
+                f"--external-tensor-rank={args.external_tensor_rank} conflicts with "
+                f"--external-field-value ({len(args.external_field_value)} values → rank {inferred_rank})"
+            )
     if args.external_field_file and not args.external_tensor_rank:
         raise ValueError("--external-field-file requires --external-tensor-rank (e.g. 1 for electric field)")
-    if args.external_tensor_rank and not args.external_field_file:
-        raise ValueError("--external-tensor-rank requires --external-field-file")
+    if args.external_tensor_rank and not args.external_field_file and not args.external_field_value:
+        logging.warning(
+            "--external-tensor-rank is set but --external-field-file/--external-field-value is not. "
+            "The model will include external field architecture. If 'external_field' "
+            "is not embedded in the H5 dataset, the field will be zero at runtime."
+        )
     if args.external_tensor_rank and args.tensor_product_mode != "pure-cartesian-ictd":
         raise ValueError("--external-tensor-rank only supported for --tensor-product-mode pure-cartesian-ictd")
     if (args.physical_tensors or args.physical_tensors_per_node) and args.tensor_product_mode != "pure-cartesian-ictd":
@@ -857,6 +887,20 @@ def main():
         if not data_ready:
             logging.error("Data preparation failed. Exiting.")
             return
+
+    # --- Inject uniform external field into H5 (if --external-field-value) ---
+    if args.external_field_value:
+        from molecular_force_field.active_learning.data_merge import _inject_external_field_into_h5
+        if use_custom_data_paths:
+            h5_paths = [args.train_data, args.valid_data]
+        else:
+            h5_paths = [
+                os.path.join(args.data_dir, f"processed_{args.train_prefix}.h5"),
+                os.path.join(args.data_dir, f"processed_{args.val_prefix}.h5"),
+            ]
+        for hp in h5_paths:
+            if os.path.exists(hp):
+                _inject_external_field_into_h5(hp, args.external_field_value)
 
     # --- Build extra_label_paths and extra_per_node for H5Dataset ---
     extra_label_paths = {}
