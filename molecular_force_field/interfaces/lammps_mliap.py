@@ -57,11 +57,142 @@ from molecular_force_field.models.e3nn_layers_channelwise import (
     E3_TransformerLayer_multi as E3_TransformerLayer_multi_channelwise,
 )
 from molecular_force_field.models.pure_cartesian_ictd_layers import (
+    PhysicalTensorICTDRecovery,
     PureCartesianICTDTransformerLayer as PureCartesianICTDTransformerLayerSave,
 )
 from molecular_force_field.models.pure_cartesian_ictd_layers_full import PureCartesianICTDTransformerLayer
 from molecular_force_field.utils.config import ModelConfig
+from molecular_force_field.utils.checkpoint_metadata import (
+    infer_external_tensor_rank_from_state_dict,
+    infer_physical_tensor_outputs_from_state_dict,
+)
 from molecular_force_field.utils.tensor_utils import map_tensor_values
+
+
+_GLOBAL_PHYS_LAYOUT = (
+    ("charge", 1),
+    ("dipole", 3),
+    ("polarizability", 9),
+    ("quadrupole", 9),
+)
+_ATOM_PHYS_LAYOUT = (
+    ("charge_per_atom", 1),
+    ("dipole_per_atom", 3),
+    ("polarizability_per_atom", 9),
+    ("quadrupole_per_atom", 9),
+)
+
+
+def _layout_total_dim(layout: tuple[tuple[str, int], ...]) -> int:
+    return sum(dim for _, dim in layout)
+
+
+def _layout_offsets(layout: tuple[tuple[str, int], ...]) -> dict[str, tuple[int, int]]:
+    out: dict[str, tuple[int, int]] = {}
+    start = 0
+    for name, dim in layout:
+        out[name] = (start, start + dim)
+        start += dim
+    return out
+
+
+_GLOBAL_PHYS_TOTAL_DIM = _layout_total_dim(_GLOBAL_PHYS_LAYOUT)
+_ATOM_PHYS_TOTAL_DIM = _layout_total_dim(_ATOM_PHYS_LAYOUT)
+_GLOBAL_PHYS_OFFSETS = _layout_offsets(_GLOBAL_PHYS_LAYOUT)
+_ATOM_PHYS_OFFSETS = _layout_offsets(_ATOM_PHYS_LAYOUT)
+
+
+def _resolve_model_external_tensor_rank(model: nn.Module) -> int | None:
+    ext_rank = getattr(model, "external_tensor_rank", None)
+    if ext_rank is not None:
+        return int(ext_rank)
+    conv = getattr(model, "e3_conv_emb", None)
+    ext_rank = getattr(conv, "external_tensor_rank", None)
+    if ext_rank is not None:
+        return int(ext_rank)
+    nested = getattr(model, "model", None)
+    if nested is not None and nested is not model:
+        return _resolve_model_external_tensor_rank(nested)
+    return None
+
+
+def _canonicalize_cartesian_rank2(x: torch.Tensor) -> torch.Tensor:
+    # Keep the user-facing LAMMPS output simple: always expose a full 3x3 Cartesian tensor.
+    return x.reshape(*x.shape[:-2], 9)
+
+
+def _recover_cartesian_physical_tensors(
+    physical_out: dict[str, dict[int, torch.Tensor]] | None,
+    *,
+    batch: torch.Tensor,
+    num_nodes: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_graphs = int(batch.max().item()) + 1 if batch.numel() else 0
+    global_phys = torch.zeros(num_graphs, _GLOBAL_PHYS_TOTAL_DIM, device=device, dtype=dtype)
+    atom_phys = torch.zeros(num_nodes, _ATOM_PHYS_TOTAL_DIM, device=device, dtype=dtype)
+    global_mask = torch.zeros(len(_GLOBAL_PHYS_LAYOUT), device=device, dtype=dtype)
+    atom_mask = torch.zeros(len(_ATOM_PHYS_LAYOUT), device=device, dtype=dtype)
+    if not physical_out:
+        return global_phys, atom_phys, global_mask, atom_mask
+
+    recover_rank1 = PhysicalTensorICTDRecovery(rank=1, channels_in=1, lmax_in=1, include_trace_chain=False).to(device)
+    recover_rank2_full = PhysicalTensorICTDRecovery(rank=2, channels_in=1, lmax_in=2, include_trace_chain=True).to(device)
+    recover_rank2_l2 = PhysicalTensorICTDRecovery(rank=2, channels_in=1, lmax_in=2, include_trace_chain=False).to(device)
+
+    global_mask_index = {name: idx for idx, (name, _) in enumerate(_GLOBAL_PHYS_LAYOUT)}
+    atom_mask_index = {name: idx for idx, (name, _) in enumerate(_ATOM_PHYS_LAYOUT)}
+
+    for name, blocks in physical_out.items():
+        if not isinstance(blocks, dict):
+            continue
+        if name in _GLOBAL_PHYS_OFFSETS:
+            start, end = _GLOBAL_PHYS_OFFSETS[name]
+            if name == "charge":
+                blk = blocks.get(0)
+                if blk is None:
+                    continue
+                if blk.shape[-2] != 1:
+                    raise ValueError(f"{name} channels_out>1 is not supported for LibTorch export")
+                global_phys[:, start:end] = blk[..., 0, :].reshape(blk.shape[0], 1)
+            elif name == "dipole":
+                rec = recover_rank1(blocks)
+                global_phys[:, start:end] = rec.reshape(rec.shape[0], 3)
+            elif name == "polarizability":
+                rec = recover_rank2_full(blocks)
+                global_phys[:, start:end] = _canonicalize_cartesian_rank2(rec)
+            elif name == "quadrupole":
+                l2_only = {2: blocks[2]} if 2 in blocks else {}
+                if not l2_only:
+                    continue
+                rec = recover_rank2_l2(l2_only)
+                global_phys[:, start:end] = _canonicalize_cartesian_rank2(rec)
+            global_mask[global_mask_index[name]] = 1.0
+        elif name in _ATOM_PHYS_OFFSETS:
+            start, end = _ATOM_PHYS_OFFSETS[name]
+            if name == "charge_per_atom":
+                blk = blocks.get(0)
+                if blk is None:
+                    continue
+                if blk.shape[-2] != 1:
+                    raise ValueError(f"{name} channels_out>1 is not supported for LibTorch export")
+                atom_phys[:, start:end] = blk[..., 0, :].reshape(blk.shape[0], 1)
+            elif name == "dipole_per_atom":
+                rec = recover_rank1(blocks)
+                atom_phys[:, start:end] = rec.reshape(rec.shape[0], 3)
+            elif name == "polarizability_per_atom":
+                rec = recover_rank2_full(blocks)
+                atom_phys[:, start:end] = _canonicalize_cartesian_rank2(rec)
+            elif name == "quadrupole_per_atom":
+                l2_only = {2: blocks[2]} if 2 in blocks else {}
+                if not l2_only:
+                    continue
+                rec = recover_rank2_l2(l2_only)
+                atom_phys[:, start:end] = _canonicalize_cartesian_rank2(rec)
+            atom_mask[atom_mask_index[name]] = 1.0
+
+    return global_phys, atom_phys, global_mask, atom_mask
 
 
 # ---------------------------------------------------------------------------
@@ -94,13 +225,17 @@ class LAMMPS_MP(torch.autograd.Function):
 class _TorchScriptEdgeVecCore(nn.Module):
     """Core wrapper to make precomputed_edge_vec traceable (positional arg).
 
-    LAMMPS 接口仅接受能量和力：trace 时 model.forward 不传 return_physical_tensors，
-    默认 False，故 TorchScript 导出的 core.pt 只输出 per-atom energy（力由 dE/dpos 计算）。
+    LAMMPS LibTorch 接口始终返回 per-atom energy；若模型配置了 physical tensor
+    heads，则额外导出固定 schema 的体系级/逐原子笛卡尔物理张量，供 C++ 侧缓存。
     """
 
     def __init__(self, model: nn.Module):
         super().__init__()
         self.model = model
+        self.external_tensor_rank = _resolve_model_external_tensor_rank(model)
+        self.has_physical_tensor_heads = (
+            hasattr(model, "physical_tensor_heads") and getattr(model, "physical_tensor_heads", None) is not None
+        )
 
     def forward(
         self,
@@ -112,19 +247,39 @@ class _TorchScriptEdgeVecCore(nn.Module):
         edge_shifts: torch.Tensor,
         cell: torch.Tensor,
         edge_vec: torch.Tensor,
-    ) -> torch.Tensor:
-        # 强制只输出能量：LAMMPS 接口仅接受能量和力，不输出物理张量
+        external_tensor: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         try:
-            return self.model(
-                pos, A, batch, edge_src, edge_dst, edge_shifts, cell,
-                precomputed_edge_vec=edge_vec,
-                return_physical_tensors=False,
-            )
+            kwargs = {
+                "precomputed_edge_vec": edge_vec,
+                "return_physical_tensors": self.has_physical_tensor_heads,
+            }
+            if self.external_tensor_rank is not None:
+                kwargs["external_tensor"] = external_tensor
+            out = self.model(pos, A, batch, edge_src, edge_dst, edge_shifts, cell, **kwargs)
         except TypeError:
-            return self.model(
-                pos, A, batch, edge_src, edge_dst, edge_shifts, cell,
-                precomputed_edge_vec=edge_vec,
-            )
+            kwargs = {
+                "precomputed_edge_vec": edge_vec,
+                "return_physical_tensors": self.has_physical_tensor_heads,
+            }
+            if self.external_tensor_rank is not None:
+                kwargs["external_tensor"] = external_tensor
+            out = self.model(pos, A, batch, edge_src, edge_dst, edge_shifts, cell, **kwargs)
+
+        if isinstance(out, tuple):
+            atom_energy = out[0]
+            physical_out = out[1] if len(out) > 1 else None
+        else:
+            atom_energy = out
+            physical_out = None
+        global_phys, atom_phys, global_mask, atom_mask = _recover_cartesian_physical_tensors(
+            physical_out,
+            batch=batch,
+            num_nodes=pos.shape[0],
+            device=pos.device,
+            dtype=atom_energy.dtype,
+        )
+        return atom_energy, global_phys, atom_phys, global_mask, atom_mask
 
 
 class _TorchScriptEdgeVecAdapter(nn.Module):
@@ -164,12 +319,18 @@ class _TorchScriptEdgeVecAdapter(nn.Module):
         cell: torch.Tensor,
         *,
         precomputed_edge_vec: Optional[torch.Tensor] = None,
+        external_tensor: Optional[torch.Tensor] = None,
         sync_after_scatter=None,
     ) -> torch.Tensor:
         if precomputed_edge_vec is None:
             raise ValueError("TorchScript model requires precomputed_edge_vec")
         # sync_after_scatter is ignored in TorchScript mode.
-        return self.core(pos, A, batch, edge_src, edge_dst, edge_shifts, cell, precomputed_edge_vec)
+        if external_tensor is None:
+            external_tensor = torch.empty(0, dtype=pos.dtype, device=pos.device)
+        out = self.core(
+            pos, A, batch, edge_src, edge_dst, edge_shifts, cell, precomputed_edge_vec, external_tensor
+        )
+        return out[0] if isinstance(out, tuple) else out
 
 
 def _maybe_torchscript_trace_model(
@@ -189,6 +350,8 @@ def _maybe_torchscript_trace_model(
     # Trace a core wrapper that takes edge_vec as positional arg.
     core = _TorchScriptEdgeVecCore(model).to(device=device)
 
+    ext_rank = _resolve_model_external_tensor_rank(model)
+
     # Example inputs (dynamic shapes should still work for most ops).
     N = 32
     E = 256
@@ -200,6 +363,10 @@ def _maybe_torchscript_trace_model(
     edge_shifts = torch.zeros(E, 3, device=device, dtype=dtype)
     cell = (torch.eye(3, device=device, dtype=dtype).unsqueeze(0) * 100.0)
     edge_vec = torch.randn(E, 3, device=device, dtype=dtype)
+    if ext_rank is None:
+        external_tensor = torch.empty(0, device=device, dtype=dtype)
+    else:
+        external_tensor = torch.zeros((3,) * int(ext_rank), device=device, dtype=dtype)
 
     try:
         # Prewarm one-time caches before tracing to keep Python-side setup out of the trace.
@@ -210,13 +377,13 @@ def _maybe_torchscript_trace_model(
                     if callable(prewarm):
                         prewarm(device=device, dtype=dtype)
                 # One eager run to lock in branches and fill caches.
-                _ = core(pos, A, batch, edge_src, edge_dst, edge_shifts, cell, edge_vec)
+                _ = core(pos, A, batch, edge_src, edge_dst, edge_shifts, cell, edge_vec, external_tensor)
         except Exception:
             pass
 
         core_ts = torch.jit.trace(
             core,
-            (pos, A, batch, edge_src, edge_dst, edge_shifts, cell, edge_vec),
+            (pos, A, batch, edge_src, edge_dst, edge_shifts, cell, edge_vec, external_tensor),
             check_trace=False,
             strict=False,
         )
@@ -258,6 +425,7 @@ class AtomForcesWrapper(nn.Module):
         edge_shifts: torch.Tensor,
         cell: torch.Tensor,
         nlocal: int,
+        external_tensor: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute total energy, per-atom energies and per-atom forces.
 
@@ -283,6 +451,7 @@ class AtomForcesWrapper(nn.Module):
         atom_energies = self.model(
             pos, A, batch, edge_src, edge_dst, edge_shifts, cell,
             precomputed_edge_vec=edge_vec,
+            external_tensor=external_tensor,
         )
 
         mapped_A = map_tensor_values(
@@ -325,6 +494,7 @@ class EdgeForcesWrapper(nn.Module):
         edge_shifts: torch.Tensor,
         cell: torch.Tensor,
         nlocal: int,
+        external_tensor: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute total energy, per-atom energies and per-pair forces."""
         pos = torch.zeros(A.size(0), 3, dtype=edge_vec.dtype, device=edge_vec.device)
@@ -332,6 +502,7 @@ class EdgeForcesWrapper(nn.Module):
         atom_energies = self.model(
             pos, A, batch, edge_src, edge_dst, edge_shifts, cell,
             precomputed_edge_vec=edge_vec,
+            external_tensor=external_tensor,
         )
 
         mapped_A = map_tensor_values(
@@ -491,6 +662,13 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
             aek = config.atomic_energy_keys
             aev = config.atomic_energy_values
 
+        external_tensor_rank = ckpt.get("external_tensor_rank", arch_meta.get("external_tensor_rank"))
+        if external_tensor_rank is None:
+            external_tensor_rank = infer_external_tensor_rank_from_state_dict(ckpt.get("e3trans_state_dict", {}))
+        physical_tensor_outputs = ckpt.get("physical_tensor_outputs", arch_meta.get("physical_tensor_outputs"))
+        if physical_tensor_outputs is None:
+            physical_tensor_outputs = infer_physical_tensor_outputs_from_state_dict(ckpt.get("e3trans_state_dict", {}))
+
         if mode == "pure-cartesian-ictd":
             model = PureCartesianICTDTransformerLayer(
                 max_embed_radius=config.max_radius,
@@ -509,6 +687,8 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 num_interaction=num_interaction,
                 function_type_main=config.function_type,
                 lmax=config.lmax,
+                physical_tensor_outputs=physical_tensor_outputs,
+                external_tensor_rank=external_tensor_rank,
                 internal_compute_dtype=dtype,
                 device=torch.device(device),
             ).to(device)

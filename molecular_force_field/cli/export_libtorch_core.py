@@ -8,7 +8,7 @@ Difference from torch.save(obj):
 
 This script exports core.pt with:
 - forward signature:
-    (pos, A, batch, edge_src, edge_dst, edge_shifts, cell, edge_vec) -> atom_energies
+    (pos, A, batch, edge_src, edge_dst, edge_shifts, cell, edge_vec, external_tensor) -> atom_energies
 - **LAMMPS 接口仅需能量和力**：TorchScript trace 时 model 不输出物理张量（dipole/polarizability 等），
   只输出 per-atom energy；力由 C++ 侧 dE/dpos 计算。
 - **Optional embedded E0** (option B): embed per-element constant energy (E0) from preprocessing/fitting
@@ -81,6 +81,15 @@ class _E0WrappedModel(torch.nn.Module):
     def __init__(self, model: torch.nn.Module, e0_lut: torch.Tensor):
         super().__init__()
         self.model = model
+        conv = getattr(model, "e3_conv_emb", None)
+        ext_rank = getattr(model, "external_tensor_rank", None)
+        if ext_rank is None:
+            ext_rank = getattr(conv, "external_tensor_rank", None)
+        self.external_tensor_rank = int(ext_rank) if ext_rank is not None else None
+        self.physical_tensor_heads = getattr(model, "physical_tensor_heads", None)
+        self.has_physical_tensor_heads = (
+            hasattr(model, "physical_tensor_heads") and getattr(model, "physical_tensor_heads", None) is not None
+        )
         self.register_buffer("e0_lut", e0_lut)
 
     def forward(
@@ -94,20 +103,30 @@ class _E0WrappedModel(torch.nn.Module):
         cell: torch.Tensor,
         *,
         precomputed_edge_vec: Optional[torch.Tensor] = None,
+        external_tensor: Optional[torch.Tensor] = None,
+        return_physical_tensors: bool = False,
         sync_after_scatter=None,
-    ) -> torch.Tensor:
+    ):
         # Keep the same signature the framework expects.
-        out = self.model(
-            pos, A, batch, edge_src, edge_dst, edge_shifts, cell,
-            precomputed_edge_vec=precomputed_edge_vec,
-            sync_after_scatter=sync_after_scatter,
-        )
+        kwargs = {
+            "precomputed_edge_vec": precomputed_edge_vec,
+            "sync_after_scatter": sync_after_scatter,
+        }
+        if return_physical_tensors and self.has_physical_tensor_heads:
+            kwargs["return_physical_tensors"] = True
+        if external_tensor is not None:
+            kwargs["external_tensor"] = external_tensor
+        out = self.model(pos, A, batch, edge_src, edge_dst, edge_shifts, cell, **kwargs)
         # E0 lookup: e0_lut[Z]
         e0 = self.e0_lut.index_select(0, A.to(torch.long))
+        atom_energy = out[0] if isinstance(out, tuple) else out
         # Broadcast e0 to match out (usually (N,1)).
-        if out.dim() == 2:
+        if atom_energy.dim() == 2:
             e0 = e0.unsqueeze(1)
-        return out + e0.to(dtype=out.dtype, device=out.device)
+        atom_energy = atom_energy + e0.to(dtype=atom_energy.dtype, device=atom_energy.device)
+        if isinstance(out, tuple):
+            return (atom_energy, *out[1:])
+        return atom_energy
 
 
 def export_core(
@@ -124,7 +143,11 @@ def export_core(
     e0_csv: Optional[str] = None,
     native_ops: bool = False,
 ) -> None:
-    from molecular_force_field.interfaces.lammps_mliap import LAMMPS_MLIAP_MFF, _maybe_torchscript_trace_model
+    from molecular_force_field.interfaces.lammps_mliap import (
+        LAMMPS_MLIAP_MFF,
+        _maybe_torchscript_trace_model,
+        _resolve_model_external_tensor_rank,
+    )
     from molecular_force_field.utils.config import ModelConfig
 
     _ts_supported = ("pure-cartesian-ictd", "pure-cartesian-ictd-save", "spherical-save-cue")
@@ -200,6 +223,7 @@ def export_core(
         obj.wrapper.model = obj.wrapper.model.to(dtype=force_dtype)
 
     model_eager = obj.wrapper.model
+    external_tensor_rank = _resolve_model_external_tensor_rank(model_eager)
 
     if mode == "spherical-save-cue" and not native_ops:
         if hasattr(model_eager, "make_torchscript_portable"):
@@ -247,12 +271,17 @@ def export_core(
             "edge_shifts(E,3)",
             "cell(1,3,3)",
             "edge_vec(E,3)",
+            "external_tensor(rank-dependent tensor or empty tensor)",
         ],
+        "external_tensor_rank": (
+            int(external_tensor_rank) if external_tensor_rank is not None else None
+        ),
         "notes": [
             "Core model: outputs per-atom energy.",
             "If embed_e0=true: output includes E0(Z) constant bias (from preprocessing fit or e0_csv).",
             "Forces: dE/d(pos) computed via autograd on C++ side.",
             "Loadable: C++ torch::jit::load(path).",
+            "external_tensor is required at runtime when external_tensor_rank is not null.",
         ],
     }
     meta_path = out_pt + ".json"

@@ -67,6 +67,15 @@ def main():
     train_indices = indices[train_mask]
     
     print(f"Split: {len(train_indices)} Train, {len(val_indices)} Val")
+
+    # Save split indices for aligning external labels (e.g. dipole, polarizability)
+    # train_indices[i] = original extxyz frame index for processed_train.h5 sample_i
+    # val_indices[i] = original extxyz frame index for processed_val.h5 sample_i
+    train_indices_path = os.path.join(args.output_dir, 'train_indices.npy')
+    val_indices_path = os.path.join(args.output_dir, 'val_indices.npy')
+    np.save(train_indices_path, train_indices)
+    np.save(val_indices_path, val_indices)
+    print(f"Saved {train_indices_path}, {val_indices_path}")
     
     train_blocks = [all_blocks[i] for i in train_indices]
     train_raw_E = [all_raw_energy[i] for i in train_indices]

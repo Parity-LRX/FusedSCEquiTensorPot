@@ -15,6 +15,7 @@ This provides an SO(3)-equivariant irreps message passing stack without ever mat
 
 from __future__ import annotations
 
+import itertools
 import torch
 import torch.nn as nn
 from molecular_force_field.utils.scatter import scatter
@@ -28,6 +29,7 @@ from molecular_force_field.models.ictd_irreps import (
     direction_harmonics,
     direction_harmonics_all,
     build_harmonic_projectors,
+    build_harmonic_reconstructors,
     sym_dim,
 )
 from molecular_force_field.models.ictd_fast import _counts_list
@@ -96,6 +98,34 @@ def _sym_rank_linear_indices_and_coefs(L: int) -> tuple[torch.Tensor, torch.Tens
         lin[d] = li
         coefs[d] = float(math.factorial(L) / (math.factorial(a) * math.factorial(b) * math.factorial(c)))
     return lin.contiguous(), coefs.contiguous()
+
+
+@lru_cache(maxsize=None)
+def _sym_rank_linear_permutation_indices(L: int) -> tuple[list[torch.Tensor], torch.Tensor]:
+    """
+    For each canonical (a,b,c) monomial in Sym^L, return the flattened linear
+    indices of all unique cartesian permutations and the matching multinomial
+    coefficient.  This is the inverse lookup for `_sym_rank_linear_indices_and_coefs`.
+    """
+    counts = _counts_list(L)
+    if L == 0:
+        return [torch.zeros(1, dtype=torch.int64)], torch.ones(1, dtype=torch.float64)
+
+    pow3 = [3 ** (L - 1 - k) for k in range(L)]
+    perm_indices: list[torch.Tensor] = []
+    coefs = []
+    for (a, b, c) in counts:
+        idx_seq = ([0] * a) + ([1] * b) + ([2] * c)
+        uniq = sorted(set(itertools.permutations(idx_seq, L)))
+        lin = []
+        for tup in uniq:
+            li = 0
+            for ik, pk in zip(tup, pow3):
+                li += int(ik) * int(pk)
+            lin.append(li)
+        perm_indices.append(torch.tensor(lin, dtype=torch.int64))
+        coefs.append(float(math.factorial(L) / (math.factorial(a) * math.factorial(b) * math.factorial(c))))
+    return perm_indices, torch.tensor(coefs, dtype=torch.float64)
 
 
 class PhysicalTensorICTDEmbedding(nn.Module):
@@ -285,6 +315,155 @@ class PhysicalTensorICTDEmbedding(nn.Module):
         if return_blocks:
             return out_blocks
         return _merge_irreps(out_blocks, self.channels_out, self.lmax_out)
+
+
+class PhysicalTensorICTDRecovery(nn.Module):
+    """
+    Recover a symmetric Cartesian tensor from ICTD irreps blocks.
+
+    This is the inverse companion of :class:`PhysicalTensorICTDEmbedding` at the
+    representation level:
+      irreps blocks -> Sym^L monomial coefficients -> symmetric Cartesian tensor.
+
+    Notes
+    -----
+    - Exact recovery requires that the provided blocks contain the complete trace
+      chain for the target rank (e.g. l=0 and l=2 for a general symmetric rank-2 tensor).
+    - If only the highest-l block is given (e.g. l=2), the recovered Cartesian
+      tensor is the corresponding traceless symmetric component.
+    """
+
+    def __init__(
+        self,
+        *,
+        rank: int,
+        channels_in: int = 1,
+        lmax_in: int | None = None,
+        include_trace_chain: bool = True,
+        internal_compute_dtype: torch.dtype = torch.float64,
+    ):
+        super().__init__()
+        self.rank = int(rank)
+        self.channels_in = int(channels_in)
+        self.lmax_in = int(lmax_in) if lmax_in is not None else int(rank)
+        self.include_trace_chain = bool(include_trace_chain)
+        self.internal_compute_dtype = internal_compute_dtype
+
+        if self.rank < 0:
+            raise ValueError(f"rank must be >= 0, got {self.rank}")
+        if self.channels_in <= 0:
+            raise ValueError(f"channels_in must be positive, got {self.channels_in}")
+        if self.lmax_in < 0:
+            raise ValueError(f"lmax_in must be >= 0, got {self.lmax_in}")
+
+        self._recon_cache: dict[tuple[str, str], dict[int, torch.Tensor]] = {}
+
+    def _get_reconstructors(self, device: torch.device, dtype: torch.dtype) -> dict[int, torch.Tensor]:
+        compute_dtype = self.internal_compute_dtype
+        key = (str(device), str(compute_dtype))
+        cached = self._recon_cache.get(key)
+        if cached is not None:
+            return cached
+
+        recon = build_harmonic_reconstructors(Lmax=self.rank)
+        if self.include_trace_chain:
+            ls = list(range(self.rank, -1, -2))
+        else:
+            ls = [self.rank]
+
+        out: dict[int, torch.Tensor] = {}
+        for l in ls:
+            if l > self.lmax_in:
+                continue
+            V = recon.V[(self.rank, l)]
+            out[l] = V.to(device=device, dtype=compute_dtype).contiguous()
+        self._recon_cache[key] = out
+        return out
+
+    def _ensure_channel_dim_blocks(self, blk: torch.Tensor, l: int) -> torch.Tensor:
+        if blk.shape[-1] != 2 * l + 1:
+            raise ValueError(f"irreps block for l={l} must end with 2l+1={2*l+1}, got shape={tuple(blk.shape)}")
+        if blk.dim() >= 2 and blk.shape[-2] == self.channels_in:
+            return blk
+        if self.channels_in == 1:
+            return blk.unsqueeze(-2)
+        raise ValueError(
+            f"Expected channels_in={self.channels_in} at dim -2 for l={l} block, got shape={tuple(blk.shape)}"
+        )
+
+    def _to_monomial_coeffs(self, blocks: dict[int, torch.Tensor]) -> torch.Tensor:
+        device = next(iter(blocks.values())).device
+        dtype = next(iter(blocks.values())).dtype
+        compute_dtype = self.internal_compute_dtype
+        recons = self._get_reconstructors(device=device, dtype=dtype)
+        D = sym_dim(self.rank)
+
+        sample_block = next(iter(blocks.values()))
+        batch_shape = self._ensure_channel_dim_blocks(sample_block, next(iter(blocks.keys()))).shape[:-2]
+        t = torch.zeros(*batch_shape, self.channels_in, D, device=device, dtype=compute_dtype)
+
+        for l, V in recons.items():
+            blk = blocks.get(l)
+            if blk is None:
+                continue
+            blk = self._ensure_channel_dim_blocks(blk, l)
+            blk_comp = blk.to(dtype=compute_dtype) if blk.dtype != compute_dtype else blk
+            t = t + torch.einsum("...cm,dm->...cd", blk_comp, V)
+        return t.to(dtype=dtype) if t.dtype != dtype else t
+
+    def _monomial_to_cartesian(self, t: torch.Tensor, *, squeeze_channel: bool) -> torch.Tensor:
+        if self.rank == 0:
+            out = t[..., 0]
+            return out.squeeze(-1) if squeeze_channel and self.channels_in == 1 else out
+
+        perm_indices, coefs = _sym_rank_linear_permutation_indices(self.rank)
+        coefs = coefs.to(device=t.device, dtype=t.dtype)
+        flat = torch.zeros(*t.shape[:-1], 3 ** self.rank, device=t.device, dtype=t.dtype)
+        for d, idxs_cpu in enumerate(perm_indices):
+            idxs = idxs_cpu.to(device=t.device)
+            vals = (t[..., d] / coefs[d]).unsqueeze(-1).expand(*t.shape[:-1], idxs.numel())
+            idxs = idxs.view(*([1] * (flat.dim() - 1)), idxs.numel()).expand(*t.shape[:-1], idxs.numel())
+            flat.scatter_(-1, idxs, vals)
+        out = flat.reshape(*t.shape[:-1], *([3] * self.rank))
+        if squeeze_channel and self.channels_in == 1:
+            out = out.squeeze(-self.rank - 1)
+        return out
+
+    def forward(
+        self,
+        blocks: dict[int, torch.Tensor] | torch.Tensor,
+        *,
+        input_repr: str = "blocks",
+        squeeze_channel: bool | None = None,
+        return_monomial: bool = False,
+    ) -> torch.Tensor:
+        """
+        Args:
+          blocks:
+            - if input_repr="blocks": dict l->(..., Cin, 2l+1) or dict l->(..., 2l+1) for Cin=1
+            - if input_repr="flat": (..., Cin*(lmax_in+1)^2)
+          squeeze_channel:
+            If True and channels_in==1, drop the channel dimension in the returned
+            Cartesian tensor to match common `(B,3)` / `(B,3,3)` label shapes.
+        """
+        if squeeze_channel is None:
+            squeeze_channel = (self.channels_in == 1)
+
+        if input_repr == "flat":
+            if not torch.is_tensor(blocks):
+                raise TypeError("input_repr='flat' expects a tensor input")
+            blocks_dict = _split_irreps(blocks, self.channels_in, self.lmax_in)
+        elif input_repr == "blocks":
+            if torch.is_tensor(blocks):
+                raise TypeError("input_repr='blocks' expects a dict[int, Tensor] input")
+            blocks_dict = blocks
+        else:
+            raise ValueError(f"input_repr must be 'blocks' or 'flat', got {input_repr!r}")
+
+        t = self._to_monomial_coeffs(blocks_dict)
+        if return_monomial:
+            return t.squeeze(-2) if squeeze_channel and self.channels_in == 1 else t
+        return self._monomial_to_cartesian(t, squeeze_channel=squeeze_channel)
 
 def _irreps_elementwise_tensor_product_0e(x1: torch.Tensor, x2: torch.Tensor, channels: int, lmax: int) -> torch.Tensor:
     """

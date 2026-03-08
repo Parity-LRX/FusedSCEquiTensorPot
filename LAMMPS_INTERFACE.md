@@ -45,6 +45,53 @@ pair_style mff/torch 5.0 cuda
 pair_coeff * * /path/to/core.pt H O
 ```
 
+**运行时外场示例**（当前仅支持 `pure-cartesian-ictd` 的 rank-1 外场，即 3 分量电场）：
+```lammps
+variable Ex equal 0.0
+variable Ey equal 0.0
+variable Ez equal 0.01
+
+pair_style mff/torch 5.0 cuda field v_Ex v_Ey v_Ez
+pair_coeff * * /path/to/core.pt H O
+```
+
+- `field v_Ex v_Ey v_Ez` 会在每个力计算步重新求值，因此可配合 LAMMPS equal-style 变量实现随时间变化的外场。
+- 若 `core.pt` 导出自带外场架构的 checkpoint，则必须提供 `field ...`；若模型不带外场架构，则不能传 `field ...`。
+
+**rank-2 运行时外场示例**：
+
+全量 `3×3` 二阶张量，按行主序 `xx xy xz yx yy yz zx zy zz`：
+```lammps
+variable Txx equal 1.0
+variable Txy equal 0.0
+variable Txz equal 0.0
+variable Tyx equal 0.0
+variable Tyy equal 1.0
+variable Tyz equal 0.0
+variable Tzx equal 0.0
+variable Tzy equal 0.0
+variable Tzz equal 1.0
+
+pair_style mff/torch 5.0 cuda field9 v_Txx v_Txy v_Txz v_Tyx v_Tyy v_Tyz v_Tzx v_Tzy v_Tzz
+pair_coeff * * /path/to/core.pt H O
+```
+
+若你的 rank-2 外场本身是对称张量，可用 6 分量简写，顺序为 `xx yy zz xy xz yz`：
+```lammps
+variable Txx equal 1.0
+variable Tyy equal 1.0
+variable Tzz equal 1.0
+variable Txy equal 0.0
+variable Txz equal 0.0
+variable Tyz equal 0.0
+
+pair_style mff/torch 5.0 cuda field6 v_Txx v_Tyy v_Tzz v_Txy v_Txz v_Tyz
+pair_coeff * * /path/to/core.pt H O
+```
+
+- `field9` 适合一般 rank-2 外场，例如电场梯度张量或任意二阶外参。
+- `field6` 适合对称 rank-2 张量，例如对称电场梯度近似、应变张量等。
+
 **模型限制**：目前支持 `pure-cartesian-ictd` 系列和 `spherical-save-cue` 模型。元素顺序、cutoff 需与导出时一致。
 
 **spherical-save-cue 导出说明**（方案 A，便携版）：

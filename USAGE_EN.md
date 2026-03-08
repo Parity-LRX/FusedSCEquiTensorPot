@@ -1766,6 +1766,62 @@ thermo 20
 run 200
 ```
 
+**USER-MFFTORCH notes**:
+
+- The current `mfftorch` path is validated for 4 common combinations:
+  1. No external field, no physical tensors: energy + forces only
+  2. External field, no physical tensors: energy + forces with runtime `field` / `field6` / `field9`
+  3. No external field, with physical tensors: energy + forces + tensor outputs via `compute mff/torch/phys`
+  4. External field, with physical tensors: both runtime field input and tensor outputs enabled
+- Runtime external field support:
+  - `field v_Ex v_Ey v_Ez`: rank-1 external tensor, appropriate for `l=1`-like vector cases
+  - `field6` / `field9`: rank-2 external tensor input
+- The current fixed-schema physical quantities exposed in LAMMPS are:
+  - global: `charge`, `dipole`, `polarizability`, `quadrupole`
+  - per-atom: `charge_per_atom`, `dipole_per_atom`, `polarizability_per_atom`, `quadrupole_per_atom`
+- Missing physical heads are allowed: the corresponding mask becomes 0 and the output block is filled with 0
+- Typical fixed-schema `l` compatibility:
+  - `charge` / `charge_per_atom`: `l=0`
+  - `dipole` / `dipole_per_atom`: `l=1`
+  - `polarizability`: usually a rank-2 Cartesian tensor, typically `l=0+2`
+  - `quadrupole`: usually `l=2`
+- Arbitrary custom physical head names are not auto-exposed to `compute mff/torch/phys` yet
+- The current LibTorch/LAMMPS export path assumes `channels_out == 1` for exposed physical heads
+
+**Recommended GPU test commands**:
+
+```bash
+# 1) No field, no physical tensors: energy/force only
+bash molecular_force_field/test/run_gpu_lammps_with_corept.sh \
+  --lmp /path/to/lmp --dummy-ictd --elements H O --cutoff 5.0 --steps 50
+
+# 2) External field, no physical tensors
+bash molecular_force_field/test/run_gpu_lammps_with_corept.sh \
+  --lmp /path/to/lmp --dummy-ictd --elements H O \
+  --field-values 0.0 0.0 0.01 --cutoff 5.0 --steps 50
+
+# 3) No field, with physical tensors
+bash molecular_force_field/test/run_gpu_lammps_with_corept.sh \
+  --lmp /path/to/lmp --dummy-ictd --dummy-phys-heads --test-phys-compute \
+  --elements H O --cutoff 5.0 --steps 50
+
+# 4) External field, with physical tensors
+bash molecular_force_field/test/run_gpu_lammps_with_corept.sh \
+  --lmp /path/to/lmp --dummy-ictd --dummy-phys-heads --test-phys-compute \
+  --elements H O --field-values 0.0 0.0 0.01 --cutoff 5.0 --steps 50
+```
+
+**Two-GPU / multi-GPU note**:
+
+- If your cluster uses one GPU per MPI rank, the recommended workflow is: use the script to generate `core.pt` and `in.corept`, then launch LAMMPS with your site-standard MPI/GPU binding
+- A common pattern is:
+
+```bash
+mpirun -np 2 --allow-run-as-root --bind-to none \
+  bash -c 'export CUDA_VISIBLE_DEVICES=$OMPI_COMM_WORLD_LOCAL_RANK; \
+  /path/to/lmp -k on g 1 -sf kk -pk kokkos newton off neigh full -in /tmp/mff_test/in.corept'
+```
+
 **spherical-save-cue export note**: Default export uses pure PyTorch implementation (`force_naive`); `core.pt` does not depend on cuEquivariance custom ops and runs in any LibTorch environment.
 
 See [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md) for full documentation.

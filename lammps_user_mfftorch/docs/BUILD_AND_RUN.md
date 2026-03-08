@@ -303,13 +303,103 @@ neighbor 1.0 bin
 pair_style mff/torch 5.0 cuda
 pair_coeff * * /path/to/core.pt H O
 
+compute mffg all mff/torch/phys global
+compute mffa all mff/torch/phys atom
+
 velocity all create 300 42
 fix 1 all nve
 thermo 20
+thermo_style custom step temp pe c_mffg[2] c_mffg[3] c_mffg[4]
+dump 1 all custom 20 dump.mff id type x y z c_mffa[1] c_mffa[2] c_mffa[3] c_mffa[4]
 run 200
 ```
 
-### 8.3 输出压力/应力（virial）
+若 `core.pt` 来自带外场架构的 `pure-cartesian-ictd` checkpoint，可在运行时通过 LAMMPS equal-style 变量传入 rank-1 外场：
+
+```lammps
+variable Ex equal 0.0
+variable Ey equal 0.0
+variable Ez equal 0.01
+
+pair_style mff/torch 5.0 cuda field v_Ex v_Ey v_Ez
+pair_coeff * * /path/to/core.pt H O
+```
+
+说明：
+- `field v_Ex v_Ey v_Ez` 会在每个 force call 重新求值，可用于时间相关外场。
+- 也支持 rank-2 外场：
+  - `field9`：全量 `3x3`，行主序 `xx xy xz yx yy yz zx zy zz`
+  - `field6`：对称 `3x3` 简写，顺序 `xx yy zz xy xz yz`
+- 若 `core.pt` 需要外场但未提供 `field ...`，LAMMPS 初始化时会报错；反之，普通 `core.pt` 也不能搭配 `field ...` 使用。
+
+rank-2 示例：
+
+```lammps
+variable Txx equal 1.0
+variable Txy equal 0.0
+variable Txz equal 0.0
+variable Tyx equal 0.0
+variable Tyy equal 1.0
+variable Tyz equal 0.0
+variable Tzx equal 0.0
+variable Tzy equal 0.0
+variable Tzz equal 1.0
+
+pair_style mff/torch 5.0 cuda field9 v_Txx v_Txy v_Txz v_Tyx v_Tyy v_Tyz v_Tzx v_Tzy v_Tzz
+pair_coeff * * /path/to/core.pt H O
+```
+
+### 8.3 输出物理张量
+
+若 `core.pt` 是带 `physical_tensor_outputs` 的 `pure-cartesian-ictd` 模型，
+可通过 `compute mff/torch/phys` 读取最近一次 `pair_style mff/torch*` 缓存的笛卡尔物理张量：
+
+```lammps
+compute mffg all mff/torch/phys global
+compute mffgm all mff/torch/phys global/mask
+compute mffa all mff/torch/phys atom
+compute mffam all mff/torch/phys atom/mask
+
+compute mffd all mff/torch/phys global dipole
+compute mffdx all mff/torch/phys global dipole x
+compute mffp all mff/torch/phys global polarizability
+compute mffpxx all mff/torch/phys global polarizability xx
+
+compute mffad all mff/torch/phys atom dipole
+compute mffadx all mff/torch/phys atom dipole x
+```
+
+模式说明：
+
+- `global`：返回 22 维全局向量，可用于 `thermo_style custom`
+- `global/mask`：返回 4 维全局 mask，顺序是 `charge dipole polarizability quadrupole`
+- `atom`：返回 `N x 22` 逐原子数组，可用于 `dump custom`
+- `atom/mask`：返回 4 维全局 mask，顺序是 `charge_per_atom dipole_per_atom polarizability_per_atom quadrupole_per_atom`
+
+也支持按名字直接读取某个物理量：
+
+- `global charge`：全局标量
+- `global dipole`：3 维全局向量；`global dipole x`：全局标量
+- `global polarizability` / `global quadrupole`：9 维全局向量；`... xx` 等分量形式返回全局标量
+- `atom charge`：逐原子向量
+- `atom dipole`：逐原子 `N x 3` 数组；`atom dipole x`：逐原子向量
+- `atom polarizability` / `atom quadrupole`：逐原子 `N x 9` 数组；`... xx` 等分量形式返回逐原子向量
+- `global/mask dipole`、`atom/mask polarizability`：直接检查单个 head 是否启用
+
+22 列固定顺序如下：
+
+`charge, dipole_x, dipole_y, dipole_z, polar_xx, polar_xy, polar_xz, polar_yx, polar_yy, polar_yz, polar_zx, polar_zy, polar_zz, quad_xx, quad_xy, quad_xz, quad_yx, quad_yy, quad_yz, quad_zx, quad_zy, quad_zz`
+
+如果某个头没有在模型中启用，对应列会返回 0，需要配合 `mask` 判断哪些块有效。
+另外，该 compute 读取的是当前 timestep 的 pair 缓存；若当前步还未进行 pair 计算，请先执行 `run` 或 `run 0`。
+
+如果模型训练时没有配置 `physical_tensor_outputs`，`pair_style mff/torch*` 仍可正常输出能量和力。
+此时 `compute mff/torch/phys` 不会报错，但：
+
+- `global` / `atom` 返回全 0
+- `global/mask` / `atom/mask` 也返回全 0
+
+### 8.4 输出压力/应力（virial）
 
 若编译时启用了 `MFF_ENABLE_VIRIAL=ON`，可在 `thermo_style` 中加入压力与应力分量：
 
@@ -326,7 +416,7 @@ thermo 20
 
 未启用 virial 时，`press` 等只有动能贡献，数值不完整。
 
-### 8.4 使用 Kokkos GPU 运行
+### 8.5 使用 Kokkos GPU 运行
 
 ```bash
 /path/to/lammps/build-mfftorch/lmp \
@@ -342,7 +432,7 @@ thermo 20
 - `-sf kk`：将 `pair_style mff/torch` 映射到 Kokkos 变体 `mff/torch/kk`
 - `-pk kokkos newton off neigh full`：Kokkos 使用 `neigh full` 时必须 `newton off`
 
-### 8.5 仅 CPU 运行（无 Kokkos）
+### 8.6 仅 CPU 运行（无 Kokkos）
 
 ```bash
 /path/to/lammps/build-mfftorch/lmp -in in.mfftorch

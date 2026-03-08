@@ -14,6 +14,10 @@ struct MFFOutputs {
   torch::Tensor atom_energy;   // (ntotal,1) or (ntotal,) on engine device
   torch::Tensor forces;        // (ntotal,3) on engine device
   torch::Tensor atom_virial;   // (ntotal,6) on engine device — Voigt: xx,yy,zz,xy,xz,yz
+  torch::Tensor global_phys;   // (n_graphs, 22) on engine device
+  torch::Tensor atom_phys;     // (ntotal, 22) on engine device
+  torch::Tensor global_phys_mask;  // (4,) on engine device
+  torch::Tensor atom_phys_mask;    // (4,) on engine device
 };
 
 class MFFTorchEngine {
@@ -27,18 +31,22 @@ class MFFTorchEngine {
 
   const torch::Device& device() const { return device_; }
   bool is_cuda() const { return device_.is_cuda(); }
+  bool accepts_external_tensor() const { return core_requires_external_tensor_; }
 
   MFFOutputs compute(int64_t nlocal, int64_t ntotal,
                      const torch::Tensor& A,
                      const torch::Tensor& edge_src,
                      const torch::Tensor& edge_dst,
                      const torch::Tensor& rij,
+                     const torch::Tensor& external_tensor = torch::Tensor(),
                      bool need_energy = true,
                      bool need_atom_virial = false);
 
  private:
   torch::jit::script::Module core_;
   bool loaded_ = false;
+  bool core_takes_external_tensor_arg_ = false;
+  bool core_requires_external_tensor_ = false;
 
   torch::Device device_{torch::kCPU};
 

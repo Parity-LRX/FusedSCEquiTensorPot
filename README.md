@@ -303,6 +303,38 @@ pair_style mff/torch 5.0 cuda
 pair_coeff * * /path/to/core.pt H O
 ```
 
+For `pure-cartesian-ictd` checkpoints exported with external-field architecture, USER-MFFTORCH also supports a runtime rank-1 external field:
+
+```lammps
+variable Ex equal 0.0
+variable Ey equal 0.0
+variable Ez equal 0.01
+pair_style mff/torch 5.0 cuda field v_Ex v_Ey v_Ez
+pair_coeff * * /path/to/core.pt H O
+```
+
+The `field` variables are re-evaluated on each force call, so time-dependent equal-style variables are supported. Current limitation: runtime external tensors are implemented for rank-1 and rank-2.
+
+For rank-2 runtime external tensors, USER-MFFTORCH supports both:
+- `field9`: full `3x3` tensor in row-major order `xx xy xz yx yy yz zx zy zz`
+- `field6`: symmetric `3x3` shorthand in order `xx yy zz xy xz yz`
+
+Example:
+
+```lammps
+variable Txx equal 1.0
+variable Txy equal 0.0
+variable Txz equal 0.0
+variable Tyx equal 0.0
+variable Tyy equal 1.0
+variable Tyz equal 0.0
+variable Tzx equal 0.0
+variable Tzy equal 0.0
+variable Tzz equal 1.0
+pair_style mff/torch 5.0 cuda field9 v_Txx v_Txy v_Txz v_Tyx v_Tyy v_Tyz v_Tzx v_Tzy v_Tzz
+pair_coeff * * /path/to/core.pt H O
+```
+
 **Model support**: `pure-cartesian-ictd` series and `spherical-save-cue` only.
 
 ### ML-IAP Interface

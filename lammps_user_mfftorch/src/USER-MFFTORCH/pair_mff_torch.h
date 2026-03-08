@@ -14,8 +14,11 @@ PairStyle(mff/torch,PairMFFTorch);
 #include <string>
 #include <vector>
 
+#include <torch/torch.h>
+
 namespace mfftorch {
 class MFFTorchEngine;
+struct MFFOutputs;
 }
 
 namespace LAMMPS_NS {
@@ -30,9 +33,18 @@ class PairMFFTorch : public Pair {
   void coeff(int narg, char **arg) override;
   double init_one(int i, int j) override;
   void init_style() override;
+  const torch::Tensor& global_phys() const { return global_phys_cpu_; }
+  const torch::Tensor& atom_phys() const { return atom_phys_cpu_; }
+  const torch::Tensor& global_phys_mask() const { return global_phys_mask_cpu_; }
+  const torch::Tensor& atom_phys_mask() const { return atom_phys_mask_cpu_; }
+  int64_t cached_phys_timestep() const { return cached_phys_timestep_; }
 
  protected:
   void allocate();
+  torch::Tensor current_external_tensor(const torch::Device& device);
+  void validate_external_field_configuration();
+  void cache_physical_outputs(const mfftorch::MFFOutputs& out, int nlocal);
+  void reset_physical_outputs();
 
   double cut_global_ = 0.0;
   double cutsq_global_ = 0.0;
@@ -41,6 +53,17 @@ class PairMFFTorch : public Pair {
   std::string core_pt_path_;
 
   std::vector<int64_t> type2Z_;
+  bool use_external_field_ = false;
+  int external_tensor_rank_ = 0;
+  bool external_field_symmetric_rank2_ = false;
+  std::vector<std::string> external_field_var_names_;
+  std::vector<float> cached_external_field_values_;
+  torch::Tensor external_tensor_cache_;
+  torch::Tensor global_phys_cpu_;
+  torch::Tensor atom_phys_cpu_;
+  torch::Tensor global_phys_mask_cpu_;
+  torch::Tensor atom_phys_mask_cpu_;
+  int64_t cached_phys_timestep_ = -1;
 
   std::unique_ptr<mfftorch::MFFTorchEngine> engine_;
   bool engine_loaded_ = false;

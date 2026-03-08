@@ -159,6 +159,20 @@ class HarmonicProjectors:
     P: Dict[Tuple[int, int], torch.Tensor]  # (L,l) -> (2l+1, Dsym(L))
 
 
+@dataclass(frozen=True)
+class HarmonicReconstructors:
+    """
+    Reconstruction matrices for the symmetric trace chain on Sym^L:
+      t_L = sum_l V_{L<-l} c_l
+
+    where ``c_l`` are harmonic coordinates in the canonical ICTD basis and
+    ``t_L`` are monomial coefficients in Sym^L.
+    """
+
+    Lmax: int
+    V: Dict[Tuple[int, int], torch.Tensor]  # (L,l) -> (Dsym(L), 2l+1)
+
+
 @lru_cache(maxsize=None)
 def build_harmonic_projectors(Lmax: int) -> HarmonicProjectors:
     """
@@ -185,6 +199,22 @@ def build_harmonic_projectors(Lmax: int) -> HarmonicProjectors:
             P[(L, l)] = Pinv.contiguous()
 
     return HarmonicProjectors(Lmax=Lmax, P=P)
+
+
+@lru_cache(maxsize=None)
+def build_harmonic_reconstructors(Lmax: int) -> HarmonicReconstructors:
+    """
+    Build all V_{L<-l} on CPU/float64 for stability; move to device/dtype at runtime.
+    These matrices reconstruct monomial coefficients from ICTD harmonic coordinates.
+    """
+    V: Dict[Tuple[int, int], torch.Tensor] = {}
+    for L in range(Lmax + 1):
+        for k in range(L // 2 + 1):
+            l = L - 2 * k
+            B_l = _harmonic_basis_t(l, dtype=torch.float64)  # (D_l, 2l+1)
+            M = _build_r2k_lift(l, k, dtype=torch.float64)   # (D_L, D_l)
+            V[(L, l)] = (M @ B_l).contiguous()               # (D_L, 2l+1)
+    return HarmonicReconstructors(Lmax=Lmax, V=V)
 
 
 def direction_harmonics(n: torch.Tensor, l: int) -> torch.Tensor:

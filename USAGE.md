@@ -1789,6 +1789,208 @@ thermo 20
 run 200
 ```
 
+**USER-MFFTORCH 注意事项**：
+
+- 当前 `mfftorch` 已验证并支持 4 种常见组合：
+  1. 无外场、无物理张量：只输出能量和力
+  2. 有外场、无物理张量：输出能量和力，并接收运行时 `field`/`field6`/`field9`
+  3. 无外场、有物理张量：输出能量、力，以及 `compute mff/torch/phys` 暴露的 tensor
+  4. 有外场、有物理张量：同时支持外场输入和 tensor 输出
+- 运行时外场支持：
+  - `field v_Ex v_Ey v_Ez`：rank-1 外场，适合 `l=1` 向量情形
+  - `field6` / `field9`：rank-2 外场输入
+- 当前 LAMMPS 端固定暴露的物理量为：
+  - 结构级：`charge`、`dipole`、`polarizability`、`quadrupole`
+  - 原子级：`charge_per_atom`、`dipole_per_atom`、`polarizability_per_atom`、`quadrupole_per_atom`
+- 缺失的物理量是允许的：若某个 head 没训练，对应 `mask=0`，输出自动填 0
+- 当前固定 schema 与 `l` 的典型对应关系：
+  - `charge` / `charge_per_atom`：`l=0`
+  - `dipole` / `dipole_per_atom`：`l=1`
+  - `polarizability`：通常是 rank-2 笛卡尔张量，对应 `l=0+2`
+  - `quadrupole`：通常对应 `l=2`
+- 自定义 physical head 名称当前不会自动暴露到 `compute mff/torch/phys`
+- 当前导出到 LAMMPS 的 physical heads 默认假定 `channels_out == 1`
+
+**推荐测试命令**（GPU 脚本）：
+
+```bash
+# 1) 无外场、无物理张量：只测 energy/force
+bash molecular_force_field/test/run_gpu_lammps_with_corept.sh \
+  --lmp /path/to/lmp --dummy-ictd --elements H O --cutoff 5.0 --steps 50
+
+# 2) 有外场、无物理张量
+bash molecular_force_field/test/run_gpu_lammps_with_corept.sh \
+  --lmp /path/to/lmp --dummy-ictd --elements H O \
+  --field-values 0.0 0.0 0.01 --cutoff 5.0 --steps 50
+
+# 3) 无外场、有物理张量
+bash molecular_force_field/test/run_gpu_lammps_with_corept.sh \
+  --lmp /path/to/lmp --dummy-ictd --dummy-phys-heads --test-phys-compute \
+  --elements H O --cutoff 5.0 --steps 50
+
+# 4) 有外场、有物理张量
+bash molecular_force_field/test/run_gpu_lammps_with_corept.sh \
+  --lmp /path/to/lmp --dummy-ictd --dummy-phys-heads --test-phys-compute \
+  --elements H O --field-values 0.0 0.0 0.01 --cutoff 5.0 --steps 50
+```
+
+**双卡 / 多卡备注**：
+
+- 若你的机器是“一张 GPU 对应一个 MPI rank”，推荐先用脚本生成 `core.pt` 和 `in.corept`，再手动用你自己的 MPI 启动方式运行
+- 常见启动方式如下：
+
+```bash
+mpirun -np 2 --allow-run-as-root --bind-to none \
+  bash -c 'export CUDA_VISIBLE_DEVICES=$OMPI_COMM_WORLD_LOCAL_RANK; \
+  /path/to/lmp -k on g 1 -sf kk -pk kokkos newton off neigh full -in /tmp/mff_test/in.corept'
+```
+
+**LAMMPS `in` 文件模板**：
+
+下面假设：
+
+- `core.pt` 已经导出完成
+- 元素顺序为 `H O`
+- cutoff 为 `5.0`
+- 使用 `read_data system.data`
+
+通用头部为：
+
+```lammps
+units metal
+atom_style atomic
+boundary p p p
+
+read_data system.data
+
+neighbor 1.0 bin
+```
+
+1. **无外场、无物理张量**：只输出 energy/force
+
+```lammps
+units metal
+atom_style atomic
+boundary p p p
+
+read_data system.data
+
+neighbor 1.0 bin
+
+pair_style mff/torch 5.0 cuda
+pair_coeff * * /path/to/core.pt H O
+
+fix 1 all nve
+thermo_style custom step pe
+thermo 20
+run 200
+```
+
+2. **有外场、无物理张量**：以 rank-1 电场为例
+
+```lammps
+units metal
+atom_style atomic
+boundary p p p
+
+read_data system.data
+
+neighbor 1.0 bin
+
+variable Ex equal 0.0
+variable Ey equal 0.0
+variable Ez equal 0.01
+
+pair_style mff/torch 5.0 cuda field v_Ex v_Ey v_Ez
+pair_coeff * * /path/to/core.pt H O
+
+fix 1 all nve
+thermo_style custom step pe
+thermo 20
+run 200
+```
+
+3. **无外场、有物理张量**：输出 energy/force/tensor
+
+```lammps
+units metal
+atom_style atomic
+boundary p p p
+
+read_data system.data
+
+neighbor 1.0 bin
+
+pair_style mff/torch 5.0 cuda
+pair_coeff * * /path/to/core.pt H O
+
+compute mffgm all mff/torch/phys global/mask
+compute mffdx all mff/torch/phys global dipole x
+compute mffpxx all mff/torch/phys global polarizability xx
+compute mffadx all mff/torch/phys atom dipole x
+
+fix 1 all nve
+thermo_style custom step pe c_mffgm[2] c_mffgm[3] c_mffdx c_mffpxx
+dump 1 all custom 20 dump.tensor id type x y z c_mffadx
+thermo 20
+run 200
+```
+
+4. **有外场、有物理张量**：同时测试外场输入与 tensor 输出
+
+```lammps
+units metal
+atom_style atomic
+boundary p p p
+
+read_data system.data
+
+neighbor 1.0 bin
+
+variable Ex equal 0.0
+variable Ey equal 0.0
+variable Ez equal 0.01
+
+pair_style mff/torch 5.0 cuda field v_Ex v_Ey v_Ez
+pair_coeff * * /path/to/core.pt H O
+
+compute mffgm all mff/torch/phys global/mask
+compute mffdx all mff/torch/phys global dipole x
+compute mffpxx all mff/torch/phys global polarizability xx
+compute mffadx all mff/torch/phys atom dipole x
+
+fix 1 all nve
+thermo_style custom step pe c_mffgm[2] c_mffgm[3] c_mffdx c_mffpxx
+dump 1 all custom 20 dump.tensor id type x y z c_mffadx
+thermo 20
+run 200
+```
+
+**常用 `compute mff/torch/phys` 读法**：
+
+```lammps
+compute q all mff/torch/phys global charge
+compute dx all mff/torch/phys global dipole x
+compute d all mff/torch/phys global dipole
+compute pxx all mff/torch/phys global polarizability xx
+compute p all mff/torch/phys global polarizability
+
+compute qatom all mff/torch/phys atom charge
+compute dxatom all mff/torch/phys atom dipole x
+compute datom all mff/torch/phys atom dipole
+compute pxxatom all mff/torch/phys atom polarizability xx
+compute patom all mff/torch/phys atom polarizability
+```
+
+其中 `global/mask` 的固定顺序为：
+
+- `c_mffgm[1]` -> `charge`
+- `c_mffgm[2]` -> `dipole`
+- `c_mffgm[3]` -> `polarizability`
+- `c_mffgm[4]` -> `quadrupole`
+
+若某个量没有训练或没有导出，则对应 mask 为 `0`，输出块自动填 `0`。
+
 **spherical-save-cue 导出说明**：默认导出为纯 PyTorch 实现（`force_naive`），`core.pt` 不依赖 cuEquivariance 自定义 ops，可在任意 LibTorch 环境运行。
 
 完整说明见 [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md)。

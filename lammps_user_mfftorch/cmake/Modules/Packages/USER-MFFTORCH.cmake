@@ -7,6 +7,7 @@ option(MFF_ENABLE_VIRIAL "Enable virial/stress calculation in mff/torch Kokkos p
 # Core (always)
 target_sources(lammps PRIVATE
   ${LAMMPS_SOURCE_DIR}/USER-MFFTORCH/mff_torch_engine.cpp
+  ${LAMMPS_SOURCE_DIR}/USER-MFFTORCH/compute_mff_torch_phys.cpp
   ${LAMMPS_SOURCE_DIR}/USER-MFFTORCH/pair_mff_torch.cpp
 )
 

@@ -55,6 +55,7 @@ void PairMFFTorchKokkos<DeviceType>::init_style() {
     }
     try {
       engine_->load_core(core_pt_path_, dev);
+      validate_external_field_configuration();
       engine_loaded_ = true;
     } catch (const std::exception &e) {
       error->all(FLERR, (std::string("Failed to load TorchScript core: ") + e.what()).c_str());
@@ -86,6 +87,7 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
   // Use default allocation behavior so eatom/vatom are available when
   // computes like pe/atom or stress/atom request per-atom quantities.
   ev_init(eflag, vflag);
+  reset_physical_outputs();
 
   atomKK->sync(execution_space, X_MASK | F_MASK | TYPE_MASK);
   atomKK->modified(execution_space, F_MASK);
@@ -171,16 +173,18 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
   Kokkos::fence();
 
   auto A = type2Z_cuda_.index_select(0, buf_type_idx_);
+  auto external_tensor = current_external_tensor(dev);
 
   const bool need_energy = static_cast<bool>(eflag_global || eflag_atom);
   const bool need_atom_virial = static_cast<bool>(vflag_atom);
   mfftorch::MFFOutputs out;
   try {
-    out = engine_->compute(nlocal, ntotal, A, buf_edge_src_, buf_edge_dst_, buf_rij_,
+    out = engine_->compute(nlocal, ntotal, A, buf_edge_src_, buf_edge_dst_, buf_rij_, external_tensor,
                            need_energy, need_atom_virial);
   } catch (const std::exception &e) {
     error->all(FLERR, (std::string("mff/torch/kk engine compute failed: ") + e.what()).c_str());
   }
+  cache_physical_outputs(out, nlocal);
 
   if (eflag_global) eng_vdwl += out.energy;
 

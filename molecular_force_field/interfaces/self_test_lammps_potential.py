@@ -114,7 +114,12 @@ def _make_dummy_checkpoint_spherical_save_cue(path: str, device: torch.device) -
     return config
 
 
-def _make_dummy_checkpoint_pure_cartesian_ictd(path: str, device: torch.device) -> ModelConfig:
+def _make_dummy_checkpoint_pure_cartesian_ictd(
+    path: str,
+    device: torch.device,
+    external_tensor_rank: int | None = None,
+    physical_tensor_outputs: dict[str, dict] | None = None,
+) -> ModelConfig:
     """创建 pure-cartesian-ictd (pure_cartesian_ictd_layers_full) 的 dummy checkpoint。"""
     from molecular_force_field.models.pure_cartesian_ictd_layers_full import PureCartesianICTDTransformerLayer
 
@@ -139,6 +144,8 @@ def _make_dummy_checkpoint_pure_cartesian_ictd(path: str, device: torch.device) 
         num_interaction=2,
         function_type_main=config.function_type,
         lmax=config.lmax,
+        physical_tensor_outputs=physical_tensor_outputs,
+        external_tensor_rank=external_tensor_rank,
         internal_compute_dtype=config.dtype,
         device=device,
     ).to(device)
@@ -148,6 +155,10 @@ def _make_dummy_checkpoint_pure_cartesian_ictd(path: str, device: torch.device) 
         "dtype": "float64",
         "tensor_product_mode": "pure-cartesian-ictd",
     }
+    if external_tensor_rank is not None:
+        ckpt["external_tensor_rank"] = int(external_tensor_rank)
+    if physical_tensor_outputs is not None:
+        ckpt["physical_tensor_outputs"] = physical_tensor_outputs
     torch.save(ckpt, path)
     return config
 

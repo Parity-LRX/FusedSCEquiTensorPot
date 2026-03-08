@@ -399,6 +399,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         self.max_radius = float(max_embed_radius)
         self.number_of_basis = int(main_number_of_basis)
         self.function_type = str(function_type_main)
+        self.external_tensor_rank = int(external_tensor_rank) if external_tensor_rank is not None else None
 
         # conv1
         self.e3_conv_emb = ICTDIrrepsE3Conv(

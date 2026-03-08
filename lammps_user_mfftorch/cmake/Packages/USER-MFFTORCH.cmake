@@ -13,6 +13,18 @@ if(MFF_ENABLE_VIRIAL)
   target_compile_definitions(lammps PRIVATE MFF_ENABLE_VIRIAL)
 endif()
 
+target_sources(lammps PRIVATE
+  ${LAMMPS_SOURCE_DIR}/USER-MFFTORCH/mff_torch_engine.cpp
+  ${LAMMPS_SOURCE_DIR}/USER-MFFTORCH/compute_mff_torch_phys.cpp
+  ${LAMMPS_SOURCE_DIR}/USER-MFFTORCH/pair_mff_torch.cpp
+)
+
+if(PKG_KOKKOS)
+  target_sources(lammps PRIVATE
+    ${LAMMPS_SOURCE_DIR}/USER-MFFTORCH/pair_mff_torch_kokkos.cpp
+  )
+endif()
+
 if(TARGET Torch::Torch)
   target_link_libraries(lammps PRIVATE Torch::Torch)
 else()
